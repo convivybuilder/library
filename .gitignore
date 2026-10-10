@@ -1,0 +1,46 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+# Without the trailing slash too: a pattern ending in `/` matches only a
+# DIRECTORY, so a `.venv` SYMLINK to one slips past `.venv/` and can be
+# committed. That happened on PR #26 — a 120000 blob holding an absolute
+# path on one machine, which is a dangling link for every other clone.
+.venv
+venv
+.DS_Store
+.pytest_cache/
+.ruff_cache/
+# Coverage outputs — `pytest --cov` writes these; locally they're throwaway.
+.coverage
+coverage.json
+htmlcov/
+# Runtime profile individuation from `agentctl spawn` / `co` dispatch into this repo
+.claude/
+# Vault data never belongs in the repo: the Chart House and the Archives are
+# databases on the mini with their own backups (ADR-0022). A stray .db here is a
+# copy of live lock state in git history.
+*.db
+*.db-wal
+*.db-shm
+# Shadow comparison series. `shadow.py --series` records what the two services
+# answered, so a run against live traffic writes real row ids and real
+# disagreements. Field values from customer-class rows are redacted before they
+# are written, and this is the second line rather than the first: a plaintext
+# artifact of a live read surface does not belong in git whatever it holds.
+#
+# Matched by the documented artifact name rather than by `*.jsonl`, which would
+# silently untrack any future JSONL fixture anywhere in the repo (reviewer,
+# PR #3). A series written somewhere else is not covered, so the redaction above
+# is what actually protects the content.
+shadow-series*
+
+# Runtime logs from serve.sh / shadow.py — machine state, never the repo's.
+serve.log
+shadow-run.log
+.uvicorn.log
+
+# Swift Package Manager build output for root-ca.
+root-ca/.build/
+root-ca/.swiftpm/

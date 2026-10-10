@@ -1,0 +1,185 @@
+{
+  "_comment": "Fixed question set for the Archives retrieval-quality measurement (bin/measure_retrieval_quality.py). Each right answer was picked by reading the signal's own row in the live database read-only, never by running /signals/search. See the PR body for how each was chosen. kind is the embedded kind the question is meant to exercise; questions 1-5 are transcript-turn rows written by the operator, which library/decisions/0001 marks as what the index reduction risks losing.",
+  "questions": [
+    {
+      "id": "q01",
+      "kind": "transcript-turn",
+      "query": "what did the operator ask for about excluding Christmas music from builds outside December",
+      "right_answers": ["sig_01M3DB6TQH01Y1YH6JXEF9SAHN"]
+    },
+    {
+      "id": "q02",
+      "kind": "transcript-turn",
+      "query": "what is the operator's preferred design for labeling signals submitted from a shared machine",
+      "right_answers": ["sig_01M3BG9S5MMB3DQDYM6TY62TED"]
+    },
+    {
+      "id": "q03",
+      "kind": "transcript-turn",
+      "query": "why did the operator want the grooming skill changed to allow closing epics",
+      "right_answers": ["sig_01M3AJY4V5E4FQQ7AG2K9DSS0X"]
+    },
+    {
+      "id": "q04",
+      "kind": "transcript-turn",
+      "query": "has the operator said the writing-style instructions given to agents have grown too long",
+      "right_answers": ["sig_01M3QFC84XZA6B8WEZ8TJTFB8M"]
+    },
+    {
+      "id": "q05",
+      "kind": "transcript-turn",
+      "query": "what feedback did the operator give about the generated playlists being repetitive",
+      "right_answers": ["sig_01M3SVXA5B9DYW5ZSHMRWS7TWN"]
+    },
+    {
+      "id": "q06",
+      "kind": "pr_comment",
+      "query": "has a reviewer been corrected before for reporting a code review line length without actually measuring it",
+      "right_answers": ["sig_01M3GH0P3J3EKX8H9MCRK3GK08"]
+    },
+    {
+      "id": "q07",
+      "kind": "pr_comment",
+      "query": "why was Clavero rejected as a candidate name",
+      "right_answers": ["sig_01M3B8RMHT3KS8BV6Y9SVXWXVY"]
+    },
+    {
+      "id": "q08",
+      "kind": "pr_comment",
+      "query": "did a later pull request comment broaden an existing safety rule to cover shell substitution forms beyond plain arithmetic expressions",
+      "right_answers": ["sig_01M3JAFH6792MQ216FFSBPPG87"]
+    },
+    {
+      "id": "q09",
+      "kind": "pr_comment",
+      "query": "besides passing an automated review, what else has to happen before the memory-retention epic's pull request can merge",
+      "right_answers": ["sig_01M3P0C7GTDPTFFH1CBGMTH68C"]
+    },
+    {
+      "id": "q10",
+      "kind": "pr_comment",
+      "query": "has a runbook been found to describe the push egress content incorrectly",
+      "right_answers": ["sig_01M3QADXS32FFDBTRPV7CDX6G9"]
+    },
+    {
+      "id": "q11",
+      "kind": "finding",
+      "query": "has agentctl review-status been found rejecting a genuine review verdict because of how the commit hash was formatted",
+      "right_answers": ["sig_01KYJ9RJDRR2V37SA5YZAXETGN"]
+    },
+    {
+      "id": "q12",
+      "kind": "finding",
+      "query": "what did pacing experiments show about how Spotify's API actually enforces its rate limit",
+      "right_answers": ["sig_01KZ7V26W9GVDA5YVWSBRBGEW3"]
+    },
+    {
+      "id": "q13",
+      "kind": "finding",
+      "query": "has agentctl spawn ever set up a new branch that still included work from someone else's still-open pull request",
+      "right_answers": ["sig_01KYMW6CH5K45FGQJGFBH7YEX0"]
+    },
+    {
+      "id": "q14",
+      "kind": "finding",
+      "query": "why doesn't a window event listener catch unhandled promise rejections in vivy's frontend tests",
+      "right_answers": ["sig_01KZ5E3V39T5FJBJGW0WVHB97Z"]
+    },
+    {
+      "id": "q15",
+      "kind": "decision",
+      "query": "is there confirmation that all of the Library's currently open epics have a written scope the operator has signed off on",
+      "right_answers": ["sig_01M12MG5XANHRWBQD8EEQEVBQK"]
+    },
+    {
+      "id": "q16",
+      "kind": "retired-decision",
+      "query": "why did we decide to keep substrate and convivy-deck hand-maintained instead of generating their .claude files",
+      "right_answers": ["dec_01M08Z5STSCXABN0PMWAK69YNZ"]
+    },
+    {
+      "id": "q17",
+      "kind": "retired-decision",
+      "query": "why hasn't tool-policy enforcement been turned on yet",
+      "right_answers": ["dec_01KZWFZC1WHATF50JGJNZPA2A1"]
+    },
+    {
+      "id": "q18",
+      "kind": "needs-decision",
+      "query": "whose clearance is needed before an agent can write a migration making Property.tenant_id a required field",
+      "right_answers": ["sig_01M1KD64VZC37PK9RYDS65GKVA"]
+    },
+    {
+      "id": "q19",
+      "kind": "memory",
+      "query": "where should a hollis to svc handoff contract be dropped",
+      "right_answers": ["sig_01M3RXTJ4P797GS7VQJG6AGDSF"]
+    },
+    {
+      "id": "q20",
+      "kind": "memory",
+      "query": "was the Anthropic Agent SDK billing split announced for June 2026 ever put into effect",
+      "right_answers": ["sig_01M3RXTKGJ6H6PGZR46E23ABJ1"]
+    },
+    {
+      "id": "q21",
+      "kind": "memory",
+      "query": "what was Personal Assistant renamed to and why",
+      "right_answers": ["sig_01M3RXTM0NSCYN8Y4QPBJMKGA4"]
+    },
+    {
+      "id": "q22",
+      "kind": "release_note",
+      "query": "what changed in the release that added text message alerts for hosts",
+      "right_answers": ["sig_01M3DB8XT823NT76N85MXBR8WP"]
+    },
+    {
+      "id": "q23",
+      "kind": "release_note",
+      "query": "which release made automation history read as one gap-free log",
+      "right_answers": ["sig_01M1ST193ZE3D7PT79BJJAFFF4"]
+    },
+    {
+      "id": "q24",
+      "kind": "release_note",
+      "query": "which release fixed cancelled bookings reporting a payout that never reached the host",
+      "right_answers": ["sig_01M1R4Z5S0GVJCJB61GQQE5K8W"]
+    },
+    {
+      "id": "q25",
+      "kind": "review_record",
+      "query": "what was the first end-to-end review record posted from the Library co session",
+      "right_answers": ["sig_01M2KSK480QNS98PJW6KA2EZWZ"]
+    },
+    {
+      "id": "q26",
+      "kind": "review_record",
+      "query": "did the security review of PR 688's review-records route find any findings in round 2",
+      "right_answers": ["sig_01M3SJ3M6M7ZYG06PSSQ32FAZ2"]
+    },
+    {
+      "id": "q27",
+      "kind": "review_record",
+      "query": "has a PR comment misattributed which module's composite-score formula reads downvotes",
+      "right_answers": ["sig_01M3SJEDAG1R9HXT08PGW5Y98C"]
+    },
+    {
+      "id": "q28",
+      "kind": "note",
+      "query": "why did the worktree reap job stop working on review trees",
+      "right_answers": ["sig_01KY9CCSR7GW21W7DQ09HH8QKM"]
+    },
+    {
+      "id": "q29",
+      "kind": "note",
+      "query": "has a review gone past ADR-0037's round cap because the fix looked cheap",
+      "right_answers": ["sig_01M00QBJP87TEZERAGJJVQT441"]
+    },
+    {
+      "id": "q30",
+      "kind": "note",
+      "query": "why hasn't OwnerRez been asked again to pass lock events to Vivy",
+      "right_answers": ["sig_01M26Z1ZQNAGPB2JQABD37EYH6"]
+    }
+  ]
+}

@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <!-- A TEMPLATE, NOT A LOADABLE PLIST: every path under the installing
+       user's home carries bin/install-library's home placeholder, and
+       launchd does not expand it. Never copy this file raw. Render it
+       through that script's internal render entry point; the comment
+       above that entry point gives the exact command. -->
+<dict>
+  <key>Label</key>
+  <string>com.convivy.library.cert-expiry-check</string>
+  <!-- DEPLOY-PINNED, the same rule every sibling plist in this directory
+       follows (platform/decisions/0059 rule 1): a timer invokes the checker
+       from the deploy area, never the working checkout, because nobody is
+       testing anything when launchd fires this unattended.
+       bin/cert_expiry_check.py is exported into ~/.local/deploy/library by
+       bin/install-library like every other tracked file, so it lands here
+       automatically on the next install — this file only names the
+       deploy-area path, it does not arrange for the script to be there.
+
+       THIS PR DOES NOT LOAD IT. Installing the plist template into
+       ~/Library/LaunchAgents and loading it is the operator's own step. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>@@LIBRARY_HOME@@/.local/deploy/library/.venv/bin/python3</string>
+    <string>@@LIBRARY_HOME@@/.local/deploy/library/bin/cert_expiry_check.py</string>
+  </array>
+  <!-- `cert_expiry_check.py` opens `LIBRARY_DB` directly through `store.py`
+       and writes an `ops-alert` signal through `store.insert_signal`,
+       unlike `ci_result_fetch.py`'s sibling job, which posts over HTTP and
+       needs no database variables at all — so this plist carries the same
+       three variables `cold-tier.plist` sets for the same reason (see that
+       file's own comment on each): `LIBRARY_DB` and
+       `LIBRARY_WRITES_ENABLED=1` together, never one without the other; and
+       `LIBRARY_COLD_DB`, which `store.insert_signal`'s dedup check attaches
+       on every write that carries a `dedup_key` — every write this job
+       makes. `LIBRARY_TLS_CERT`/`_KEY`/`_CA` are deliberately NOT set here:
+       their defaults already resolve to the Library's own TLS directory
+       (`mtls.py`), the same place the mutual-TLS listener itself reads from
+       with no override either. -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>HOME</key>
+    <string>@@LIBRARY_HOME@@</string>
+    <key>LIBRARY_DB</key>
+    <string>@@LIBRARY_HOME@@/.library/library.db</string>
+    <key>LIBRARY_COLD_DB</key>
+    <string>@@LIBRARY_HOME@@/.library/cold.db</string>
+    <key>LIBRARY_WRITES_ENABLED</key>
+    <string>1</string>
+  </dict>
+  <key>WorkingDirectory</key>
+  <string>@@LIBRARY_HOME@@/.local/deploy/library</string>
+  <!-- A one-shot check, not a server, the same shape ci-result-fetch and
+       cold-tier both take: RunAtLoad covers a restart, a sleep, or a prior
+       failure as soon as the job loads; StartInterval repeats it every 24
+       hours after that — platform/decisions/0066's own "run it at least
+       daily". No KeepAlive — a run that exits (0 or 1) is expected to
+       exit. -->
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartInterval</key>
+  <integer>86400</integer>
+  <!-- ~/.library is the Library's own external state area, never the
+       deploy area, which an atomic install swap replaces wholesale and
+       would destroy a log living inside it. -->
+  <key>StandardOutPath</key>
+  <string>@@LIBRARY_HOME@@/.library/cert-expiry-check.log</string>
+  <key>StandardErrorPath</key>
+  <string>@@LIBRARY_HOME@@/.library/cert-expiry-check.log</string>
+</dict>
+</plist>

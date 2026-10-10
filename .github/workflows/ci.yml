@@ -1,0 +1,170 @@
+name: ci
+
+# The Library serves reads against a live database during its shadow period, so
+# the suite runs on every push and every PR from the first commit. There is no
+# draft gate here: the whole suite is seconds of Linux time, and the ARCH-364
+# draft-gating that agent-platform needs exists to defer an expensive macOS job
+# this repo does not have.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.head_ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    # ci1, the self-hosted Linux runner (platform/runbooks/standing-up-the-
+    # linux-ci-box): each job gets a fresh Incus VM, destroyed afterwards,
+    # with internet egress and a fence that drops its traffic to the LAN,
+    # ci1 itself and other job VMs. GARM's scale set carries only its own
+    # name, so a label array would match no runner and the job would sit
+    # queued.
+    runs-on: convivy-linux
+    steps:
+      # Passes only when curl times out (exit 28) without ever completing a
+      # TCP connection (time_connect 0). ci1's fence drops LAN traffic rather
+      # than rejecting it, so a refused connection, an HTTP answer, or a
+      # connection that opens and then stalls all mean a path to the LAN
+      # exists, and the job fails before checkout or the deploy key. macstudio
+      # being down also never connects, so this is a per-run canary for one
+      # address. Runbook step 9 is the isolation proof: its LAN, router,
+      # 192.168.8.1, bridge and second-VM rows have negative controls, and
+      # its tailnet rows rest on a timeout alone.
+      - name: Fence probe, macstudio LAN address must time out
+        run: |
+          rc=0
+          tc=$(curl -s -m 3 -o /dev/null -w '%{time_connect}' http://172.16.0.138:7000/) || rc=$?
+          echo "fence probe: curl exit $rc, connect time $tc"
+          if [ "$rc" != 28 ] || [ "$tc" != "0.000000" ]; then
+            echo "::error::curl to macstudio on the LAN exited $rc with connect time $tc, not an unconnected timeout; the CI fence has failed." >&2
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+      # The drift test in tests/test_reference_admission.py compares this
+      # repo's admission constants with knowledge's scripts/validate.py. The
+      # deploy key is read-only on convivy/knowledge and is used only by this
+      # step. Checkout writes it to $RUNNER_TEMP for the fetch; with
+      # persist-credentials: false, the finally at the end of its getSource
+      # deletes that file and leaves nothing in git config, all within this
+      # step, so the later steps, which run the PR's own code, cannot reach
+      # it. The knowledge tree it fetched stays in the workspace for pytest.
+      - uses: actions/checkout@v4
+        with:
+          repository: convivy/knowledge
+          path: knowledge
+          ssh-key: ${{ secrets.KNOWLEDGE_DEPLOY_KEY }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements-dev.txt
+      # tests/test_serve_guard.py reads POSIX ACLs with getfacl/setfacl on
+      # Linux — the same tool the guard itself refuses to start without, so
+      # it has to be here for the same reason the guard needs it in
+      # production. Not preinstalled on a bare ubuntu-latest image.
+      - run: sudo apt-get install -y acl
+      # `/home` on ubuntu-latest — not just this checkout's path under it —
+      # carries a `default:user:runner:rwx` ACL, which serve.sh's own ACL
+      # check correctly refuses. That refuses two separate things: `serve.sh`'s
+      # own path (`SELF`'s walk), and every test fixture's tree, which the
+      # module rooted under `$HOME/.cache/...` to keep clear of any ancestor
+      # `.git`. Both need a home. This stages the whole tracked tree, the
+      # same `git archive | tar -x` bin/install-library uses for `$STAGE`,
+      # under a directory built for it, and a `tmp` root for the test
+      # fixture trees alongside it; both are owned by the runner user, mode
+      # 755, no ACL, and (like `$HOME`) outside any git working tree.
+      # `--check`'s `import app` case (added by library#196) needs `app.py`
+      # and its own imports reachable from `$DIR`, which the full tree
+      # provides. `git archive` exports no `.git`, so the staged copy takes
+      # serve.sh's own no-git-repository passthrough rather than its
+      # untracked-file-shadow guard. `SERVE_GUARD_REQUIRED=1` below turns the
+      # path-refusal skip into a hard failure if either root ever stops
+      # working.
+      - name: stage a checkout path the guard accepts
+        run: |
+          sudo mkdir -p /srv/library-ci/tmp
+          sudo chown -R "$(id -u):$(id -g)" /srv/library-ci
+          chmod 755 /srv/library-ci /srv/library-ci/tmp
+          git archive HEAD | tar -x -C /srv/library-ci
+          chmod 755 /srv/library-ci/serve.sh
+          echo "-- ownership, mode and ACL from / down to the staged checkout --"
+          for d in / /srv /srv/library-ci /srv/library-ci/tmp; do
+            stat -c '%n: owner=%U group=%G mode=%a' "$d"
+            getfacl --absolute-names --omit-header "$d"
+          done
+      # Round 3: three of the guard suite's Linux-only cases need a precondition
+      # this unprivileged runner cannot build for itself — chgrp to a group it
+      # isn't a member of, or a directory owned by a distinct account — so they
+      # skipped every run rather than testing anything. sudo builds each one
+      # here and hands it to pytest by path; SERVE_GUARD_REQUIRED=1 below turns
+      # a missing one of these into a hard failure instead of a silent skip.
+      - name: prepare group and ownership fixtures for the guard suite
+        run: |
+          mkdir -p /srv/library-ci/fixtures/gid80 /srv/library-ci/fixtures/nonadmin /srv/library-ci/fixtures/thirdparty
+          chmod 755 /srv/library-ci/fixtures /srv/library-ci/fixtures/gid80 /srv/library-ci/fixtures/nonadmin /srv/library-ci/fixtures/thirdparty
+
+          # gid 80 is macOS's `admin`; on Linux it may already name some other
+          # system group depending on the image, so reuse it if present rather
+          # than colliding with groupadd.
+          gid80_group="$(getent group 80 | cut -d: -f1)"
+          if [ -z "$gid80_group" ]; then
+            sudo groupadd -g 80 ci-guard-gid80
+            gid80_group=ci-guard-gid80
+          fi
+          sudo groupadd ci-guard-nonadmin
+
+          # Only the group changes here, via sudo — the runner user stays the
+          # owner, so the test can still create the symlink and chmod the
+          # directory itself, same as it does for a fixture it builds unaided.
+          sudo chgrp "$gid80_group" /srv/library-ci/fixtures/gid80
+          sudo chgrp ci-guard-nonadmin /srv/library-ci/fixtures/nonadmin
+          # test_component_owned_by_a_third_user_is_refused needs a directory
+          # owned by neither this user nor root; chown always needs root.
+          sudo chown nobody:nogroup /srv/library-ci/fixtures/thirdparty
+
+          echo "-- fixture ownership --"
+          stat -c '%n: owner=%U group=%G(%g) mode=%a' \
+            /srv/library-ci/fixtures/gid80 /srv/library-ci/fixtures/nonadmin /srv/library-ci/fixtures/thirdparty
+      # test_the_real_interpreter_passes_the_guard is the guard's end-to-end
+      # positive control: it runs serve.sh with no PY override, so it needs a
+      # real venv at $DIR/.venv (DIR = the staged serve.sh's own directory)
+      # carrying everything the import preflight requires. Built only for the
+      # staged copy under /srv/library-ci, not this checkout's own tree.
+      #
+      # --copies: setup-python's interpreter lives under this runner's own
+      # hosted tool-cache directory, derived at run time by `python -c
+      # "import sys; print(sys.prefix)"` rather than a fixed path — and that
+      # directory's /opt parent is mode 777 on ubuntu-latest, a real hazard
+      # the guard is right to refuse. The default symlinked venv points
+      # bin/python straight through it, so .venv/bin/python failed with "the
+      # interpreter: /opt is world-writable" on the first attempt at this
+      # positive control. --copies gives .venv/bin/python a real, standalone
+      # binary that never walks through /opt at all.
+      - name: build a .venv for the real-interpreter guard case
+        run: |
+          python -m venv --copies /srv/library-ci/.venv
+          /srv/library-ci/.venv/bin/pip install -r requirements.txt
+      - name: ruff
+        run: ruff check .
+      - name: pytest
+        env:
+          KNOWLEDGE_ROOT: ${{ github.workspace }}/knowledge
+        # test_serve_guard.py runs in its own step below, from the staged
+        # checkout the guard accepts — excluded here so it isn't collected
+        # (and silently skipped) a second time from this one, which it does.
+        run: python -m pytest -q -rs --ignore=tests/test_serve_guard.py
+      - name: pytest (serve guard, linux, required)
+        env:
+          SERVE_GUARD_REQUIRED: "1"
+          SERVE_GUARD_TEST_ROOT: /srv/library-ci/tmp
+          SERVE_GUARD_GID80_DIR: /srv/library-ci/fixtures/gid80
+          SERVE_GUARD_NONADMIN_GROUP_DIR: /srv/library-ci/fixtures/nonadmin
+          SERVE_GUARD_THIRD_PARTY_DIR: /srv/library-ci/fixtures/thirdparty
+        working-directory: /srv/library-ci
+        run: python -m pytest tests/test_serve_guard.py -v -rA

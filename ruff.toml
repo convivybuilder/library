@@ -1,0 +1,10 @@
+# Declare the rule set explicitly rather than inheriting whatever ruff's default
+# happens to be in the version CI installed today. ruff 0.16.0 expanded its
+# default set and reddened several Convivy repos on code nobody had touched; the
+# ones that survived were precisely those that already declared a `select`.
+#
+# These four are what the default set has historically been. A new rule ruff adds
+# UNDER one of these prefixes is still picked up automatically — what declaring a
+# select prevents is a new rule CATEGORY silently joining what CI demands.
+[lint]
+select = ["E4", "E7", "E9", "F"]

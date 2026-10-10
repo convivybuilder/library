@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <!-- A TEMPLATE, NOT A LOADABLE PLIST: every path under the installing
+       user's home carries bin/install-library's home placeholder, and
+       launchd does not expand it. Never copy this file raw. Render it
+       through install-library's own hidden render entry point (see that
+       script's header for the exact command). -->
+<dict>
+  <key>Label</key>
+  <string>com.convivy.library.deploy-watch</string>
+  <!-- CHECKOUT-PINNED, UNLIKE ITS SIBLINGS (ci-result-fetch, cold-tier,
+       cert-expiry-check — all deploy-pinned, ADR-0059 rule 1). This job's
+       own work is comparing the checkout's `origin/main` against the deploy
+       area and, when they differ, running the CHECKOUT's `bin/
+       library-install` — the installer that fast-forwards that same
+       checkout and reads its git history for the merged-PR range (library-
+       install's own step (c)). Pointing this job at the deploy-area copy
+       would give it a tree with no `.git` at all, exactly the hazard
+       bin/library-deploy-watch's own module docstring warns about, one repo
+       over from convivy-orient/deploy_watch.py's identical layout and the
+       identical reason.
+
+       CQ·94 (issue_01M1G7G14FMD7M30ZFQK9YZVST): the operator ruled 2026-10-09 that
+       every merge should autodeploy rather than wait on him to run
+       library-install by hand (library#231's rule, reversed). This job is
+       the trigger; library-install still carries every refusal it always
+       did.
+
+       THIS IS A FOURTH PLIST install-library NEVER INSTALLS ITSELF (see its
+       own hidden render-entry-point comment, which now lists this one
+       beside cold-tier, cert-expiry-check and ci-result-fetch) —
+       bootstrap is the operator's call, same as those three, and the
+       exact first-load command is in this PR's own body. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>@@LIBRARY_HOME@@/Convivy/library/.venv/bin/python3</string>
+    <string>@@LIBRARY_HOME@@/Convivy/library/bin/library-deploy-watch</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>HOME</key>
+    <string>@@LIBRARY_HOME@@</string>
+  </dict>
+  <key>WorkingDirectory</key>
+  <string>@@LIBRARY_HOME@@/Convivy/library</string>
+  <!-- A poll, not a server: RunAtLoad picks up a merge that landed while
+       the job was unloaded, as soon as it loads; StartInterval repeats it
+       every 5 minutes after that — the same interval
+       com.convivy.orient-deploy-watch uses. No KeepAlive — a run that exits
+       (0 or 1) is expected to exit. -->
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartInterval</key>
+  <integer>300</integer>
+  <!-- ~/.library is the Library's own external state area — where
+       bin/library-deploy-watch itself reads/writes its failed-target marker
+       (deploy-watch-failed-target.json) and its credential
+       (deploy-watch-token) by absolute path, matching LIBRARY_DB and
+       ci-fetch-token on the sibling plists. Never the deploy area: an
+       atomic install swap replaces ~/.local/deploy/library wholesale, which
+       would destroy either. -->
+  <key>StandardOutPath</key>
+  <string>@@LIBRARY_HOME@@/.library/deploy-watch.log</string>
+  <key>StandardErrorPath</key>
+  <string>@@LIBRARY_HOME@@/.library/deploy-watch.log</string>
+</dict>
+</plist>

@@ -1,0 +1,177 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.convivy.library</string>
+  <!-- DEPLOY-PINNED per platform/decisions/0059 rule 1: serve.sh and every
+       file it execs live outside the development checkout, in
+       ~/.local/deploy/library — a copy installed from `main` by
+       bin/install-library (rules 2, 6, 7), never a symlink into
+       ~/Convivy/library. This plist is itself a COPY landed in
+       ~/Library/LaunchAgents by that same installer (rule 8) — this file in
+       the repo is only the versioned template, never what launchd loads. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>@@LIBRARY_HOME@@/.local/deploy/library/serve.sh</string>
+  </array>
+  <!-- THE DEPLOYED VALUE OF LIBRARY_WRITES_ENABLED IS "1" (ADR-0016: a file
+       that ships a control gated by configuration names the value it deploys).
+       The dict below sets it, so store.connect_rw opens the vault read-write and the
+       Library is the writer of record for the Chart House and the Archives.
+
+       THE DEPLOYED VALUE OF LIBRARY_DB IS "@@LIBRARY_HOME@@/.library/library.db",
+       and the two are set together or not at all (the cutover sequence, Stage B
+       step 6). Setting LIBRARY_WRITES_ENABLED alone is a refusal to start rather
+       than a second writer: store.resolve_db has no default for LIBRARY_DB, so
+       there is no value the omission can fall back to.
+
+       THE DEPLOYED VALUE OF LIBRARY_VECTORS_DB IS "@@LIBRARY_HOME@@/.library/vectors.db"
+       (memory-retention epic clause 7, issue_01M35R5GA1SKRG2CMQRF189NDE).
+       `vectors.resolve_vectors_db_path` has no default either, so a job that
+       omits it refuses to import rather than serving with the vector index
+       silently unreachable. Existence of the file itself is checked later, at
+       connect time, not at import — a job that starts before `split_vectors.py`
+       has run comes up and serves ordinary routes, with the boot log and
+       `/health`'s `semantic_search.ready` both saying so (`vectors.available()`
+       catches the missing file and names it).
+
+       BOTH WENT LIVE AT THE WRITE CUTOVER, ABOUT 04:00 ON 2026-08-17, AND THIS
+       COMMENT SAID "UNSET" FOR NINE DAYS AFTERWARDS. The prior version stated
+       the pre-cutover configuration and said "this comment is where to change
+       it"; the cutover changed the running job and left the file behind. A
+       convivy-deck co session read this file and store.WRITES_ENABLED on
+       2026-08-25, concluded the Library refuses every write, and built a change
+       around a 503 that does not happen — a dispatched probe is what found out
+       otherwise (issue_01M0XTPJVVRY6KR49MR7ZGWYCN). A comment exists so a reader
+       does not have to go look, which is exactly what makes a stale one worse
+       than none.
+
+       THE DEPLOYED VALUE OF LIBRARY_COLD_DB IS "@@LIBRARY_HOME@@/.library/cold.db"
+       (memory-retention epic clause 9, issue_01M35R5QKX7QDCM822K3J18SWX).
+       app.py calls `store.resolve_cold_db_path()` at import, which has no
+       default, so a job that omits it refuses to start. The cold file itself
+       is created by `init_cold.py` and checked at attach time, not at import.
+       It must match the mover's plist (com.convivy.library.cold-tier.plist),
+       and it must differ from LIBRARY_DB. Library#181 shipped the import-time
+       requirement without this line, and the 2026-10-01 install of cd9693a
+       crash-looped on it from 16:28Z until a rollback at 16:31Z.
+
+       THE DEPLOYED VALUE OF LIBRARY_BLOB_DIR IS "@@LIBRARY_HOME@@/.library/blobs"
+       (memory-retention epic clause 8, issue_01M35R5KXQJGWPRFC9BGEZAYQE).
+       `blobs.resolve_blob_dir` has no default for LIBRARY_BLOB_DIR, so a job
+       that omits it refuses to start rather than silently creating an empty
+       store somewhere a missing NAS mount could pass for one.
+
+       THE DEPLOYED VALUE OF LIBRARY_API_TOKENS IS "@@LIBRARY_HOME@@/Convivy/convivy-orient/api-tokens.json"
+       (issue_01M3JKQGP1TV1PT9HWK27RKTG8). `identity.TOKENS` now defaults to
+       `~/.library/api-tokens.json`, which is empty on macstudio, so this deploy
+       sets the variable explicitly and keeps reading the file it reads today.
+
+       THE DEPLOYED VALUE OF LIBRARY_KNOWLEDGE_ROOT IS "@@LIBRARY_HOME@@/Convivy/knowledge"
+       (issue_01M3NS89KVRXB368VA4TJ38MDG). `reference_admission.project_catalogue`
+       reads this tree's `projects/` directories to widen its baseline project
+       list past Convivy's own, so `POST /reference/admission` stops refusing an
+       adopter's own project. Unset or unreadable admits the baseline only —
+       today's behaviour — so this variable was safe to add ahead of being set.
+
+       THE CHECK THAT DISTINGUISHES THIS FILE FROM THE RUNNING JOB, which reading
+       either one alone cannot:
+
+         launchctl print gui/501/com.convivy.library | sed -n '/^\tenvironment/,/}/p'
+
+       It prints the environment the LOADED job holds, which is what the process
+       actually got. `kickstart -k` restarts from that loaded definition and
+       preserves it; `bootout` + `bootstrap` replaces it from this file. So while
+       the two disagree, a redeploy from the checkout SILENTLY TAKES THE WRITES
+       AWAY, and the boot line in serve.log is the confirmation either way:
+
+         library: database @@LIBRARY_HOME@@/.library/library.db (from LIBRARY_DB), writes ENABLED -->
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>HOME</key>
+    <string>@@LIBRARY_HOME@@</string>
+    <key>LIBRARY_DB</key>
+    <string>@@LIBRARY_HOME@@/.library/library.db</string>
+    <key>LIBRARY_BLOB_DIR</key>
+    <string>@@LIBRARY_HOME@@/.library/blobs</string>
+    <key>LIBRARY_WRITES_ENABLED</key>
+    <string>1</string>
+    <key>LIBRARY_VECTORS_DB</key>
+    <string>@@LIBRARY_HOME@@/.library/vectors.db</string>
+    <key>LIBRARY_COLD_DB</key>
+    <string>@@LIBRARY_HOME@@/.library/cold.db</string>
+    <key>LIBRARY_API_TOKENS</key>
+    <string>@@LIBRARY_HOME@@/Convivy/convivy-orient/api-tokens.json</string>
+    <key>LIBRARY_KNOWLEDGE_ROOT</key>
+    <string>@@LIBRARY_HOME@@/Convivy/knowledge</string>
+  </dict>
+  <key>WorkingDirectory</key>
+  <string>@@LIBRARY_HOME@@/.local/deploy/library</string>
+  <!-- RunAtLoad + KeepAlive together are the point of this file: until it
+       existed the Library was hand-started, so a reboot ended it with nothing
+       saying so, and merged code never became live without somebody
+       remembering to restart it. -->
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <!-- Long enough that a preflight refusal does not spin. serve.sh exits 78
+       when the interpreter is wrong, and KeepAlive would otherwise restart it
+       several times a second forever. -->
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+  <!-- THE KEY IS `ExitTimeOut`, CAPITAL O (`man launchd.plist`) — this file
+       spelled it `ExitTimeout` until round 4 of PR #157's review, which
+       launchd silently ignores rather than refusing, so the value below was
+       NEVER TAKEN: `launchctl print gui/501/com.convivy.library` read `exit
+       timeout = 5` the whole time (launchd's own unset default; the man page
+       states it as "system-defined," not a fixed number, so 5s is what was
+       OBSERVED on this machine, not a documented constant to rely on
+       elsewhere).
+
+       THE VALUE BELOW IS 60, NOT A MARGINED NUMBER ABOVE app.py's
+       `_DRAIN_DEADLINE_SECONDS`, BECAUSE 60 IS ALL THIS KEY CAN GET: once
+       correctly spelled, this was set to 75 and `launchctl print` still read
+       `exit timeout = 60` (issue_01M3N7NB9218HXKQDPD3NF1BJH) — a clamp this
+       gui-domain LaunchAgent is subject to on this machine, undocumented by
+       `man launchd.plist`, and inferred rather than confirmed (a system
+       LaunchDaemon, `/System/Library/LaunchDaemons/com.apple.xsan.plist`,
+       sets 240, so the clamp looks specific to the gui domain rather than
+       universal). Setting 75 here again would repeat the exact bug this
+       comment now describes: a number that reads correctly in this file and
+       is not the number launchd applies. `bin/install-library`'s post-reload
+       verification reads the EFFECTIVE value back from `launchctl print`
+       rather than trusting this file's own integer, for that reason.
+
+       A SIGTERM — from `install-library`'s own `bootout` on a reload, or
+       from any other source — is drained the same way the quiesce path
+       drains: one shared handler (`serve_dual.main`) sets `should_exit` on
+       both listeners, and each one's `shutdown()` is bounded by
+       `timeout_graceful_shutdown`, which IS `_DRAIN_DEADLINE_SECONDS` by
+       reference (`serve_dual.py`), not a second literal. That constant is
+       50s precisely so that 60 here — the effective ceiling, not a number
+       this file gets to choose — leaves it 10s of margin
+       (test_launchd_plist.py asserts ExitTimeOut > _DRAIN_DEADLINE_SECONDS,
+       and separately that ExitTimeOut itself is <= 60, so a future edit
+       cannot repeat the 75-that-reads-60 mistake without a test noticing). -->
+  <key>ExitTimeOut</key>
+  <integer>60</integer>
+  <!-- Moved out of the checkout to ~/.library, alongside LIBRARY_DB above and
+       the client-tokens file identity.py defaults to at
+       ~/.library/client-tokens.json — the Library's own external state area,
+       never the deploy area (ADR-0059 rule 3: state and output stay in their
+       own place, and an atomic install swap replaces ~/.local/deploy/library
+       wholesale, which would silently truncate a log living inside it). -->
+  <key>StandardOutPath</key>
+  <string>@@LIBRARY_HOME@@/.library/serve.log</string>
+  <key>StandardErrorPath</key>
+  <string>@@LIBRARY_HOME@@/.library/serve.log</string>
+</dict>
+</plist>
+

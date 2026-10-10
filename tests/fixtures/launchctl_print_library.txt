@@ -1,0 +1,80 @@
+gui/501/com.convivy.library = {
+	active count = 1
+	path = /srv/fixture-home/Library/LaunchAgents/com.convivy.library.plist
+	type = LaunchAgent
+	state = running
+
+	program = /bin/sh
+	arguments = {
+		/bin/sh
+		/srv/fixture-home/.local/deploy/library/serve.sh
+	}
+
+	working directory = /srv/fixture-home/.local/deploy/library
+
+	stdout path = /srv/fixture-home/.library/serve.log
+	stderr path = /srv/fixture-home/.library/serve.log
+	inherited environment = {
+		SSH_AUTH_SOCK => /var/run/com.apple.launchd.pgaQorkYWI/Listeners
+	}
+
+	default environment = {
+		PATH => /usr/bin:/bin:/usr/sbin:/sbin
+	}
+
+	environment = {
+		OSLogRateLimit => 64
+		LIBRARY_API_TOKENS => /srv/fixture-home/Convivy/convivy-orient/api-tokens.json
+		LIBRARY_WRITES_ENABLED => 1
+		PATH => /opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+		HOME => /srv/fixture-home
+		LIBRARY_DB => /srv/fixture-home/.library/library.db
+		XPC_SERVICE_NAME => com.convivy.library
+	}
+
+	domain = gui/501 [100002]
+	asid = 100002
+	minimum runtime = 30
+	exit timeout = 5
+	runs = 3
+	pid = 55670
+	immediate reason = inefficient
+	forks = 110
+	execs = 4
+	initialized = 1
+	trampolined = 1
+	started suspended = 0
+	proxy started suspended = 0
+	checked allocations = 0 (queried = 1)
+	checked allocations reason = no host
+	checked allocations flags = 0x0
+	last exit code = 0
+
+	resource coalition = {
+		ID = 42897
+		type = resource
+		state = active
+		active count = 1
+		name = com.convivy.library
+	}
+
+	jetsam coalition = {
+		ID = 42898
+		type = jetsam
+		state = active
+		active count = 1
+		name = com.convivy.library
+	}
+
+	spawn type = daemon (3)
+	jetsam priority = 40
+	jetsam memory limit (active) = (unlimited)
+	jetsam memory limit (inactive) = (unlimited)
+	jetsamproperties category = daemon
+	jetsam thread limit = 32
+	cpumon = default
+	job state = running
+	sanitizer flags = 0x0
+
+	properties = keepalive | runatload | inferred program
+}

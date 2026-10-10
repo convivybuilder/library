@@ -1,0 +1,2076 @@
+#!/bin/sh
+# install-library — deploy-pin the Library (platform/decisions/0059).
+#
+# WHY. com.convivy.library's ProgramArguments used to exec
+# ~/Convivy/library/serve.sh directly — the development
+# checkout, and its WorkingDirectory too. Whatever was checked out there was
+# what served, including an unmerged branch, and launchd re-reads that on
+# every restart, including an unattended crash-restart under KeepAlive. On
+# 2026-08-20 the service served code 19 hours stale because the checkout sat
+# on a branch nobody switched back after merging through `gh`.
+#
+# WHAT THIS DOES, per ADR-0059 rules 1, 2, 3, 4, 6, 7, 8:
+#   1. Reads a git REF (default main), never the live working tree, via
+#      `git archive` — a `cp`/`rsync` of the checkout would ignore
+#      .gitignore and sweep the Library's gitignored credential files into
+#      the deploy area (rule 7).
+#   2. Extracts a COPY of the whole tracked tree at that commit into
+#      ~/.local/deploy/library/ (rule 2: copies, not symlinks). Nothing
+#      outside git's tracked blobs reaches the deploy area, which is what
+#      makes this safe where `cp -r`/`rsync` would not be.
+#   3. Builds a fresh venv inside that same deploy area from the exported
+#      requirements.txt, so the interpreter travels with the code rather
+#      than depending on the checkout's own .venv (rule 4).
+#   4. Runs the deployed serve.sh's own `--check` against the staged build,
+#      BEFORE the swap — the same interpreter-trust guard that has always
+#      gated a start now also gates an install, so a broken pip install or
+#      an untrusted interpreter chain never reaches the swap step, and it
+#      is the one check for this, not a second copy of it (the task's
+#      "that check moves with the service rather than being replaced").
+#      `--check` also imports `app` itself, under the plist this install is
+#      about to make live (`LIBRARY_CHECK_PLIST`, below) — a job plist
+#      missing a variable `app.py` or its imports require at import time now
+#      fails THIS step rather than crash-looping the live service (library
+#      issue issue_01M3W62VVYJPQ6N9Y85DF3ZQYP).
+#   5. Copies (never symlinks) the plist template out of the repo into
+#      ~/Library/LaunchAgents/, refusing to clobber a live plist that has
+#      drifted from what THIS installer itself last put there — its record
+#      at ~/.local/deploy/library-plist.sha256, not the new template — unless
+#      --force is given (rule 8). A template change over an unedited live
+#      plist is therefore never refused as drift; only an operator's own
+#      hand edit is. This comparison happens FIRST, before step 2, not
+#      after: see rule 6 below.
+#   6. When that comparison says the live plist is about to change (and the
+#      change is not refused), bootout's the job BEFORE step 2 ever stages
+#      anything — so neither the old code under the new environment nor the
+#      new code under the old environment is ever live — then, once steps 2-5
+#      land the new code and plist together, bootstraps it back and verifies,
+#      with bounded retries, that it is running, that every variable the new
+#      plist sets is the variable `launchctl print` reports back, and that
+#      the EFFECTIVE `exit timeout` `launchctl print` reports exceeds the
+#      deployed app.py's own drain deadline (issue_01M3N7NB9218HXKQDPD3NF1BJH:
+#      the plist's own `ExitTimeOut` integer is not what launchd necessarily
+#      applies). Skipped entirely whenever step 5's comparison found no
+#      change, or the
+#      change was refused as drift.
+#
+# Never touches ~/.library — the Chart House and the Archives (the vaults
+# LIBRARY_DB and LIBRARY_CLIENT_TOKENS point at) already live outside any
+# repo, read by absolute path, and this script has no line that opens,
+# writes, or copies anything under that directory (rule 3). Confirm by
+# reading this file: the only paths it writes are under $DEPLOY_DIR and
+# $LAUNCH_AGENTS.
+#
+# Idempotent and re-run-safe: each run stages a full new deploy area and
+# swaps it in atomically (old directory renamed aside, new one moved into
+# place) — never a partial mix of two commits' files, and a staged build that
+# fails its own --check is discarded before the swap ever runs, leaving
+# whatever was already deployed untouched. The same guarantee now covers the
+# job itself: when this install is reloading the job, the renamed-aside old
+# release is kept, not deleted, until the reload verifies — see the
+# "RELOADING INSTALL, STEP BY STEP" table below for exactly what each step
+# leaves on disk and loaded if it's the one that fails, and what recovery
+# does about it.
+#
+# Does not touch the vault write cutover's environment (LIBRARY_DB /
+# LIBRARY_WRITES_ENABLED) itself — those live in the plist this script only
+# copies, never edits.
+#
+# DOES reload the launchd job (bootout, then stage+swap+plist-write, then
+# bootstrap+verify) when the plist it is about to install differs from the
+# one that is live. See the step table below for why bootout has to come
+# before the code is staged rather than after.
+#
+# ALSO fast-forwards the checkout and migrates the vault before any of the
+# above, on an ordinary run: when $REPO has the named branch (main, by
+# default) checked out, with a clean tree and no merge or rebase in
+# progress, and that branch is behind origin, this runs `git merge
+# --ff-only` to catch it up; when the vault's alembic revision is then
+# behind the tree's new head, this backs it up with `sqlite3 .backup` and
+# runs `alembic upgrade head` from $REPO before staging anything. Neither
+# step ever stashes, resets, checks out, or cleans on the operator's
+# behalf, and neither runs when the branch named isn't the one checked
+# out — only an operator's own `git pull`/`alembic upgrade` reaches that
+# case, same as always. `--no-pull` and `--no-migrate` each turn one step
+# off, back to today's refuse-and-say-so behaviour; a pending revision
+# that sets `LIBRARY_AUTO_APPLY = False` (see alembic/README) always stops
+# instead of migrating, flag or no flag.
+set -eu
+
+# --- shared parsers, defined up front so the hidden test entry point right
+# below can call them without running the rest of this script. Neither is
+# part of the public interface (usage() does not list --internal-*);
+# tests/test_install_library.py invokes --internal-launchctl-env-pairs
+# directly, on stdin, against a captured real `launchctl print` fixture, so
+# the parser under test is the exact one this script runs, not a copy of it.
+
+# The token every shipped launchd/*.plist carries in place of a literal home
+# directory — launchd does not expand `$HOME` or `~` in a plist it loads, so
+# the checked-in template can never name the installing user's home as a
+# literal path and still be the same file on every machine. Rendered out by
+# _render_plist below, always against the real $HOME this script is running
+# with, never a path hardcoded to one operating system's own convention —
+# the Library has to run on Linux too (company/decisions/0010).
+PLIST_HOME_PLACEHOLDER='@@LIBRARY_HOME@@'
+
+# Replaces every literal occurrence of $1 in the text on stdin with $2,
+# treating both as plain strings — no regex, and no special meaning for `&`
+# or `\` in either, which is what sed's own `s/.../.../` or awk's own
+# gsub(regex, repl) replacement argument would both give those two
+# characters. $2 here is always $HOME, outside this script's control, so a
+# substitution mechanism that treated it as a pattern or a replacement
+# directive could corrupt the render on a $HOME containing either character.
+# Both strings reach awk through ENVIRON, which awk reads raw: `awk -v`
+# processes escape sequences in its value, so a `\t` in $HOME would render
+# as a tab.
+_replace_literal() {
+  _RL_FIND="$1" _RL_REPL="$2" awk '
+    BEGIN { find = ENVIRON["_RL_FIND"]; repl = ENVIRON["_RL_REPL"] }
+    {
+      line = $0
+      out = ""
+      flen = length(find)
+      while ((idx = index(line, find)) > 0) {
+        out = out substr(line, 1, idx - 1) repl
+        line = substr(line, idx + flen)
+      }
+      print out line
+    }
+  '
+}
+
+# Renders plist template $1 (read from the filesystem) against $HOME,
+# printing the result to stdout. The one substitution a shipped plist ever
+# needs: $PLIST_HOME_PLACEHOLDER for the installing user's own $HOME.
+_render_plist() {
+  _replace_literal "$PLIST_HOME_PLACEHOLDER" "$HOME" < "$1"
+}
+
+# Parses a plist file's own EnvironmentVariables into KEY=VALUE lines.
+_plist_env_pairs() {
+  awk '
+    /<key>EnvironmentVariables<\/key>/ { in_env=1; next }
+    in_env && /<\/dict>/ { in_env=0 }
+    in_env && /<key>/ {
+      k=$0; sub(/.*<key>/,"",k); sub(/<\/key>.*/,"",k); pending=k; next
+    }
+    in_env && pending != "" && /<string>/ {
+      v=$0; sub(/.*<string>/,"",v); sub(/<\/string>.*/,"",v)
+      print pending "=" v
+      pending=""
+    }
+  ' "$1"
+}
+
+# Reads `app.py`'s own `_DRAIN_DEADLINE_SECONDS` out of the deployed source
+# file at $1, truncated to whole seconds — `launchctl print`'s own `exit
+# timeout` is always an integer, and the constant carries a `.0` a plain
+# shell `-le` cannot compare against. Grep, not `import app`: importing the
+# real module pulls in every dependency app.py imports (fastapi, store, the
+# rest of the service) for a value that never leaves module scope, and this
+# runs from this script's own interpreter, not the staged venv.
+#
+# Matches only a top-level line — one that starts in column 0 with the exact
+# name — so a decoy in a comment, an indented copy, a same-prefix name
+# (`_DRAIN_DEADLINE_SECONDS_OLD`), or a string elsewhere in app.py can never
+# supply the value. Accepts both the plain assignment
+# (`_DRAIN_DEADLINE_SECONDS = 50.0`) and the annotated form
+# (`_DRAIN_DEADLINE_SECONDS: float = 50.0`), and strips a trailing `#`
+# comment before parsing the number. Prints nothing — never a non-numeric
+# string — when the line isn't found or what follows `=` isn't a plain
+# integer once whitespace, the annotation and any trailing comment are
+# stripped: this fail-closed shape is what lets the caller treat an empty
+# result as "could not read", the same as an unreadable `exit timeout`
+# (issue_01M3N7NB9218HXKQDPD3NF1BJH round 1: a skipped comparison here used
+# to verify a reload silently instead of failing it).
+_drain_deadline_seconds() {
+  awk '
+    /^_DRAIN_DEADLINE_SECONDS[ \t]*(:[ \t]*[A-Za-z_][A-Za-z0-9_]*[ \t]*)?=/ {
+      line = $0
+      sub(/^[^=]*=/, "", line)
+      sub(/#.*/, "", line)
+      gsub(/[ \t]/, "", line)
+      sub(/\.[0-9]*$/, "", line)
+      if (line ~ /^[0-9]+$/) print line
+      exit
+    }
+  ' "$1" 2>/dev/null
+}
+
+# Reads `launchctl print`'s text from stdin and emits ONLY its own
+# `environment = { ... }` block as KEY=VALUE lines — never `inherited
+# environment = { ... }` or `default environment = { ... }`, which real
+# `launchctl print` output also emits, each perfectly capable of containing
+# the literal substring "environment = {" itself (round 3 review, PR #157:
+# an unanchored `/environment[ \t]*=[ \t]*\{/` matches all three block
+# openers, pooling their pairs together — PATH, for one, is set in all
+# three, to three different values). The match requires "environment" to be
+# the FIRST non-whitespace token on the line, which the plist's own comment
+# (`launchd/com.convivy.library.plist`, over EnvironmentVariables) already
+# documents as the anchored form that tells this file apart from the two
+# it must not read: neither "inherited" nor "default" starts a line this
+# way. tests/fixtures/launchctl_print_library.txt is a real, once-captured
+# `launchctl print` of this job, checked for secrets before it was
+# committed (the environment it holds is paths and flags only) — the parser
+# is tested against it directly via --internal-launchctl-env-pairs below.
+_launchctl_env_actual_pairs() {
+  awk '
+    /^[ \t]*environment[ \t]*=[ \t]*\{[ \t]*$/ { in_env=1; next }
+    in_env {
+      line=$0
+      gsub(/^[ \t]+|[ \t]+$/, "", line)
+      if (line == "}") { in_env=0; next }
+      idx = index(line, " => ")
+      if (idx > 0) {
+        print substr(line, 1, idx-1) "=" substr(line, idx+4)
+      }
+    }
+  '
+}
+
+if [ "${1:-}" = "--internal-launchctl-env-pairs" ]; then
+  _launchctl_env_actual_pairs
+  exit 0
+fi
+
+# Not part of the public interface either (usage() does not list it) — lets
+# an operator render one of the four plists this script never installs
+# itself (cold-tier, cert-expiry-check, ci-result-fetch, deploy-watch — each
+# one's header points here) before copying it to ~/Library/LaunchAgents by
+# hand, and lets tests exercise the real renderer directly rather than a
+# reimplementation of it. From the deploy area, for one of the first three
+# (deploy-pinned, so the deploy area's own copy is the one that matters):
+#
+#   bin/install-library --internal-render-plist \
+#     launchd/com.convivy.library.cold-tier.plist \
+#     > ~/Library/LaunchAgents/com.convivy.library.cold-tier.plist
+#
+# deploy-watch is CHECKOUT-pinned instead (its own header says why), so
+# render it from the checkout rather than the deploy area:
+#
+#   bin/install-library --internal-render-plist \
+#     launchd/com.convivy.library.deploy-watch.plist \
+#     > ~/Library/LaunchAgents/com.convivy.library.deploy-watch.plist
+#
+# Copying the template raw installs the literal placeholder, which launchd
+# does not expand.
+if [ "${1:-}" = "--internal-render-plist" ]; then
+  [ -n "${2:-}" ] || { echo "install-library: --internal-render-plist needs a path" >&2; exit 2; }
+  _render_plist "$2"
+  exit 0
+fi
+
+usage() {
+  cat >&2 <<'EOF'
+usage: install-library [--ref=<git-ref>] [--repo=<path>]
+                        [--allow-non-main] [--force] [--status]
+                        [--allow-schema-behind] [--no-pull] [--no-migrate]
+                        [--python=<path>]
+
+  --ref=<git-ref>     Ref to install from (default: main). Classified by what
+                       it RESOLVES TO, not how it's spelled: when that is a
+                       local branch (a bare name, HEAD, or any refs/heads/...
+                       spelling) that $REPO does not currently have checked
+                       out, fetches origin first and refuses to install if
+                       the branch differs from origin's, in either direction
+                       — unchanged from before. When it IS the branch $REPO
+                       has checked out (true of the default, main, on an
+                       ordinary deploy checkout), fetches origin first and,
+                       if behind, fast-forwards it with `git merge
+                       --ff-only` instead of refusing (see --no-pull); still
+                       refuses, exactly as before, if ahead of or diverged
+                       from origin. When that is an origin remote-tracking
+                       ref (origin/<branch> or refs/remotes/origin/<branch>),
+                       fetches origin first and installs whatever that
+                       resolves to, so it's never stale. Either way, with no
+                       "origin" remote configured to verify against, this
+                       refuses rather than installing unverified. A full sha
+                       or a tag deploys as given, unfetched, with no origin
+                       needed.
+  --repo=<path>       Checkout to read the ref from (default: this script's
+                       own repo — resolved from argv[0], not the caller's cwd).
+  --allow-non-main    Required to install anything other than main (rule 6:
+                       the deploy area is installed from main).
+  --force             Overwrite a live plist that has drifted from what this
+                       installer last put there.
+  --status             Print what commit is currently deployed, the recorded
+                       plist sha256, and whether the live plist matches it,
+                       plus the vault's alembic revision, the tree's
+                       migration head, whether they match, whether $REPO's
+                       local main is behind origin/main, and (when the vault
+                       is behind) the pending revisions; exit. Never changes
+                       anything, and never fast-forwards or migrates.
+  --allow-schema-behind
+                       Required to install when the vault's alembic revision
+                       is unknown to the tree or could not be read at all —
+                       checked against the LIBRARY_DB the CURRENTLY LIVE
+                       plist sets (library issue
+                       issue_01M1JKC0AC3ZBBA3CXC2DGSVYH: the running service
+                       can self-restart onto newly staged code within
+                       seconds, with no migration ever applied). Also skips
+                       the auto-migrate below when the vault is simply
+                       behind, installing with the old schema state instead
+                       of migrating it. Skipped entirely when nothing is
+                       live yet to protect (no plist at $PLIST_LIVE).
+  --no-pull           Never fast-forward $REPO's checked-out branch — refuse
+                       instead whenever it differs from origin, in either
+                       direction, same as before this installer could pull
+                       at all.
+  --no-migrate        Never apply a pending migration — refuse instead
+                       whenever the vault's alembic revision is behind the
+                       tree's, same as before this installer could migrate
+                       at all.
+  --python=<path>     Interpreter to build the staged venv with, instead of
+                       the hardcoded macOS/Homebrew search below. Selects
+                       only which interpreter BUILDS the venv — the staged
+                       build still has to pass serve.sh's own ownership walk
+                       (rule 4) before it can go live, unchanged by this.
+EOF
+  exit 2
+}
+
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+REF="main"
+ALLOW_NON_MAIN=0
+PLIST_FORCE=0
+STATUS_ONLY=0
+ALLOW_SCHEMA_BEHIND=0
+NO_PULL=0
+NO_MIGRATE=0
+PYTHON_OVERRIDE=""
+
+for arg in "$@"; do
+  case "$arg" in
+    --ref=*) REF="${arg#--ref=}" ;;
+    --repo=*) REPO="${arg#--repo=}" ;;
+    --allow-non-main) ALLOW_NON_MAIN=1 ;;
+    --force) PLIST_FORCE=1 ;;
+    --status) STATUS_ONLY=1 ;;
+    --allow-schema-behind) ALLOW_SCHEMA_BEHIND=1 ;;
+    --no-pull) NO_PULL=1 ;;
+    --no-migrate) NO_MIGRATE=1 ;;
+    --python=*) PYTHON_OVERRIDE="${arg#--python=}" ;;
+    -h|--help) usage ;;
+    *) echo "install-library: unknown option: $arg" >&2; usage ;;
+  esac
+done
+
+DEPLOY_DIR="$HOME/.local/deploy/library"
+# INSTALL_LIBRARY_LAUNCH_AGENTS, INSTALL_LIBRARY_LAUNCHCTL (below) and
+# INSTALL_LIBRARY_LAUNCHD_DOMAIN (below, once $LABEL is known) let a test
+# harness redirect every launchd-facing operation this script makes — the
+# LaunchAgents directory it writes a plist into, the launchctl binary it
+# invokes, and the domain it targets — at a scratch directory, a stub binary
+# and a throwaway domain instead of the real ones, without this script
+# needing to know it is under test. Each defaults to the real value, so an
+# operator run is unchanged.
+LAUNCH_AGENTS="${INSTALL_LIBRARY_LAUNCH_AGENTS:-$HOME/Library/LaunchAgents}"
+PLIST_NAME="com.convivy.library.plist"
+PLIST_LIVE="$LAUNCH_AGENTS/$PLIST_NAME"
+PLIST_RECORD="$HOME/.local/deploy/library-plist.sha256"
+LAUNCHCTL="${INSTALL_LIBRARY_LAUNCHCTL:-launchctl}"
+
+say() { printf '\033[1;34m▸\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m!\033[0m %s\n' "$*" >&2; }
+
+# Find a real sha256 tool, never one a poisoned PATH could hand back — the
+# same principle, and the same shape, as the PYTHON_BIN search below: fixed
+# absolute paths first, `command -v` only as a last resort, fail closed if
+# neither turns up anything. Runs here, ahead of both the --status branch and
+# the drift decision, since --status hashes the live plist too and used to
+# reach that entirely via `command -v shasum`. shasum is the macOS tool,
+# sha256sum the Linux one (serve.sh's own UNAME_S guard is the same split).
+HASH_TOOL=""
+for cand in \
+    /usr/bin/shasum \
+    /opt/homebrew/bin/shasum \
+    /usr/local/bin/shasum \
+    /usr/bin/sha256sum \
+    /bin/sha256sum \
+    /opt/homebrew/bin/sha256sum \
+    /usr/local/bin/sha256sum
+do
+  if [ -x "$cand" ]; then HASH_TOOL="$cand"; break; fi
+done
+if [ -z "$HASH_TOOL" ]; then
+  HASH_TOOL="$(command -v shasum 2>/dev/null || command -v sha256sum 2>/dev/null || true)"
+fi
+[ -n "$HASH_TOOL" ] || {
+  echo "install-library: no sha256 tool found (checked /usr/bin/shasum," >&2
+  echo "  /opt/homebrew/bin, /usr/local/bin, /usr/bin/sha256sum, /bin, and PATH)" >&2
+  exit 1
+}
+
+# Hashes $1 with sha256, printing just the digest, via $HASH_TOOL above.
+_sha256() {
+  case "$HASH_TOOL" in
+    */shasum) "$HASH_TOOL" -a 256 "$1" | awk '{print $1}' ;;
+    *) "$HASH_TOOL" "$1" | awk '{print $1}' ;;
+  esac
+}
+
+# Records $1's sha256 as what this installer itself last put at $PLIST_LIVE
+# — the record the drift decision below reads, never the new template.
+# Written atomically (temp file, then `mv` within the same directory) so a
+# reader never observes a partial write. Tolerates its own failure (warns
+# and returns 0 either way) rather than aborting an install — under `set -e`
+# a bare failure here would abort a reload this function runs AFTER
+# verifying succeeded, over a bookkeeping file that isn't itself load-bearing
+# for anything already running.
+#
+# This record guards against an OPERATOR'S OWN hand edit going unnoticed, not
+# against a same-user adversary. The direct routes to the same plist swap —
+# editing $PLIST_LIVE, writing this file, running `install-library --force`
+# — are all overt, timed by whoever runs them. A same-user process can also
+# forge this file to match a live plist the operator has hand-edited, which
+# makes the OPERATOR'S NEXT ROUTINE install (no --force) discard that edit
+# silently, with no warning and a clean --status afterward — deferred and
+# invisible where the direct routes are not. That gap is accepted: anything
+# running as this user can already overwrite $PLIST_LIVE and reload the job,
+# so the forgery grants no privilege beyond what a same-UID process already
+# has, and closing it needs the deploy state to live under a user the agents
+# don't run as, which is not built.
+_write_plist_record() {
+  mkdir -p "$(dirname "$PLIST_RECORD")" 2>/dev/null || true
+  tmp="$PLIST_RECORD.tmp.$$"
+  if _sha256 "$1" > "$tmp" 2>/dev/null && mv "$tmp" "$PLIST_RECORD" 2>/dev/null; then
+    :
+  else
+    rm -f "$tmp" 2>/dev/null || true
+    warn "could not record the installed plist's sha256 at $PLIST_RECORD — a later install may need --force unnecessarily"
+  fi
+}
+
+# --- migration-state check (library issue issue_01M1JKC0AC3ZBBA3CXC2DGSVYH):
+# does the vault's alembic revision match the tree's migration head? Reads
+# only — the install flow below is what decides whether to back up and
+# migrate, never this check itself.
+
+# A python3 for READ-ONLY sqlite queries only — never for building the staged
+# venv (PYTHON_BIN below, found separately and held to a stricter trust rule).
+# sqlite3 the CLI tool cannot be used here instead: reproduced directly, the
+# `sqlite3` shell fails to open a WAL-mode database `mode=ro` once its -wal/
+# -shm files are absent ("unable to open database file"), while Python's own
+# `sqlite3` module with the same `mode=ro` URI reads correctly in every WAL
+# state (confirmed directly; store.py's `connect()` docstring records the
+# same finding for the real vault). Fixed absolute paths first, `command -v`
+# only as a fallback — same shape as HASH_TOOL above, though a stale PATH
+# finding the wrong python3 here only affects a diagnostic read, never a
+# build, so this is not held to that search's full paranoia.
+DB_READ_PYTHON=""
+for cand in \
+    /usr/bin/python3 \
+    /opt/homebrew/bin/python3 \
+    /usr/local/bin/python3
+do
+  if [ -x "$cand" ]; then DB_READ_PYTHON="$cand"; break; fi
+done
+if [ -z "$DB_READ_PYTHON" ]; then
+  DB_READ_PYTHON="$(command -v python3 2>/dev/null || true)"
+fi
+
+# The sqlite3 CLI, needed only for the auto-migrate path below: `.backup`
+# (which opens the live vault for real, WAL and all — unlike DB_READ_PYTHON's
+# read-only URI above) and the backup's own `pragma quick_check` afterward.
+# Fixed absolute paths first, `command -v` only as a fallback — same shape
+# as HASH_TOOL/DB_READ_PYTHON above. Checked for existence only where it's
+# actually used (an install that never reaches the migrate step needs no
+# sqlite3 at all), not here.
+SQLITE_BIN=""
+for cand in \
+    /usr/bin/sqlite3 \
+    /opt/homebrew/bin/sqlite3 \
+    /usr/local/bin/sqlite3
+do
+  if [ -x "$cand" ]; then SQLITE_BIN="$cand"; break; fi
+done
+if [ -z "$SQLITE_BIN" ]; then
+  SQLITE_BIN="$(command -v sqlite3 2>/dev/null || true)"
+fi
+
+# Prints $1's alembic_version.version_num, read via a `mode=ro&immutable=1`
+# URI, always — a write attempt on this connection raises rather than
+# silently succeeding, so this can never be what touches the vault. Prints
+# one of three sentinels instead of a revision when it can't:
+# __DB_MISSING__ (no file at $1), __NO_VERSION_TABLE__ (opened, but alembic
+# has never stamped it), or __UNREADABLE__ (any other failure — not a
+# database, locked, more than one row, no python3 found). A caller must
+# never treat __UNREADABLE__ or a missing python3 as "nothing pending"
+# (library issue issue_01M1JKC0AC3ZBBA3CXC2DGSVYH: "a naive implementation
+# will print an error that reads like 'no pending migrations'").
+#
+# Round 2 made this URI's `immutable=1` conditional on whether $1-wal
+# existed, reading plain `mode=ro` instead when it did, on the premise that
+# a live writer holding the database open was a rare, shutdown-adjacent
+# event. Round 3's reviewer named the actual code path: the live service's
+# own `store.connect_rw()` and every write route in app.py open a
+# connection, write, commit and close it in a `finally` block PER REQUEST —
+# not a connection held for the service's lifetime — so SQLite's own
+# non-atomic deletion of -wal and -shm on that last-connection close happens
+# on every write request, not just at shutdown. Confirmed directly: the live
+# vault normally has no -wal at all, and polling a disposable database
+# across repeated open-write-commit-close cycles caught `-wal` present with
+# `-shm` absent in roughly a quarter of samples — a real, repeatable
+# transient, not a constructed one. Round 2's plain-`mode=ro` branch, fed
+# that exact state by a read landing in the gap between this script's own
+# `[ -f "$db-wal" ]` check and the Python process it feeds (a process spawn,
+# not the few hundred microseconds the SQLite-internal deletion spans), can
+# itself CREATE a new -wal/-shm pair under the vault's own directory on a
+# build where a no-wal plain `mode=ro` open succeeds rather than raising
+# (Homebrew's python3, confirmed directly — the exact Linux-style build
+# platform/decisions/0010 requires this script to run on) — the write this
+# script's own invariant and the platform's "an install never writes state"
+# rule both forbid. `immutable=1` has nothing to open that way: it never
+# consults -wal and never performs the locking/journal probe a plain
+# `mode=ro` open does, so it creates no file in any state — confirmed
+# directly under both /usr/bin/python3 and Homebrew's python3, against a
+# database with no sidecars, with -wal and -shm both present, and with -wal
+# present and -shm absent.
+#
+# The cost of always reading `immutable=1`: it never consults -wal, so a
+# migration the live service has already committed but not yet checkpointed
+# into the main file reads as the OLD revision until the next checkpoint.
+# Since that checkpoint runs on every write request's connection close, not
+# just at shutdown, it lands within one request's lifetime of the migration
+# being applied — the caller (_compute_migration_state, below) retries a
+# "behind" read across that bound when -wal exists, rather than this
+# function ever branching on it itself.
+#
+# Still raises `no such table` exactly as before — confirmed directly — so
+# this changes nothing about telling that state apart from the others.
+_DB_READ_PY='
+import sqlite3
+import sys
+from urllib.parse import quote
+
+# A raw path interpolated into a sqlite URI defeats mode=ro/immutable: the
+# URI parser splits on the FIRST "?" in the whole string, so a path
+# containing "?" or "#" has everything after it, directory components and
+# all, swallowed as query or dropped as fragment (security-reviewer,
+# convivy/library#22 — store.py.db_uri fixed the identical bug; duplicated
+# rather than imported for the same reason that module gives for not
+# importing it from migrate.py: this has to run under whatever interpreter
+# PATH hands back, not the staged venv).
+db = sys.argv[1]
+encoded = quote(db, safe="/")
+uri = "file:%s?mode=ro&immutable=1" % encoded
+conn = None
+try:
+    conn = sqlite3.connect(uri, uri=True)
+    rows = conn.execute("SELECT version_num FROM alembic_version").fetchall()
+except sqlite3.OperationalError as exc:
+    print("__NO_VERSION_TABLE__" if "no such table" in str(exc) else "__UNREADABLE__")
+    sys.exit(0)
+except Exception:
+    print("__UNREADABLE__")
+    sys.exit(0)
+finally:
+    if conn is not None:
+        conn.close()
+if len(rows) == 1:
+    print(rows[0][0])
+else:
+    print("__UNREADABLE__")
+'
+
+_db_alembic_revision() {
+  db="$1"
+  [ -f "$db" ] || { echo "__DB_MISSING__"; return 0; }
+  [ -n "$DB_READ_PYTHON" ] || { echo "__UNREADABLE__"; return 0; }
+  "$DB_READ_PYTHON" -c "$_DB_READ_PY" "$db"
+}
+
+# The same read as _DB_READ_PY, minus the mode=ro&immutable=1 URI: a plain
+# `sqlite3.connect(db)`, exactly how store.py's own connect_rw() and the
+# `alembic upgrade head` call right before this one's every caller both open
+# the vault, so it sees a revision alembic just committed to the WAL even
+# when that commit's own checkpoint hasn't landed in the main file yet
+# (alembic's own connection does the write; this one only has to see it, the
+# same way any other ordinary reader of a WAL-mode database already would).
+# Never used for a read that has to create nothing — the --status path and
+# the pre-migration check both still read via _db_alembic_revision above —
+# only for the one re-read right after this script's own `alembic upgrade
+# head` has already written to the vault, where a -wal/-shm side effect is
+# nothing new.
+_DB_READ_LIVE_PY='
+import sqlite3
+import sys
+
+db = sys.argv[1]
+conn = None
+try:
+    conn = sqlite3.connect(db)
+    rows = conn.execute("SELECT version_num FROM alembic_version").fetchall()
+except sqlite3.OperationalError as exc:
+    print("__NO_VERSION_TABLE__" if "no such table" in str(exc) else "__UNREADABLE__")
+    sys.exit(0)
+except Exception:
+    print("__UNREADABLE__")
+    sys.exit(0)
+finally:
+    if conn is not None:
+        conn.close()
+if len(rows) == 1:
+    print(rows[0][0])
+else:
+    print("__UNREADABLE__")
+'
+
+_db_alembic_revision_live() {
+  db="$1"
+  [ -f "$db" ] || { echo "__DB_MISSING__"; return 0; }
+  [ -n "$DB_READ_PYTHON" ] || { echo "__UNREADABLE__"; return 0; }
+  "$DB_READ_PYTHON" -c "$_DB_READ_LIVE_PY" "$db"
+}
+
+# Finds the single alembic head among the version scripts at $1/alembic/
+# versions (a directory already materialized on disk — the deployed tree for
+# --status, or a throwaway `git archive` extraction of the commit being
+# installed, never the checkout's own working tree). Every script's own
+# `revision =` is a candidate; every script's `down_revision =` (handling a
+# merge's tuple form too) removes its target from the candidate set — what's
+# left is the head. Sets ALEMBIC_HEAD (the single revision) and ALEMBIC_REVS
+# (every revision found, newline-separated, for the caller's own membership
+# check) on success; on failure, ALEMBIC_HEAD is empty and
+# ALEMBIC_HEAD_REASON says why (no directory, no scripts, or an ambiguous —
+# zero or multiple — candidate set).
+_alembic_head_in_dir() {
+  versions_dir="$1/alembic/versions"
+  ALEMBIC_HEAD=""
+  ALEMBIC_REVS=""
+  ALEMBIC_HEAD_REASON=""
+  if [ ! -d "$versions_dir" ]; then
+    ALEMBIC_HEAD_REASON="no alembic/versions directory found"
+    return 1
+  fi
+  revs_file="${TMPDIR:-/tmp}/install-library-revs.$$"
+  downs_file="${TMPDIR:-/tmp}/install-library-downs.$$"
+  : > "$revs_file"
+  : > "$downs_file"
+  found_any=0
+  for f in "$versions_dir"/*.py; do
+    [ -f "$f" ] || continue
+    found_any=1
+    awk -F"['\"]" '/^revision[ \t]*=/{for (i=2;i<=NF;i+=2) print $i; exit}' "$f" >> "$revs_file"
+    awk -F"['\"]" '/^down_revision[ \t]*=/{for (i=2;i<=NF;i+=2) print $i; exit}' "$f" >> "$downs_file"
+  done
+  if [ "$found_any" -eq 0 ]; then
+    rm -f "$revs_file" "$downs_file"
+    ALEMBIC_HEAD_REASON="no migration scripts found in $versions_dir"
+    return 1
+  fi
+  ALEMBIC_REVS="$(cat "$revs_file")"
+  candidates="$(grep -vFxf "$downs_file" "$revs_file" 2>/dev/null || true)"
+  rm -f "$revs_file" "$downs_file"
+  count="$(printf '%s\n' "$candidates" | awk 'NF{c++} END{print c+0}')"
+  if [ "$count" -eq 1 ]; then
+    ALEMBIC_HEAD="$candidates"
+    return 0
+  fi
+  if [ "$count" -eq 0 ]; then
+    ALEMBIC_HEAD_REASON="no revision in $versions_dir is unreferenced as another's down_revision"
+  else
+    ALEMBIC_HEAD_REASON="$count candidate heads in $versions_dir (ambiguous)"
+  fi
+  return 1
+}
+
+# Classifies a raw _db_alembic_revision*/MIG_DB_REV reading against the
+# already-computed $ALEMBIC_HEAD/$ALEMBIC_REVS, filling MIG_STATE/MIG_DB_REV.
+# MIG_STATE is one of: db_missing | no_version_table | unreadable |
+# revision_unknown | behind | matching. A revision present in $ALEMBIC_REVS
+# but not equal to $ALEMBIC_HEAD is "behind" rather than walked through the
+# down_revision chain explicitly: alembic requires a single connected chain
+# to one head, and $ALEMBIC_HEAD is already confirmed unique, so any other
+# known revision in the set is necessarily its ancestor. Split out so both
+# _read_migration_state (below) and _read_migration_state_live (below) share
+# one classification, reading $1 through whichever connection their own
+# caller needs.
+_classify_db_revision() {
+  case "$1" in
+    __DB_MISSING__) MIG_STATE="db_missing"; MIG_DB_REV=""; return 0 ;;
+    __NO_VERSION_TABLE__) MIG_STATE="no_version_table"; MIG_DB_REV=""; return 0 ;;
+    __UNREADABLE__) MIG_STATE="unreadable"; MIG_DB_REV=""; return 0 ;;
+  esac
+  MIG_DB_REV="$1"
+  if [ "$MIG_DB_REV" = "$ALEMBIC_HEAD" ]; then
+    MIG_STATE="matching"
+  elif printf '%s\n' "$ALEMBIC_REVS" | grep -qxF "$MIG_DB_REV"; then
+    MIG_STATE="behind"
+  else
+    MIG_STATE="revision_unknown"
+  fi
+}
+
+# Reads $1 once via _db_alembic_revision (mode=ro&immutable=1 — never
+# consults -wal, never creates a file) and classifies it. Used by the
+# --status read and the pre-migration check, where a read must never have a
+# side effect of its own. Split out of _compute_migration_state below so
+# that function can call it again across the retry bound without
+# duplicating this logic.
+_read_migration_state() {
+  _classify_db_revision "$(_db_alembic_revision "$1")"
+}
+
+# Reads $1 once via _db_alembic_revision_live (a plain connection, which
+# sees the WAL) and classifies it the same way. Used ONLY right after this
+# script's own `alembic upgrade head` has already written to $1: that write
+# may still be sitting in the WAL, uncheckpointed, and the immutable read
+# _read_migration_state uses would then report the vault as still "behind"
+# on a migration that in fact succeeded (round 4 review).
+_read_migration_state_live() {
+  _classify_db_revision "$(_db_alembic_revision_live "$1")"
+}
+
+# Fills MIG_STATE, MIG_DB_PATH, MIG_DB_REV and MIG_WAL_RETRIED from the live
+# plist's own LIBRARY_DB — read the same way this script already reads any
+# plist's EnvironmentVariables, via _plist_env_pairs.
+#
+# A first "behind" read is retried in place, across
+# INSTALL_LIBRARY_SCHEMA_RETRY_TIMEOUT_SECONDS (default 2s, polled every
+# INSTALL_LIBRARY_SCHEMA_RETRY_POLL_SECONDS, default 0.2s), when
+# $MIG_DB_PATH-wal exists at that first read: _db_alembic_revision's
+# `immutable=1` read never consults -wal, so a migration the live service
+# has already committed but not yet checkpointed into the main file reads
+# as the OLD revision until the next checkpoint, which the live service
+# runs on every write request's connection close — within this bound, not
+# at shutdown (see the comment on $_DB_READ_PY above). A -wal file that was
+# never there to begin with has nothing pending to checkpoint, so that case
+# is left to report "behind" at once. MIG_WAL_RETRIED records whether this
+# retry ran at all, so a caller refusing on a "behind" that didn't clear can
+# tell an operator the check raced a real write rather than found a genuinely
+# stale vault.
+_compute_migration_state() {
+  MIG_DB_PATH=""
+  MIG_DB_REV=""
+  MIG_STATE=""
+  MIG_WAL_RETRIED=0
+  if [ -f "$PLIST_LIVE" ]; then
+    MIG_DB_PATH="$(_plist_env_pairs "$PLIST_LIVE" | awk -F= '$1=="LIBRARY_DB"{sub(/^[^=]*=/,""); print; exit}')"
+  fi
+  if [ -z "$MIG_DB_PATH" ]; then
+    MIG_STATE="no_library_db"
+    return 0
+  fi
+  if [ -z "$ALEMBIC_HEAD" ]; then
+    MIG_STATE="unreadable"
+    return 0
+  fi
+  _read_migration_state "$MIG_DB_PATH"
+  if [ "$MIG_STATE" = "behind" ] && [ -f "$MIG_DB_PATH-wal" ]; then
+    MIG_WAL_RETRIED=1
+    retry_timeout="${INSTALL_LIBRARY_SCHEMA_RETRY_TIMEOUT_SECONDS:-2}"
+    retry_poll="${INSTALL_LIBRARY_SCHEMA_RETRY_POLL_SECONDS:-0.2}"
+    retry_deadline=$(($(date +%s) + retry_timeout))
+    while [ "$MIG_STATE" = "behind" ] && [ "$(date +%s)" -lt "$retry_deadline" ]; do
+      sleep "$retry_poll"
+      _read_migration_state "$MIG_DB_PATH"
+    done
+  fi
+}
+
+# Walks down_revision links backward from $ALEMBIC_HEAD (set by a prior
+# _alembic_head_in_dir call) to (not including) $1 — a vault revision
+# _compute_migration_state has already classified as "behind" — reading
+# scripts from $2, a versions directory already materialized on disk. Sets
+# PENDING_REVS and PENDING_FILES, each newline-separated and newest-pending-
+# first, matched pair by line position. Returns nonzero, both left empty,
+# if the walk runs out of chain (current revision empty) before reaching
+# $1 — alembic's single chain must terminate there once $1 is a confirmed
+# member of $ALEMBIC_REVS and $ALEMBIC_HEAD is its confirmed unique head,
+# so hitting this means $2 changed underfoot since that classification, not
+# a normal outcome.
+_pending_migrations() {
+  target="$1"
+  versions_dir="$2"
+  PENDING_REVS=""
+  PENDING_FILES=""
+  current="$ALEMBIC_HEAD"
+  while [ -n "$current" ] && [ "$current" != "$target" ]; do
+    found=""
+    for f in "$versions_dir"/*.py; do
+      [ -f "$f" ] || continue
+      rv="$(awk -F"['\"]" '/^revision[ \t]*=/{for (i=2;i<=NF;i+=2) {print $i; exit}}' "$f")"
+      if [ "$rv" = "$current" ]; then found="$f"; break; fi
+    done
+    [ -n "$found" ] || break
+    if [ -z "$PENDING_REVS" ]; then PENDING_REVS="$current"; else PENDING_REVS="$PENDING_REVS
+$current"; fi
+    if [ -z "$PENDING_FILES" ]; then PENDING_FILES="$found"; else PENDING_FILES="$PENDING_FILES
+$found"; fi
+    current="$(awk -F"['\"]" '/^down_revision[ \t]*=/{for (i=2;i<=NF;i+=2) {print $i; exit}}' "$found")"
+  done
+  if [ "$current" != "$target" ]; then
+    PENDING_REVS=""
+    PENDING_FILES=""
+    return 1
+  fi
+  return 0
+}
+
+# Says whether $1, a pending revision file, must block the auto-migrate
+# below. Fails closed on the identifier LIBRARY_AUTO_APPLY: ANY occurrence
+# of it anywhere in $1 blocks UNLESS every occurrence is a plain
+# module-level assignment of True (`LIBRARY_AUTO_APPLY = True`, optionally
+# typed `LIBRARY_AUTO_APPLY: bool = True`). A one-regex match on the exact
+# `= False` spelling (what this used to be) let a type-annotated False, an
+# indented assignment, or a computed value through unmatched — silently
+# auto-applying the one migration (the Phase 3 drop-plus-VACUUM stage) this
+# flag exists to stop from ever running on an install's own timing
+# (security review, PR #231 round 1). Counting occurrences rather than
+# testing the first match means a file with two mentions, one safe and one
+# not, still blocks.
+_auto_apply_blocks_migration() {
+  file="$1"
+  total="$(grep -Ewc 'LIBRARY_AUTO_APPLY' "$file" 2>/dev/null || true)"
+  [ "${total:-0}" -gt 0 ] || return 1
+  safe="$(grep -Ec '^LIBRARY_AUTO_APPLY([[:space:]]*:[[:space:]]*bool)?[[:space:]]*=[[:space:]]*True[[:space:]]*$' "$file" 2>/dev/null || true)"
+  [ "$total" = "${safe:-0}" ] && return 1
+  return 0
+}
+
+# Says whether $1 (local) is behind, ahead of, or diverged from $2 (origin's
+# sha) against $REPO — used both by --status and by the branch-ref install
+# path below. The comparison this replaces (a plain `[ "$SHA" != "$ORIGIN_SHA" ]`)
+# already refused all three directions equally; this only says which one, so
+# the operator isn't told `pull --ff-only` for an unpushed local commit a
+# pull can't fix.
+_describe_divergence() {
+  if git -C "$REPO" merge-base --is-ancestor "$1" "$2" 2>/dev/null; then
+    echo "behind"
+  elif git -C "$REPO" merge-base --is-ancestor "$2" "$1" 2>/dev/null; then
+    echo "ahead of"
+  else
+    echo "diverged from"
+  fi
+}
+
+# Refuses — before anything is fetched or changed — unless $REPO is safe to
+# fast-forward branch $1 onto origin: $1 must be the branch actually checked
+# out (a merge acts on HEAD, not an arbitrary local ref — fast-forwarding a
+# branch that ISN'T checked out would merge its content into whatever IS),
+# no merge or rebase may already be in progress, and the working tree must
+# be clean (`git status --porcelain` prints nothing). Never stashes, resets,
+# checks out, or cleans anything itself — every refusal below names what's
+# wrong and leaves it for the operator. Exits directly rather than
+# returning, since every caller's own next step on a failure is the same:
+# stop before changing anything.
+_assess_checkout() {
+  branch="$1"
+  current_branch="$(git -C "$REPO" symbolic-ref --quiet --short HEAD 2>/dev/null)" || current_branch=""
+  if [ "$current_branch" != "$branch" ]; then
+    echo "install-library: REFUSING to pull — $REPO has '${current_branch:-a detached HEAD}' checked out, not '$branch'." >&2
+    echo "  check out '$branch' yourself first, or pass --no-pull to skip this." >&2
+    exit 1
+  fi
+  # --absolute-git-dir, never --git-dir: the latter returns a path relative
+  # to $REPO (because of -C), which a bare `[ -f "$git_dir/..." ]` below
+  # would then resolve against THIS SCRIPT's own cwd instead.
+  git_dir="$(git -C "$REPO" rev-parse --absolute-git-dir)"
+  if [ -f "$git_dir/MERGE_HEAD" ]; then
+    echo "install-library: REFUSING to pull — $REPO has a merge in progress (MERGE_HEAD exists)." >&2
+    echo "  resolve or abort it yourself first: git -C $REPO merge --abort" >&2
+    exit 1
+  fi
+  if [ -d "$git_dir/rebase-merge" ] || [ -d "$git_dir/rebase-apply" ]; then
+    echo "install-library: REFUSING to pull — $REPO has a rebase in progress." >&2
+    echo "  resolve or abort it yourself first: git -C $REPO rebase --abort" >&2
+    exit 1
+  fi
+  dirty="$(git -C "$REPO" status --porcelain)"
+  if [ -n "$dirty" ]; then
+    echo "install-library: REFUSING to pull — $REPO's working tree is not clean:" >&2
+    printf '%s\n' "$dirty" | sed 's/^/    /' >&2
+    echo "  commit, stash, or clean it yourself first — this never does any of that for you." >&2
+    exit 1
+  fi
+}
+
+# Prints, when $REPO's fetch of origin just failed, one more line naming
+# refs/stash and the command to remove it — a stash pushed in ANY linked
+# worktree of this repo lands at this one shared ref (library issue: on
+# 2026-10-08 a dispatched run's `git stash` in a linked worktree left
+# refs/stash pointing at a commit whose objects were never completed, and
+# every fetch in every worktree of that repo then failed with "fatal: bad
+# object refs/stash"). Never removes it — that is the operator's call, not
+# this script's.
+_stash_hint_on_fetch_failure() {
+  if git -C "$REPO" show-ref --verify --quiet refs/stash; then
+    echo "  refs/stash exists in $REPO and may be why — it is shared by every worktree of this repo, so a stash pushed in any of them lands here. Remove it with:" >&2
+    echo "    git -C $REPO update-ref -d refs/stash" >&2
+  fi
+}
+
+# --- --status: answer "what commit is this service serving", per ADR-0059's
+# closing requirement, and exit. No install side effects. -------------------
+if [ "$STATUS_ONLY" -eq 1 ]; then
+  STATUS_EXIT=0
+  if [ -f "$DEPLOY_DIR/DEPLOYED_COMMIT" ]; then
+    cat "$DEPLOY_DIR/DEPLOYED_COMMIT"
+  else
+    echo "install-library: nothing deployed yet at $DEPLOY_DIR" >&2
+    STATUS_EXIT=1
+  fi
+  if [ -f "$PLIST_RECORD" ]; then
+    RECORDED_SHA="$(cat "$PLIST_RECORD")"
+    echo "plist record: $RECORDED_SHA"
+    if [ -f "$PLIST_LIVE" ] && [ "$(_sha256 "$PLIST_LIVE")" = "$RECORDED_SHA" ]; then
+      echo "plist record matches the live plist"
+    else
+      echo "plist record does NOT match the live plist"
+    fi
+  else
+    echo "plist record: none (no install has recorded one yet)"
+  fi
+  _alembic_head_in_dir "$DEPLOY_DIR" || true
+  _compute_migration_state
+  case "$MIG_STATE" in
+    no_library_db)    echo "alembic db revision: unknown (LIBRARY_DB is not set in $PLIST_LIVE)" ;;
+    db_missing)       echo "alembic db revision: unknown (no database file at $MIG_DB_PATH)" ;;
+    no_version_table) echo "alembic db revision: unknown ($MIG_DB_PATH has no alembic_version table)" ;;
+    unreadable)       echo "alembic db revision: could not be read" ;;
+    *)                echo "alembic db revision: $MIG_DB_REV" ;;
+  esac
+  if [ -n "$ALEMBIC_HEAD" ]; then
+    echo "alembic tree head: $ALEMBIC_HEAD"
+  else
+    echo "alembic tree head: could not be determined (${ALEMBIC_HEAD_REASON:-unknown reason})"
+  fi
+  case "$MIG_STATE" in
+    matching)         echo "alembic: matching — the database is at the tree's head revision" ;;
+    behind)           echo "alembic: BEHIND — the database is at $MIG_DB_REV, the tree's head is $ALEMBIC_HEAD" ;;
+    revision_unknown) echo "alembic: the database's revision ($MIG_DB_REV) is unknown to this tree" ;;
+    *)                echo "alembic: could not be determined" ;;
+  esac
+  if [ "$MIG_STATE" = "behind" ] && _pending_migrations "$MIG_DB_REV" "$DEPLOY_DIR/alembic/versions"; then
+    echo "pending migrations (newest first):"
+    printf '%s\n' "$PENDING_REVS" | sed 's/^/    /'
+  fi
+
+  if git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
+    if git -C "$REPO" show-ref --verify --quiet refs/heads/main; then
+      LOCAL_MAIN="$(git -C "$REPO" rev-parse refs/heads/main)"
+      if git -C "$REPO" remote get-url origin >/dev/null 2>&1; then
+        if git -C "$REPO" fetch --quiet origin "+refs/heads/main:refs/remotes/origin/main" 2>/dev/null; then
+          ORIGIN_MAIN="$(git -C "$REPO" rev-parse refs/remotes/origin/main 2>/dev/null || true)"
+          if [ -n "$ORIGIN_MAIN" ]; then
+            if [ "$LOCAL_MAIN" = "$ORIGIN_MAIN" ]; then
+              echo "main: up to date with origin/main ($LOCAL_MAIN)"
+            else
+              echo "main: $(_describe_divergence "$LOCAL_MAIN" "$ORIGIN_MAIN") origin/main (local $LOCAL_MAIN, origin $ORIGIN_MAIN)"
+            fi
+          else
+            echo "main: origin has no 'main' branch to compare against"
+          fi
+        else
+          echo "main: could not fetch origin to compare"
+        fi
+      else
+        echo "main: no 'origin' remote configured in $REPO"
+      fi
+    else
+      echo "main: no local 'main' branch in $REPO"
+    fi
+  else
+    echo "main: $REPO is not a git checkout"
+  fi
+  exit "$STATUS_EXIT"
+fi
+
+git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1 || {
+  echo "install-library: $REPO is not a git checkout" >&2
+  exit 1
+}
+
+# --- refuse an ambiguous --ref outright, before any resolution runs ---------
+# (security review, PR #202 round 2; round 4 adds the sixth candidate below).
+# gitrevisions(7) documents six forms a bare short name falls back through,
+# in order: (1) $GIT_DIR/<name> (a pseudo-ref: HEAD, FETCH_HEAD, ORIG_HEAD,
+# MERGE_HEAD), (2) refs/<name>, (3) refs/tags/<name>, (4) refs/heads/<name>,
+# (5) refs/remotes/<name>, (6) refs/remotes/<name>/HEAD. This loop checks
+# (2) through (6) and deliberately leaves (1) uncovered: `--symbolic-full-name`
+# on a pseudo-ref returns the literal pseudo-ref name itself (e.g. the string
+# "FETCH_HEAD"), never a `refs/...` form and never empty, so it can land in
+# neither this loop's own ambiguity check nor the `''|HEAD` arm below — it
+# falls straight into the final `*)` catch-all, which refuses unconditionally
+# regardless of any same-named collision (confirmed directly, round 3
+# security review). A bare short name matching more than one of the five
+# forms this loop DOES check is ambiguous: plain `git rev-parse` silently
+# picks the first match (a tag beats a branch of the same name) and only
+# warns on stderr, which this file's own `2>/dev/null` calls below would
+# otherwise discard. Reproduced directly: a tag named `main` alongside
+# branch `main` makes `git rev-parse main` return the TAG's sha while
+# `git rev-parse --symbolic-full-name main` returns nothing — silently
+# landing in the `''|HEAD` arm below with no diagnostic either way, the exact
+# gap this check exists to close. Form (6) alone catches a bare name that
+# collides with a configured remote's own name: `git clone` auto-creates
+# refs/remotes/<remote>/HEAD, but never a bare refs/remotes/<remote> ref, so
+# a branch named the same as the remote (reproduced directly: a branch named
+# "origin" alongside the "origin" remote) is ambiguous by form (6) only —
+# forms (2) through (5) all miss it. A fully-qualified spelling
+# (refs/heads/main, refs/remotes/origin/main, refs/tags/v1) or the literal
+# token HEAD already names exactly one ref by construction and needs no
+# check here — HEAD in particular can never collide with a same-named branch
+# or tag, since git always resolves it against $GIT_DIR/HEAD first, ahead of
+# every form this loop checks.
+case "$REF" in
+  refs/*|HEAD) ;;
+  *)
+    AMBIGUOUS_REFS=""
+    AMBIGUOUS_COUNT=0
+    for candidate in "refs/$REF" "refs/tags/$REF" "refs/heads/$REF" "refs/remotes/$REF" "refs/remotes/$REF/HEAD"; do
+      if git -C "$REPO" show-ref --verify --quiet "$candidate"; then
+        AMBIGUOUS_REFS="$AMBIGUOUS_REFS
+$candidate"
+        AMBIGUOUS_COUNT=$((AMBIGUOUS_COUNT + 1))
+      fi
+    done
+    # Counted directly in the loop above, never via `... | grep -c .` on the
+    # accumulated string: `grep -c` exits 1 when it finds zero matching
+    # lines (even though it still prints "0"), and under this script's
+    # `set -eu`, a bare `VAR="$(cmd)"` assignment whose command substitution
+    # itself exits nonzero aborts the whole script right there — silently,
+    # with no message, since nothing had been echoed yet. Reproduced
+    # directly: any --ref with zero candidates (an explicit sha, or a name
+    # that resolves to nothing) hit exactly this and exited 1 with empty
+    # stdout and stderr, before ever reaching this check's own refusal
+    # message or the classification below it.
+    if [ "$AMBIGUOUS_COUNT" -gt 1 ]; then
+      echo "install-library: '$REF' is ambiguous — it could mean any of:" >&2
+      printf '%s\n' "$AMBIGUOUS_REFS" | sed -n 's/^./    &/p' >&2
+      echo "  pass a full ref name (one of the above) or a commit sha instead." >&2
+      exit 1
+    fi
+    ;;
+esac
+
+# --- classify what $REF RESOLVES TO, never how it's spelled -----------------
+# (library issue issue_01M1VW2D48D8F4B6BM6AK28D7F). A bare branch name like
+# the default "main" used to resolve against whatever the local checkout
+# last pointed at, with no comparison to the remote — on 2026-09 (PR #95) and
+# again on 2026-10-01 that deployed an old commit as a clean install of
+# "main", because the checkout had been fetched but never fast-forwarded.
+# Round 1 of this fix recognized "is $REF a branch" by matching the --ref
+# STRING against refs/heads/$REF, so --ref=refs/heads/main, --ref=HEAD, and
+# --ref=origin/<branch> each reached that identical gap by a different
+# spelling of the same ref (round 2 review). `git rev-parse
+# --symbolic-full-name` maps every spelling of the same ref to one answer:
+# refs/heads/<branch> for a local branch, refs/remotes/origin/<branch> for an
+# origin remote-tracking ref, refs/tags/<tag> for a tag, the literal string
+# "HEAD" for a detached checkout, or an empty string for a sha (also what a
+# $REF the ambiguity check above let through but that still fails to resolve
+# returns — each arm's own `rev-parse` call below catches that in turn). SHA
+# is (re)read from this classified full ref name inside each arm, never
+# reused from a separate, earlier resolution of the bare $REF, so the commit
+# verified against origin is always the exact commit that gets deployed
+# (security review, PR #202 round 2).
+FULL_REF="$(git -C "$REPO" rev-parse --symbolic-full-name "$REF" 2>/dev/null)" || FULL_REF=""
+
+HAS_ORIGIN=0
+git -C "$REPO" remote get-url origin >/dev/null 2>&1 && HAS_ORIGIN=1
+
+# True only for a full lowercase-or-uppercase hex object name (40 chars for
+# sha1, 64 for sha256) — the one shape the catch-all arm below accepts as "a
+# commit sha given explicitly", as opposed to an abbreviation or any other
+# revision expression (main~1, a short sha) `rev-parse` would also accept but
+# this installer has never documented as supported --ref input.
+_looks_like_full_commit_sha() {
+  case "$1" in
+    *[!0-9a-fA-F]*|'') return 1 ;;
+  esac
+  [ "${#1}" -eq 40 ] || [ "${#1}" -eq 64 ]
+}
+
+case "$FULL_REF" in
+  refs/heads/*)
+    # A local branch, however $REF spelled it. With no "origin" to verify it
+    # against, refuse rather than deploy it unverified (security review, PR
+    # #202 round 1): a checkout missing its remote — by accident, or a bare
+    # re-init — is exactly the state this guard exists to catch, not a
+    # reason to skip it silently.
+    BRANCH="${FULL_REF#refs/heads/}"
+    if [ "$HAS_ORIGIN" -ne 1 ]; then
+      echo "install-library: '$REF' names local branch '$BRANCH', which has no 'origin' remote configured to verify it against — REFUSING rather than installing it unverified." >&2
+      echo "  pass a full commit sha (never a branch name) to deploy without this check." >&2
+      exit 1
+    fi
+    SHA="$(git -C "$REPO" rev-parse "$FULL_REF" 2>/dev/null)" || {
+      echo "install-library: '$REF' (local branch '$BRANCH') does not resolve to a commit in $REPO" >&2
+      exit 1
+    }
+    # Only the branch $REPO actually has checked out can be fast-forwarded —
+    # `git merge --ff-only` acts on HEAD, so fast-forwarding a DIFFERENT
+    # local branch would merge ITS content onto whatever branch is checked
+    # out, not onto itself. A branch named here but not checked out (the
+    # "verify a branch before merge" use case --allow-non-main's own usage
+    # text names) keeps today's behaviour exactly: fetch, then refuse on any
+    # mismatch in either direction, pull or no pull.
+    CURRENT_BRANCH="$(git -C "$REPO" symbolic-ref --quiet --short HEAD 2>/dev/null)" || CURRENT_BRANCH=""
+    PULLING=0
+    [ "$NO_PULL" -ne 1 ] && [ "$BRANCH" = "$CURRENT_BRANCH" ] && PULLING=1
+    if [ "$PULLING" -eq 1 ]; then
+      _assess_checkout "$BRANCH"
+    fi
+    git -C "$REPO" fetch --quiet origin "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH" || {
+      echo "install-library: could not fetch origin to verify local branch '$BRANCH' is current" >&2
+      _stash_hint_on_fetch_failure
+      exit 1
+    }
+    ORIGIN_SHA="$(git -C "$REPO" rev-parse "refs/remotes/origin/$BRANCH" 2>/dev/null)" || {
+      echo "install-library: origin has no '$BRANCH' to compare against" >&2
+      exit 1
+    }
+    if [ "$SHA" != "$ORIGIN_SHA" ]; then
+      if [ "$PULLING" -eq 1 ] && git -C "$REPO" merge-base --is-ancestor "$SHA" "$ORIGIN_SHA" 2>/dev/null; then
+        say "'$BRANCH' is behind origin/$BRANCH — fast-forwarding from $SHA to $ORIGIN_SHA"
+        git -C "$REPO" merge --ff-only "refs/remotes/origin/$BRANCH" || {
+          echo "install-library: git merge --ff-only refs/remotes/origin/$BRANCH failed in $REPO" >&2
+          exit 1
+        }
+        SHA="$ORIGIN_SHA"
+      else
+        DIRECTION="$(_describe_divergence "$SHA" "$ORIGIN_SHA")"
+        echo "install-library: REFUSING to install — local branch '$BRANCH' ($SHA) is $DIRECTION origin/$BRANCH ($ORIGIN_SHA)." >&2
+        echo "  $REPO's local '$BRANCH' is not what origin has. Fix with:" >&2
+        echo "    git -C $REPO pull --ff-only" >&2
+        exit 1
+      fi
+    fi
+    ;;
+  refs/remotes/origin/*)
+    # An origin remote-tracking ref, however $REF spelled it (origin/<branch>
+    # or the full refs/remotes/origin/<branch> form) — fetched fresh so what
+    # deploys is CURRENT, not whatever this checkout last happened to fetch.
+    BRANCH="${FULL_REF#refs/remotes/origin/}"
+    if [ "$HAS_ORIGIN" -ne 1 ]; then
+      echo "install-library: '$REF' names origin's tracking ref for '$BRANCH', which has no 'origin' remote configured to refresh it from — REFUSING rather than installing it unverified." >&2
+      echo "  pass a full commit sha (never a branch name) to deploy without this check." >&2
+      exit 1
+    fi
+    git -C "$REPO" fetch --quiet origin "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH" || {
+      echo "install-library: could not fetch origin to refresh '$REF'" >&2
+      _stash_hint_on_fetch_failure
+      exit 1
+    }
+    SHA="$(git -C "$REPO" rev-parse "refs/remotes/origin/$BRANCH" 2>/dev/null)" || {
+      echo "install-library: origin has no '$BRANCH' to install" >&2
+      exit 1
+    }
+    say "'$REF' refreshed from origin: installing $SHA"
+    ;;
+  refs/tags/*)
+    # A tag. The ambiguity check above already ruled out a same-named branch
+    # for a bare spelling; a fully-qualified refs/tags/... spelling is
+    # unambiguous by construction. Not fetched or compared — this installer
+    # cannot fetch and compare a tag against a branch, so it deploys exactly
+    # as given, same as before this fix.
+    SHA="$(git -C "$REPO" rev-parse "$FULL_REF" 2>/dev/null)" || {
+      echo "install-library: '$REF' (tag '$FULL_REF') does not resolve to a commit in $REPO" >&2
+      exit 1
+    }
+    ;;
+  ''|HEAD)
+    # A full commit sha, or a detached HEAD (reported as the literal string
+    # "HEAD") — neither names a branch this installer can fetch and compare,
+    # so each deploys exactly as given, same as before this fix. Anything
+    # else landing here (an abbreviated sha, a relative expression like
+    # main~1) is refused rather than silently joining this unverified-deploy
+    # path (security review, PR #202 round 2): only a positively-identified
+    # full sha, or the detached-HEAD case, reaches the `rev-parse` below.
+    if [ "$FULL_REF" != "HEAD" ] && ! _looks_like_full_commit_sha "$REF"; then
+      echo "install-library: '$REF' does not resolve to a branch, a tag, or a full commit sha this installer recognizes — refusing rather than guessing what to deploy." >&2
+      exit 1
+    fi
+    SHA="$(git -C "$REPO" rev-parse "$REF" 2>/dev/null)" || {
+      echo "install-library: '$REF' does not resolve to a commit in $REPO" >&2
+      exit 1
+    }
+    ;;
+  *)
+    # $REF resolved to something this installer does not know how to
+    # classify (e.g. a ref outside refs/heads, refs/remotes/origin and
+    # refs/tags) — refused rather than falling through to an unchecked
+    # deploy by default.
+    echo "install-library: '$REF' resolves to '$FULL_REF', which install-library does not know how to classify — refusing rather than deploying it unchecked." >&2
+    exit 1
+    ;;
+esac
+
+if [ "$REF" != "main" ] && [ "$ALLOW_NON_MAIN" -ne 1 ]; then
+  echo "install-library: REFUSING to install ref '$REF' (resolves to $SHA)." >&2
+  echo "  ADR-0059 rule 6: the deploy area installs from main. Pass --allow-non-main" >&2
+  echo "  to install a different ref anyway (e.g. to verify a branch before merge)." >&2
+  exit 1
+fi
+
+# --- refuse to stage a vault behind $SHA's migration head (library issue
+# issue_01M1JKC0AC3ZBBA3CXC2DGSVYH): ahead of EVERYTHING else below — nothing
+# has been staged, no plist has been read or compared, no launchd call has
+# been made — because the hazard this guards is the running service itself
+# quiescing and restarting onto a staged commit within seconds of the swap
+# below, unprompted and with nobody watching (the 2026-09-04 and 2026-09-10
+# incidents this issue records: on a live job, `install-library` printing
+# "nothing was loaded, unloaded, kickstarted, or restarted" did not mean
+# nothing was about to happen).
+#
+# Skipped entirely when $PLIST_LIVE does not exist at all: with no job
+# loaded from a prior install, there is no running service that could
+# self-restart out from under an operator, so there is nothing here for this
+# gate to protect — the very first install onto a machine already requires
+# the vault to exist and be stamped by hand (store.py's baseline migration,
+# `alembic/versions/0b1e7c4a9d52_baseline_the_migrated_vaults.py`), outside
+# this installer's own scope.
+#
+# The tree's migration head is read from $SHA via `git archive`, never this
+# checkout's working tree (library issue issue_01M1JKC0AC3ZBBA3CXC2DGSVYH:
+# "Determine the tree's head from the alembic scripts in the commit being
+# installed") — the same principle as the code staged below, in a scratch
+# directory removed right after this check reads it.
+if [ -f "$PLIST_LIVE" ]; then
+  ALEMBIC_SCRATCH="${TMPDIR:-/tmp}/install-library-alembic-scratch.$$"
+  rm -rf "$ALEMBIC_SCRATCH"
+  mkdir -p "$ALEMBIC_SCRATCH"
+  git -C "$REPO" archive "$SHA" -- alembic/versions 2>/dev/null | tar -x -C "$ALEMBIC_SCRATCH" 2>/dev/null || true
+  _alembic_head_in_dir "$ALEMBIC_SCRATCH" || true
+  _compute_migration_state
+
+  # --- auto-migrate: only for "behind", never for a state where the vault's
+  # own revision is unknown or unreadable (an unknown revision usually means
+  # the vault is AHEAD of the tree — a rollback — which migrating would make
+  # worse, not better). $ALEMBIC_SCRATCH is kept alive through this whole
+  # block (not removed right after _alembic_head_in_dir, as it is on a run
+  # that never migrates) because _pending_migrations below reads the same
+  # version scripts a second time to walk the chain and check each one for
+  # LIBRARY_AUTO_APPLY. -----------------------------------------------------
+  if [ "$MIG_STATE" = "behind" ] && [ "$NO_MIGRATE" -ne 1 ] && [ "$ALLOW_SCHEMA_BEHIND" -ne 1 ]; then
+    if ! _pending_migrations "$MIG_DB_REV" "$ALEMBIC_SCRATCH/alembic/versions"; then
+      echo "install-library: REFUSING to install $SHA — could not walk the migration chain from $MIG_DB_REV to ${ALEMBIC_HEAD:-unknown} to find the pending revisions." >&2
+      rm -rf "$ALEMBIC_SCRATCH"
+      exit 1
+    fi
+    BLOCKED_FILE=""
+    while IFS= read -r pf; do
+      [ -n "$pf" ] || continue
+      if _auto_apply_blocks_migration "$pf"; then
+        BLOCKED_FILE="$pf"
+        break
+      fi
+    done <<PENDING_FILES_EOF
+$PENDING_FILES
+PENDING_FILES_EOF
+
+    if [ -n "$BLOCKED_FILE" ]; then
+      echo "install-library: REFUSING to migrate — $(basename "$BLOCKED_FILE") mentions LIBRARY_AUTO_APPLY without a plain 'LIBRARY_AUTO_APPLY = True' (see alembic/README)." >&2
+      echo "  run it by hand before the next install:" >&2
+      echo "    LIBRARY_DB=$MIG_DB_PATH $REPO/.venv/bin/python -m alembic upgrade head" >&2
+      rm -rf "$ALEMBIC_SCRATCH"
+      exit 1
+    fi
+
+    [ -n "$SQLITE_BIN" ] || {
+      echo "install-library: sqlite3 not found (checked /usr/bin, /opt/homebrew/bin, /usr/local/bin, and PATH) — cannot back up $MIG_DB_PATH to migrate it." >&2
+      rm -rf "$ALEMBIC_SCRATCH"
+      exit 1
+    }
+    SHORT_SHA="$(git -C "$REPO" rev-parse --short "$SHA" 2>/dev/null)" || SHORT_SHA="$SHA"
+    BACKUP_DEST="$MIG_DB_PATH.pre-deploy-$SHORT_SHA-$(date -u +%Y%m%dT%H%M%SZ)"
+    say "The vault is behind ($MIG_DB_REV, tree head ${ALEMBIC_HEAD:-unknown}) — backing it up to $BACKUP_DEST"
+    # sqlite3's own `.backup` dot-command, never `cp`: the vault runs in WAL
+    # mode, and a copy of the main file alone silently loses uncheckpointed
+    # writes `.backup` would not.
+    if ! "$SQLITE_BIN" "$MIG_DB_PATH" ".backup '$BACKUP_DEST'"; then
+      echo "install-library: REFUSING to install $SHA — could not back up $MIG_DB_PATH to $BACKUP_DEST" >&2
+      rm -rf "$ALEMBIC_SCRATCH"
+      exit 1
+    fi
+    # `sqlite3 -readonly` cannot open a WAL backup without a live writer; the
+    # same `mode=ro&immutable=1` URI this script already uses to read the
+    # vault's own revision opens it correctly in every WAL state.
+    BACKUP_CHECK="$("$SQLITE_BIN" "file:$BACKUP_DEST?immutable=1" 'pragma quick_check' 2>&1)" || true
+    if [ "$BACKUP_CHECK" != "ok" ]; then
+      echo "install-library: REFUSING to install $SHA — the backup at $BACKUP_DEST failed its own integrity check: $BACKUP_CHECK" >&2
+      rm -rf "$ALEMBIC_SCRATCH"
+      exit 1
+    fi
+    say "Backup verified ok — running alembic upgrade head from $REPO"
+    # From $REPO, never the deploy area: the deploy area's own alembic/
+    # versions still holds the CURRENTLY deployed revisions until the
+    # install below extracts the new tree, so `upgrade head` run there
+    # would resolve against the old graph. python -m alembic, never the
+    # `alembic` console script, so this runs under the same interpreter
+    # $REPO's own venv was built with.
+    if ! ( cd "$REPO" && LIBRARY_DB="$MIG_DB_PATH" "$REPO/.venv/bin/python" -m alembic upgrade head ); then
+      echo "install-library: REFUSING to install $SHA — alembic upgrade head failed. The vault's pre-migration backup is kept at:" >&2
+      echo "    $BACKUP_DEST" >&2
+      rm -rf "$ALEMBIC_SCRATCH"
+      exit 1
+    fi
+    _read_migration_state_live "$MIG_DB_PATH"
+    if [ "$MIG_STATE" != "matching" ]; then
+      echo "install-library: REFUSING to install $SHA — after alembic upgrade head, the vault reads '$MIG_STATE' ($MIG_DB_REV), not the tree's head (${ALEMBIC_HEAD:-unknown}). The vault's pre-migration backup is kept at:" >&2
+      echo "    $BACKUP_DEST" >&2
+      rm -rf "$ALEMBIC_SCRATCH"
+      exit 1
+    fi
+    say "Migrated: the vault is now at $MIG_DB_REV"
+  fi
+  rm -rf "$ALEMBIC_SCRATCH"
+
+  if [ "$MIG_STATE" != "matching" ] && [ "$ALLOW_SCHEMA_BEHIND" -ne 1 ]; then
+    echo "install-library: REFUSING to install $SHA — the vault's schema state is not confirmed safe." >&2
+    case "$MIG_STATE" in
+      no_library_db)
+        echo "  LIBRARY_DB is not set in the live plist ($PLIST_LIVE) — there is no database to check." >&2 ;;
+      db_missing)
+        echo "  no database file at $MIG_DB_PATH." >&2 ;;
+      no_version_table)
+        echo "  $MIG_DB_PATH has no alembic_version table (alembic has never stamped it)." >&2 ;;
+      unreadable)
+        echo "  the vault's alembic revision at $MIG_DB_PATH could not be read." >&2 ;;
+      revision_unknown)
+        echo "  the vault is at revision $MIG_DB_REV, which $SHA's migration scripts do not recognize." >&2 ;;
+      behind)
+        echo "  the vault is at revision $MIG_DB_REV; $SHA's migration head is ${ALEMBIC_HEAD:-unknown}." >&2
+        if [ "$MIG_WAL_RETRIED" -eq 1 ]; then
+          echo "  a -wal file was present and this was re-read for about ${retry_timeout:-2} seconds without the revision changing — re-run this check, since an in-progress write can still be mid-checkpoint." >&2
+        fi
+        if [ "$NO_MIGRATE" -eq 1 ]; then
+          echo "  --no-migrate was given, so this was never attempted automatically." >&2
+        fi
+        ;;
+    esac
+    if [ -n "$MIG_DB_PATH" ]; then
+      echo "  back up the vault, then apply the pending migration(s):" >&2
+      echo "    sqlite3 $MIG_DB_PATH \".backup '$MIG_DB_PATH.pre-deploy-\$(date -u +%Y%m%dT%H%M%SZ)'\"" >&2
+      echo "    LIBRARY_DB=$MIG_DB_PATH $REPO/.venv/bin/python -m alembic upgrade head" >&2
+    fi
+    echo "  pass --allow-schema-behind to install anyway." >&2
+    exit 1
+  fi
+  if [ "$MIG_STATE" != "matching" ]; then
+    warn "installing with the vault's schema state as '$MIG_STATE' — --allow-schema-behind was given"
+  fi
+fi
+
+# --- find a real interpreter, never one a poisoned PATH could hand back ----
+# A checkout's own .venv/bin can sit ahead of the system paths on PATH (true
+# of the shell that built this script), so `command -v python3.11` is tried
+# LAST, after the well-known absolute locations, and only as a fallback.
+#
+# --python=<path> skips this search entirely and takes the given interpreter
+# on faith to BUILD the venv with — it does not touch the trust guard below.
+# The staged build still has to pass the deployed serve.sh's own ownership
+# walk via `--check` before the swap (rule 4), same as every other install,
+# so an untrusted --python cannot reach a live swap; it can only fail its own
+# staged build's preflight. Every production invocation omits this and gets
+# the exact same hardcoded-path search as before.
+if [ -n "$PYTHON_OVERRIDE" ]; then
+  [ -x "$PYTHON_OVERRIDE" ] || {
+    echo "install-library: --python=$PYTHON_OVERRIDE is not an executable file" >&2
+    exit 1
+  }
+  PYTHON_BIN="$PYTHON_OVERRIDE"
+else
+  PYTHON_BIN=""
+  for cand in \
+      /opt/homebrew/bin/python3.11 \
+      /usr/local/bin/python3.11 \
+      /usr/bin/python3.11
+  do
+    if [ -x "$cand" ]; then PYTHON_BIN="$cand"; break; fi
+  done
+  if [ -z "$PYTHON_BIN" ]; then
+    PYTHON_BIN="$(command -v python3.11 2>/dev/null || true)"
+  fi
+  [ -n "$PYTHON_BIN" ] || {
+    echo "install-library: python3.11 not found (checked /opt/homebrew/bin," >&2
+    echo "  /usr/local/bin, /usr/bin, and PATH)" >&2
+    exit 1
+  }
+fi
+
+say "Installing the Library from $REF ($SHA) in $REPO, using $PYTHON_BIN"
+
+# --- decide, BEFORE anything else, whether this install will change what's
+# live — reading only `git show`, never the working tree, same as rule 1.
+# This has to run before the code is staged: the plist this install would
+# write is compared against the live one right here, and if it differs (and
+# --force allows the write), the job comes down NOW, before a single byte of
+# the new release exists on disk (security review, PR #157 round 1). Neither
+# "old code, new environment" nor "new code, old environment" can happen if
+# the job is never running while both are true — that's the whole reason this
+# comes first rather than after the swap. -------------------------------------
+mkdir -p "$LAUNCH_AGENTS"
+PLIST_CANDIDATE="$LAUNCH_AGENTS/$PLIST_NAME.candidate.$$"
+# The template read from git still carries $PLIST_HOME_PLACEHOLDER, never a
+# literal home directory — rendered here, against this run's own $HOME,
+# before the candidate is compared against anything or written anywhere.
+# Drift, the sha256 record, and the live file all see only rendered content
+# from this point on; none of them ever reads the raw template. Two steps
+# rather than a pipe: this /bin/sh has no pipefail, so a failed `git show`
+# piped into the renderer would leave an empty candidate instead of
+# stopping the install under `set -e`.
+git -C "$REPO" show "$SHA:launchd/$PLIST_NAME" > "$PLIST_CANDIDATE"
+_render_plist "$PLIST_CANDIDATE" > "$PLIST_CANDIDATE.rendered"
+mv "$PLIST_CANDIDATE.rendered" "$PLIST_CANDIDATE"
+
+LABEL="${PLIST_NAME%.plist}"
+LAUNCHD_DOMAIN="${INSTALL_LIBRARY_LAUNCHD_DOMAIN:-gui/$(id -u)}"
+
+# Drift is decided against $PLIST_RECORD — what THIS installer itself last
+# put at $PLIST_LIVE — never against the candidate template. Deciding it
+# against the template refused every shipped plist change as drift, since a
+# legitimate template change and an operator's hand edit look identical from
+# the template's side (library issue 01M3N7NH8F73WTKPN8WQGFZ3E2). A live
+# plist matching the record means the template is free to change under it,
+# reload included, with no --force; a live plist that does NOT match the
+# record — including when no record exists yet at all — is operator drift,
+# refused exactly as before.
+SAME_AS_CANDIDATE=0
+if [ -f "$PLIST_LIVE" ] && diff -q "$PLIST_LIVE" "$PLIST_CANDIDATE" >/dev/null 2>&1; then
+  SAME_AS_CANDIDATE=1
+fi
+
+IS_DRIFT=0
+if [ -f "$PLIST_LIVE" ] && [ "$SAME_AS_CANDIDATE" -ne 1 ]; then
+  if [ -f "$PLIST_RECORD" ] && [ "$(_sha256 "$PLIST_LIVE")" = "$(cat "$PLIST_RECORD")" ]; then
+    IS_DRIFT=0
+  else
+    IS_DRIFT=1
+  fi
+fi
+
+PLIST_REFUSED=0
+PLIST_WILL_WRITE=0
+if [ "$IS_DRIFT" -eq 1 ] && [ "$PLIST_FORCE" -ne 1 ]; then
+  PLIST_REFUSED=1
+  if [ -f "$PLIST_RECORD" ]; then
+    RECORDED_SHA_MSG="$(cat "$PLIST_RECORD" 2>/dev/null || echo '?')"
+  else
+    RECORDED_SHA_MSG="none (no prior install recorded one)"
+  fi
+  warn "live plist differs from what install-library last installed — NOT overwritten (--force to replace):"
+  warn "  recorded sha256: $RECORDED_SHA_MSG"
+  warn "  live sha256:     $(_sha256 "$PLIST_LIVE")"
+  diff -u "$PLIST_LIVE" "$PLIST_CANDIDATE" | sed 's/^/    /' || true
+  rm -f "$PLIST_CANDIDATE"
+elif [ "$SAME_AS_CANDIDATE" -ne 1 ]; then
+  PLIST_WILL_WRITE=1
+fi
+
+# ============================================================================
+# THE RELOADING INSTALL, STEP BY STEP. Only taken when PLIST_WILL_WRITE=1 (a
+# plist write that wasn't refused as drift). In order: bootout, retain $OLD,
+# stage the new tree, write the new plist, bootstrap, verify, clean up $OLD
+# and the backup. (The new tree is actually BUILT in a sibling directory,
+# $STAGE, while the previous release is still sitting at $DEPLOY_DIR and the
+# job is down — "retain $OLD" is what the swap step does with that previous
+# release once the staged build has already passed its own preflight, not a
+# step that runs before staging starts.)
+#
+# Every step's failure ends in exactly one of two outcomes:
+#   (i)  RESTORED — the previous release tree and plist are bootstrapped and
+#        verified as a pair, and $PLIST_LIVE is rewritten to match what's
+#        actually loaded.
+#   (ii) FAIL CLOSED — nothing is loaded; every file the exit message names
+#        is kept on disk, never deleted by the message that names it.
+#
+#   1. BOOTOUT. On disk: the previous release is still at $DEPLOY_DIR, the
+#      previous plist is still at $PLIST_LIVE ($PLIST_BACKUP is a copy of
+#      it, taken here). Loaded: nothing — `bootout`'s own exit status is
+#      ignored (`|| true`): a job that was never loaded is not an error, and
+#      nothing downstream depends on this call having succeeded.
+#
+#   2. STAGE THE NEW TREE (git archive, venv build, serve.sh --check) into
+#      $STAGE. On disk: $DEPLOY_DIR is untouched, $STAGE holds the
+#      candidate. Loaded: nothing. Recovery: outcome (i) if a previous
+#      plist backup exists (nothing to restore in the tree — it was never
+#      touched — so only the job needs bringing back up); outcome (ii)
+#      otherwise (there was nothing to restore to).
+#
+#   3. RETAIN $OLD, SWAP. $DEPLOY_DIR is renamed to $OLD, not deleted, then
+#      $STAGE is moved into $DEPLOY_DIR. Each `mv` here is guarded
+#      explicitly: if the second one fails, this tries to undo the first on
+#      the spot, moving $OLD back into $DEPLOY_DIR — but that restoring `mv`
+#      can itself fail (round 4 review, PR #157), and when it does, this
+#      does NOT claim the previous release was restored and does NOT clear
+#      $OLD: it fails closed, naming $OLD's actual path in the exit message,
+#      and $DEPLOY_DIR IS left empty until that path is moved back by hand.
+#      On disk after a clean swap: $DEPLOY_DIR holds the NEW release, $OLD
+#      the PREVIOUS one. Loaded: still nothing. Recovery: outcome (i), the
+#      pair-restore in the trap below — this is the code-swap step SWAP_DONE
+#      guards, so a failure here (either `mv`) is never seen as SWAP_DONE by
+#      the trap, and none of its own code-restore logic runs a second time
+#      for what this step already tried and reported on directly.
+#
+#   4. WRITE THE NEW PLIST. $PLIST_CANDIDATE (already diffed against the
+#      live one, above) is moved onto $PLIST_LIVE. On disk: $PLIST_LIVE now
+#      holds the NEW plist's bytes. Loaded: still nothing. Recovery: outcome
+#      (i), the pair-restore below.
+#
+#   5. BOOTSTRAP. `launchctl bootstrap` is handed $PLIST_LIVE. On disk:
+#      unchanged. Loaded: launchd has ACCEPTED the definition — not proof
+#      the process is up. A nonzero exit here means it was refused outright;
+#      nothing is loaded. Recovery: outcome (i), the pair-restore below —
+#      this is the LAST step where auto-recovery is attempted.
+#
+#   6. VERIFY. Bounded retries of `launchctl print`, confirming `state =
+#      running`, every EnvironmentVariables pair the new plist sets, and that
+#      the EFFECTIVE `exit timeout` it reports exceeds app.py's
+#      `_DRAIN_DEADLINE_SECONDS` (issue_01M3N7NB9218HXKQDPD3NF1BJH: the
+#      plist's own `ExitTimeOut` integer is not what launchd applies). On
+#      disk: unchanged. Loaded: the new pair MAY already be running by now.
+#      Once step 5 returned 0, a verify failure here does NOT trigger
+#      auto-recovery: the new process may already be up, and bootstrapping
+#      the old pair over it a second time, unasked, is not a safe default
+#      (round 1 review). This is outcome (ii), but unlike every other FAIL
+#      CLOSED case, "nothing is loaded" isn't certain — $PLIST_LIVE (new
+#      bytes) and $OLD (kept) are both left exactly as they are, and the
+#      exit message gives commands for both directions: retry forward with
+#      $PLIST_LIVE, or roll back by hand to $OLD and $PLIST_BACKUP.
+#
+#   7. CLEAN UP. Only reached once step 6 verifies. $PLIST_BACKUP and $OLD
+#      are removed — the new pair is confirmed loaded and correct.
+# ============================================================================
+RELOADING=0
+PRESERVE_FOR_OPERATOR=0
+PLIST_BACKUP=""
+OLD=""
+SWAP_DONE=0
+if [ "$PLIST_WILL_WRITE" -eq 1 ]; then
+  RELOADING=1
+  if [ -f "$PLIST_LIVE" ]; then
+    PLIST_BACKUP="$PLIST_LIVE.pre-reload.$$"
+    cp "$PLIST_LIVE" "$PLIST_BACKUP"
+  fi
+  say "Plist will change — taking $LABEL down before staging the new release"
+  "$LAUNCHCTL" bootout "$LAUNCHD_DOMAIN/$LABEL" >/dev/null 2>&1 || true
+fi
+
+# Verifies $1 (a plist path) against `launchctl print`: the job must read
+# `state = running`, every KEY=VALUE pair $1 sets under EnvironmentVariables
+# must appear, unaltered, in print's own environment block (via
+# _launchctl_env_actual_pairs above — never the inherited or default
+# blocks), and — the EFFECTIVE ExitTimeOut check, not the plist's own number
+# (issue_01M3N7NB9218HXKQDPD3NF1BJH: a plist that reads 75 was clamped by
+# launchd itself to 60, so the file's own integer proves nothing about what
+# launchd applies) — print's own `exit timeout` must exceed $DEPLOY_DIR/
+# app.py's `_DRAIN_DEADLINE_SECONDS`, read once via _drain_deadline_seconds
+# above rather than a second copy of that number in this script. FAILS
+# CLOSED on either side of that comparison: an empty `DRAIN_DEADLINE` (no
+# top-level `_DRAIN_DEADLINE_SECONDS` in app.py, or a value that isn't a
+# plain integer once _drain_deadline_seconds strips whitespace, the type
+# annotation and a trailing comment) or an empty `EXIT_TIMEOUT_ACTUAL` on a
+# running job (no `exit timeout` line in `launchctl print`'s own output)
+# fails verification exactly like a genuinely insufficient value would — a
+# real deploy area and a real launchd always have both, so an unreadable
+# side here is never a fixture exercising something else, only a broken
+# read to report as one (round 1 review, PR #159: this used to skip the
+# comparison silently and verify anyway). EXIT_TIMEOUT_INSUFFICIENT itself
+# starts at 1 and is cleared only by a `[ ... -gt ... ]` that both runs and
+# is true — a digit string too large for `[` to compare (both sides are
+# checked digits-only, not bounded in size) makes `[` print its own error
+# and return false, which leaves the flag at 1 exactly like a true
+# insufficient value would, rather than at its old default of 0 (round 2
+# review, PR #159: a comparison `[` cannot make used to leave this flag
+# unset and verify anyway). The caller's own failure message tells the two
+# unreadable cases apart from each other and from a value that read but was
+# either insufficient or too large to compare, and names where each one
+# looked.
+# Retries on a bound (INSTALL_LIBRARY_RELOAD_VERIFY_{TIMEOUT,POLL}_SECONDS,
+# 30s/2s in production) since launchd can take a moment after `bootstrap`
+# returns before `print` reflects the new state. Sets JOB_STATE, PRINT_OK,
+# MISSING, EXIT_TIMEOUT_ACTUAL, DRAIN_DEADLINE, DRAIN_DEADLINE_UNREADABLE,
+# EXIT_TIMEOUT_UNREADABLE, EXIT_TIMEOUT_INSUFFICIENT and VERIFY_TIMEOUT for
+# the caller's own failure message; returns 0/1 rather than printing
+# anything itself. Shared between the primary reload (step 6 above) and the
+# recovery trap's own pair-restore below — one definition, not two copies to
+# keep in sync.
+_verify_reload() {
+  verify_plist="$1"
+  VERIFY_TIMEOUT="${INSTALL_LIBRARY_RELOAD_VERIFY_TIMEOUT_SECONDS:-30}"
+  VERIFY_POLL="${INSTALL_LIBRARY_RELOAD_VERIFY_POLL_SECONDS:-2}"
+  env_pairs_file="${TMPDIR:-/tmp}/install-library-env-pairs.$$"
+  _plist_env_pairs "$verify_plist" > "$env_pairs_file"
+  DRAIN_DEADLINE="$(_drain_deadline_seconds "$DEPLOY_DIR/app.py")"
+  case "$DRAIN_DEADLINE" in
+    ''|*[!0-9]*) DRAIN_DEADLINE_UNREADABLE=1 ;;
+    *) DRAIN_DEADLINE_UNREADABLE=0 ;;
+  esac
+
+  VERIFIED=0
+  deadline=$(($(date +%s) + VERIFY_TIMEOUT))
+  while :; do
+    JOB_STATE="$("$LAUNCHCTL" print "$LAUNCHD_DOMAIN/$LABEL" 2>&1)" && PRINT_OK=1 || PRINT_OK=0
+    MISSING=""
+    EXIT_TIMEOUT_ACTUAL=""
+    EXIT_TIMEOUT_UNREADABLE=0
+    EXIT_TIMEOUT_INSUFFICIENT=1
+    if [ "$PRINT_OK" -eq 1 ]; then
+      case "$JOB_STATE" in
+        *"state = running"*)
+          actual_env_file="${TMPDIR:-/tmp}/install-library-actual-env.$$"
+          printf '%s\n' "$JOB_STATE" | _launchctl_env_actual_pairs > "$actual_env_file"
+          while IFS='=' read -r k v; do
+            [ -n "$k" ] || continue
+            if ! grep -qxF -- "$k=$v" "$actual_env_file"; then
+              MISSING="$MISSING $k"
+            fi
+          done < "$env_pairs_file"
+          rm -f "$actual_env_file"
+          EXIT_TIMEOUT_ACTUAL="$(printf '%s\n' "$JOB_STATE" | \
+            sed -n 's/^[ 	]*exit timeout = \([0-9][0-9]*\).*/\1/p' | head -n 1)"
+          [ -z "$EXIT_TIMEOUT_ACTUAL" ] && EXIT_TIMEOUT_UNREADABLE=1
+          if [ "$EXIT_TIMEOUT_UNREADABLE" -eq 0 ] && [ "$DRAIN_DEADLINE_UNREADABLE" -eq 0 ] && \
+             [ "$EXIT_TIMEOUT_ACTUAL" -gt "$DRAIN_DEADLINE" ] 2>/dev/null; then
+            EXIT_TIMEOUT_INSUFFICIENT=0
+          fi
+          [ -z "$MISSING" ] && [ "$EXIT_TIMEOUT_UNREADABLE" -eq 0 ] && \
+            [ "$DRAIN_DEADLINE_UNREADABLE" -eq 0 ] && [ "$EXIT_TIMEOUT_INSUFFICIENT" -eq 0 ] && \
+            VERIFIED=1
+          ;;
+      esac
+    fi
+    [ "$VERIFIED" -eq 1 ] && break
+    [ "$(date +%s)" -lt "$deadline" ] || break
+    sleep "$VERIFY_POLL"
+  done
+  rm -f "$env_pairs_file"
+  [ "$VERIFIED" -eq 1 ]
+}
+
+# --- recovery trap. Reachable on any nonzero exit while RELOADING=1.
+#
+# If PRESERVE_FOR_OPERATOR was set before the exit (step 6's verify-timeout,
+# the one case where auto-recovery is deliberately not attempted — see the
+# step table above), this does only the shared candidate cleanup plus one
+# more thing: $PLIST_LIVE already holds the new plist's bytes at this point
+# (step 6 is only reached after that mv succeeded), so the record is
+# rewritten to match it, same as every other recovery outcome below — a
+# reader comparing $PLIST_RECORD to $PLIST_LIVE right after this exit must
+# see them agree, not a record still describing whatever plist was live
+# before this install ran (round 2 review, PR #158). $OLD and $PLIST_BACKUP
+# are left exactly as this exit path already named them.
+#
+# Otherwise ($LABEL's own bootstrap was never issued, or was refused
+# outright), this attempts outcome (i): move $DEPLOY_DIR's failed contents
+# aside, move $OLD back into place, bootstrap $PLIST_BACKUP, and verify it —
+# the SAME verify step 6 uses, not a second copy. If that whole chain
+# succeeds, $PLIST_LIVE is rewritten to match (rule: the file on disk must
+# never disagree with what's loaded, `launchd/com.convivy.library.plist`'s
+# own comment on this exact hazard) — and the plist RECORD is rewritten
+# right after, whether or not that rewrite of $PLIST_LIVE itself succeeded,
+# so the record can never disagree with whatever bytes are actually sitting
+# at $PLIST_LIVE (round 1 review, PR #158: a failed rewrite used to leave the
+# record at its pre-reload value, stale against the file it's compared to).
+# If any part of it fails, this ends in
+# outcome (ii): the job is bootout'd (in case a partial bootstrap took),
+# $PLIST_LIVE is removed (it no longer describes anything loaded — leaving
+# it would fool a LATER install's own drift-diff into thinking nothing
+# changed, round 3 review), and the message names $OLD and/or $PLIST_BACKUP
+# with the exact commands to load them by hand. Neither is ever deleted in
+# this branch.
+#
+# Every filesystem operation below is checked explicitly, on its own exit
+# status, never on `set -e` doing it implicitly — `set +e` is this
+# function's own first executed statement (after `st=$?`, which has to come
+# first or the capture itself is what `set +e`'s own exit status clobbers).
+# Round 3 review already found `set -e` an unreliable way to stop this
+# function early on this /bin/sh, bash 3.2.57; round 4 (PR #157) found the
+# fix incomplete — four `rm` calls below were still bare, each one able to
+# abort the trap mid-message on a real failure, taking the RECOVERY FAILED
+# text and the correct exit status with it. `set +e` closes that off
+# structurally rather than leaving it to how reliably this bash honors an
+# `if`/`||`'s protected-context exemption while already inside a running
+# trap. The previous release is always moved aside, never deleted, until its
+# replacement is confirmed in place.
+_recover_failed_reload() {
+  st=$?
+  set +e
+  rm -f "$PLIST_CANDIDATE" 2>/dev/null || true
+
+  if [ "$PRESERVE_FOR_OPERATOR" -eq 1 ]; then
+    _write_plist_record "$PLIST_LIVE"
+    exit "$st"
+  fi
+  if [ "$st" -eq 0 ] || [ "$RELOADING" -ne 1 ]; then
+    rm -f "$PLIST_BACKUP" 2>/dev/null || true
+    exit "$st"
+  fi
+
+  warn "install failed after taking $LABEL down for reload"
+
+  if [ -z "$PLIST_BACKUP" ] || [ ! -f "$PLIST_BACKUP" ]; then
+    warn "$LABEL was not previously loaded — nothing to restore, it stays down"
+    if [ "$SWAP_DONE" -eq 1 ] && [ -f "$PLIST_LIVE" ]; then
+      if [ "${INSTALL_LIBRARY_TEST_FAIL_TRAP_RM:-0}" = "1" ] || ! rm -f "$PLIST_LIVE"; then
+        warn "could not remove stale $PLIST_LIVE — remove it by hand before the next install"
+      fi
+    fi
+    exit "$st"
+  fi
+
+  code_restored=1
+  if [ "$SWAP_DONE" -eq 1 ]; then
+    if [ -n "$OLD" ] && [ -d "$OLD" ]; then
+      BROKEN="$DEPLOY_DIR.broken.$$"
+      if ! mv "$DEPLOY_DIR" "$BROKEN"; then
+        code_restored=0
+      # INSTALL_LIBRARY_TEST_FAIL_RECOVERY_SWAP is a test-only seam
+      # (tests/test_install_library.py) that forces this specific `mv` to
+      # fail without needing a real filesystem-level failure — everything
+      # after the `||` is the real guarded recovery path either way. The
+      # same seam also forces the primary swap's own restoring `mv` further
+      # up the script (identical command, `mv "$OLD" "$DEPLOY_DIR"`), so a
+      # test that sets it exercises whichever of the two is actually reached.
+      elif [ "${INSTALL_LIBRARY_TEST_FAIL_RECOVERY_SWAP:-0}" = "1" ] || ! mv "$OLD" "$DEPLOY_DIR"; then
+        mv "$BROKEN" "$DEPLOY_DIR" 2>/dev/null || true
+        code_restored=0
+      else
+        if [ "${INSTALL_LIBRARY_TEST_FAIL_TRAP_RM:-0}" = "1" ] || ! rm -rf "$BROKEN"; then
+          warn "could not remove leftover $BROKEN — the restored release at $DEPLOY_DIR is unaffected; remove it by hand"
+        fi
+        OLD=""
+      fi
+    else
+      code_restored=0
+    fi
+  fi
+
+  if [ "$code_restored" -eq 1 ] && \
+     "$LAUNCHCTL" bootstrap "$LAUNCHD_DOMAIN" "$PLIST_BACKUP" >/dev/null 2>&1 && \
+     _verify_reload "$PLIST_BACKUP"; then
+    # INSTALL_LIBRARY_TEST_FAIL_RECOVERY_CP forces this `cp` to fail without
+    # needing a real filesystem-level failure — see the record-write below,
+    # which runs either way so the record can never go stale relative to
+    # whatever is actually at $PLIST_LIVE afterward (round 1 review, PR #158).
+    if [ "${INSTALL_LIBRARY_TEST_FAIL_RECOVERY_CP:-0}" != "1" ] && cp "$PLIST_BACKUP" "$PLIST_LIVE" 2>/dev/null; then
+      warn "restored: $LABEL bootstrapped from the previous release and plist"
+      if [ "${INSTALL_LIBRARY_TEST_FAIL_TRAP_RM:-0}" = "1" ] || ! rm -f "$PLIST_BACKUP"; then
+        warn "restored and $PLIST_LIVE matches, but stale backup $PLIST_BACKUP could not be removed — remove it by hand"
+      fi
+    else
+      warn "restored: $LABEL bootstrapped from the previous release and plist," \
+           "but $PLIST_LIVE could not be rewritten to match — it IS loaded and" \
+           "correct; fix the file by hand: cp $PLIST_BACKUP $PLIST_LIVE"
+    fi
+    # Always records what's actually at $PLIST_LIVE now, whether or not the
+    # cp above landed — the record must never disagree with the file on
+    # disk, even when that file (still the failed reload's own candidate)
+    # disagrees with what's loaded; the warning above already tells the
+    # operator that part by hand (round 1 review, PR #158: a failed cp used
+    # to leave the record at its pre-reload value, silently mismatched
+    # against the candidate bytes still sitting at $PLIST_LIVE).
+    _write_plist_record "$PLIST_LIVE"
+    exit "$st"
+  fi
+
+  "$LAUNCHCTL" bootout "$LAUNCHD_DOMAIN/$LABEL" >/dev/null 2>&1 || true
+  if [ -f "$PLIST_LIVE" ]; then
+    if [ "${INSTALL_LIBRARY_TEST_FAIL_TRAP_RM:-0}" = "1" ] || ! rm -f "$PLIST_LIVE"; then
+      warn "could not remove stale $PLIST_LIVE — remove it by hand before the next install"
+    fi
+  fi
+  echo "install-library: RECOVERY FAILED — $LABEL is down." >&2
+  if [ "$code_restored" -eq 0 ]; then
+    echo "    could not restore the previous release tree to $DEPLOY_DIR" >&2
+    if [ -n "$OLD" ] && [ -d "$OLD" ]; then
+      echo "    (the new release is still there); the previous one is intact at:" >&2
+      echo "      $OLD" >&2
+      echo "    move it back by hand, then retry:" >&2
+      echo "      mv $OLD $DEPLOY_DIR" >&2
+    else
+      echo "    and no previous release was retained to restore it from" >&2
+    fi
+  fi
+  echo "    to load the previous plist:" >&2
+  echo "    $LAUNCHCTL bootstrap $LAUNCHD_DOMAIN $PLIST_BACKUP" >&2
+  exit "$st"
+}
+trap '_recover_failed_reload' EXIT
+
+# --- stage the release in a sibling dir, never in place ---------------------
+# git archive reads the commit object, not the working tree, so an untracked
+# or gitignored file on disk (credentials, scratch state, a stray .db) is
+# invisible to it — this is what makes it safe where `cp -r`/`rsync` would
+# not be (rule 7). The whole tracked tree is exported: nothing here curates
+# a subset, so a file added to the repo later needs no installer change to
+# reach the deploy area.
+mkdir -p "$(dirname "$DEPLOY_DIR")"
+STAGE="$DEPLOY_DIR.new"
+rm -rf "$STAGE"
+mkdir -p "$STAGE"
+
+git -C "$REPO" archive "$SHA" | tar -x -C "$STAGE"
+chmod +x "$STAGE/serve.sh"
+
+# --- keep pip's own cache, and any source build's toolchain cache, out of
+# $HOME --------------------------------------------------------------------
+# pip writes its wheel/HTTP cache to $HOME/.cache by default on every
+# invocation, whether or not anything ends up installed — including the
+# internal pip run `python -m venv` shells out to via ensurepip to seed the
+# new venv, before requirements.txt is ever read. A source build for a
+# Rust-backed dependency (pydantic-core, tokenizers, py-rust-stemmers — none
+# guaranteed a prebuilt wheel for every platform/interpreter combination)
+# additionally invokes cargo, which creates $HOME/.cargo and $HOME/.rustup on
+# first use unless CARGO_HOME/RUSTUP_HOME are already set. All three read
+# $HOME from the environment, so all three would otherwise land inside
+# whatever $HOME this script is running under — never acceptable (rule 3's
+# principle, that nothing outside the deploy area and LaunchAgents gets
+# written under $HOME, extends to this). Everything from here through the
+# pip install below is confined to a scratch directory inside the staging
+# area and removed once the install finishes; a failed install already
+# discards the whole $STAGE, taking any partial cache with it. XDG_CACHE_HOME
+# is set too as a catch-all for any other tool a future dependency might pull
+# in that falls back to it.
+BUILD_CACHE="$STAGE/.build-cache"
+mkdir -p "$BUILD_CACHE"
+export CARGO_HOME="$BUILD_CACHE/cargo"
+export RUSTUP_HOME="$BUILD_CACHE/rustup"
+export PIP_CACHE_DIR="$BUILD_CACHE/pip"
+export XDG_CACHE_HOME="$BUILD_CACHE/xdg"
+
+say "Building pinned interpreter ($PYTHON_BIN -m venv)"
+"$PYTHON_BIN" -m venv "$STAGE/.venv"
+"$STAGE/.venv/bin/pip" install --quiet --disable-pip-version-check \
+    -r "$STAGE/requirements.txt"
+rm -rf "$BUILD_CACHE"
+unset CARGO_HOME RUSTUP_HOME PIP_CACHE_DIR XDG_CACHE_HOME
+
+{
+  echo "ref: $REF"
+  echo "commit: $SHA"
+  echo "installed_at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "installed_from: $REPO"
+} > "$STAGE/DEPLOYED_COMMIT"
+
+# --- validate the staged build BEFORE it can become live --------------------
+# serve.sh's own preflight is the interpreter-trust and import check this
+# service has always started under (ownership walk, ACL check, `fastapi`/
+# `uvicorn`/`sqlite_vec`/`fastembed` importability, and now `app` itself —
+# see serve.sh's own "the app's own import-time configuration refusals" for
+# why that last one was added) — reused here rather than re-implemented, so
+# an install and a start are held to the same guard. `--dir` is not a
+# serve.sh option: it derives DIR from its OWN resolved path, so running the
+# STAGED copy is what makes this check about the staged build rather than
+# the checkout. `SERVE_ALLOW_BRANCH` is unset here deliberately — $STAGE has
+# no `.git` (git archive exports no repository), which is serve.sh's
+# documented no-git passthrough, not a branch to bypass.
+#
+# `LIBRARY_CHECK_PLIST` names the plist whose `EnvironmentVariables` serve.sh
+# imports `app` under — the one this install is ABOUT TO MAKE LIVE, never the
+# live plist by default, because judging the new code against the environment
+# it will actually run with is the whole point (library issue
+# issue_01M3W62VVYJPQ6N9Y85DF3ZQYP: cd9693a's crash loop is exactly the gap a
+# check against this installer's own shell environment would have missed
+# again). When the plist write below is refused as drift, the candidate is
+# never written and the OLD live plist is what stays loaded under the new
+# code instead, so that is what gets checked.
+CHECK_PLIST="$PLIST_CANDIDATE"
+[ "$PLIST_REFUSED" -ne 1 ] || CHECK_PLIST="$PLIST_LIVE"
+if ! LIBRARY_CHECK_PLIST="$CHECK_PLIST" "$STAGE/serve.sh" --check; then
+  warn "the staged build failed serve.sh's own preflight — discarding it," \
+       "the previous deploy (if any) is untouched"
+  rm -rf "$STAGE"
+  exit 1
+fi
+
+# --- swap: the deploy area is replaced as one unit, never merged with the
+# previous release, so a partial file mix across two commits can't happen.
+# Nothing above this line can have touched the live $DEPLOY_DIR. When this
+# install is reloading the job, $OLD is kept rather than deleted here: a
+# `launchctl bootstrap` failure below has to be able to restore the previous
+# release tree, not just the previous plist (round 2 review, PR #157). It is
+# removed once the reload verifies, or consumed by the recovery trap on a
+# failure. When the plist isn't changing, nothing below can fail in a way
+# that needs it, so it goes right away as before. Both moves are guarded
+# explicitly: if the second one fails, this tries to undo the first on the
+# spot — but that restoring `mv` can itself fail, and when it does, this
+# does NOT claim the previous release was restored and does NOT clear $OLD
+# (round 4 review, PR #157): it fails closed, naming $OLD's actual path so
+# an operator can move it back by hand, and $DEPLOY_DIR IS left empty in
+# that case. ---
+OLD=""
+if [ -d "$DEPLOY_DIR" ]; then
+  OLD="$DEPLOY_DIR.old.$$"
+  if ! mv "$DEPLOY_DIR" "$OLD"; then
+    echo "install-library: could not move $DEPLOY_DIR aside for the swap — the previous release is untouched" >&2
+    exit 1
+  fi
+fi
+if [ "${INSTALL_LIBRARY_TEST_FAIL_PRIMARY_SWAP:-0}" = "1" ] || ! mv "$STAGE" "$DEPLOY_DIR"; then
+  if [ -n "$OLD" ]; then
+    # INSTALL_LIBRARY_TEST_FAIL_RECOVERY_SWAP also forces this restoring
+    # `mv` to fail (see the trap's own use of the same seam further down —
+    # it is the identical command, `mv "$OLD" "$DEPLOY_DIR"`).
+    if [ "${INSTALL_LIBRARY_TEST_FAIL_RECOVERY_SWAP:-0}" = "1" ] || ! mv "$OLD" "$DEPLOY_DIR" 2>/dev/null; then
+      echo "install-library: could not move the staged build into $DEPLOY_DIR, and could not restore the previous release from $OLD — move it back by hand: mv $OLD $DEPLOY_DIR" >&2
+    else
+      OLD=""
+      echo "install-library: could not move the staged build into $DEPLOY_DIR — the previous release was restored" >&2
+    fi
+  else
+    echo "install-library: could not move the staged build into $DEPLOY_DIR" >&2
+  fi
+  exit 1
+fi
+SWAP_DONE=1
+if [ "$RELOADING" -ne 1 ] && [ -n "$OLD" ]; then
+  rm -rf "$OLD"
+  OLD=""
+fi
+
+say "Deployed: $DEPLOY_DIR (commit $SHA)"
+
+# --- plist: written now, after the code swap above, from the SAME candidate
+# the decision at the top of this script already made (never re-read, never
+# re-compared) — a drift refusal above already skipped this whole install's
+# plist handling, and left $PLIST_CANDIDATE removed and $PLIST_LIVE untouched.
+# Checked explicitly (round 4 review, PR #157): the code has already swapped
+# in by this point, so leaving this `mv`'s own failure to fall through
+# un-checked risked $PLIST_LIVE sitting stale — still the PREVIOUS plist's
+# bytes — while $DEPLOY_DIR already holds the new release. Failing here
+# still reaches the trap below the same as any other failure past this
+# point (RELOADING was already decided at the top), which runs the ordinary
+# pair-restore.
+if [ "$PLIST_REFUSED" -ne 1 ]; then
+  if [ "${INSTALL_LIBRARY_TEST_FAIL_PLIST_WRITE:-0}" = "1" ] || ! mv "$PLIST_CANDIDATE" "$PLIST_LIVE"; then
+    echo "install-library: could not write $PLIST_LIVE from the staged candidate — $PLIST_CANDIDATE is kept" >&2
+    exit 1
+  fi
+  say "Plist installed: $PLIST_LIVE"
+fi
+
+if [ "$RELOADING" -ne 1 ]; then
+  [ "$PLIST_REFUSED" -ne 1 ] && _write_plist_record "$PLIST_LIVE"
+  say "Plist unchanged — no reload needed"
+fi
+
+# --- bootstrap: only reached when the top of this script already took the
+# job down for exactly this reason. $DEPLOY_DIR holds $SHA's code and
+# $PLIST_LIVE holds $SHA's plist by this point, so this brings both up
+# together, from one commit, in the one restart the job spends here. --------
+if [ "$RELOADING" -eq 1 ]; then
+  say "Bootstrapping $LABEL with the new plist"
+  if ! "$LAUNCHCTL" bootstrap "$LAUNCHD_DOMAIN" "$PLIST_LIVE"; then
+    echo "install-library: $LAUNCHCTL bootstrap failed for $LABEL — the job is NOT loaded" >&2
+    exit 1
+  fi
+
+  # --- verify: `state = running` alone is what ADR-0059's own --status
+  # distinction (`we told it to` vs `it's true`) already demanded of a
+  # bootstrap outcome, but a running process is not proof it is running
+  # under the environment this bootstrap just supplied — only `launchctl
+  # print`'s own `environment` block says that (security review, PR #157
+  # round 1), and only an exact match against it, from the RIGHT block only
+  # (round 3), says that reliably. _verify_reload does all of this, with
+  # bounded retries, and is the same check the recovery trap runs against a
+  # restored pair, not a second copy of it. ------------------------------
+  if _verify_reload "$PLIST_LIVE"; then
+    say "Reloaded: $LABEL is loaded, running, and the new environment is in effect"
+    _write_plist_record "$PLIST_LIVE"
+    rm -f "$PLIST_BACKUP"
+    [ -n "$OLD" ] && rm -rf "$OLD"
+    OLD=""
+  else
+    # Step 6 of the table above: bootstrap already returned 0, so
+    # auto-recovery is deliberately not attempted here — set
+    # PRESERVE_FOR_OPERATOR so the trap leaves $OLD and $PLIST_BACKUP
+    # exactly as they are, and name both in the message below (never
+    # deleted by the message that names them).
+    PRESERVE_FOR_OPERATOR=1
+    echo "install-library: $LABEL did not verify within ${VERIFY_TIMEOUT}s of reload:" >&2
+    if [ "$PRINT_OK" -ne 1 ]; then
+      echo "    $LAUNCHCTL print $LABEL failed:" >&2
+      echo "$JOB_STATE" | sed 's/^/        /' >&2
+    else
+      case "$JOB_STATE" in
+        *"state = running"*)
+          if [ -n "$MISSING" ]; then
+            echo "    running, but the live environment is missing:${MISSING}" >&2
+          fi
+          if [ "$DRAIN_DEADLINE_UNREADABLE" -eq 1 ]; then
+            echo "    running, but could not read a top-level _DRAIN_DEADLINE_SECONDS out of" >&2
+            echo "    $DEPLOY_DIR/app.py" >&2
+          fi
+          if [ "$EXIT_TIMEOUT_UNREADABLE" -eq 1 ]; then
+            echo "    running, but $LAUNCHCTL print $LAUNCHD_DOMAIN/$LABEL reported no 'exit timeout' line" >&2
+          fi
+          if [ "$EXIT_TIMEOUT_UNREADABLE" -eq 0 ] && [ "$DRAIN_DEADLINE_UNREADABLE" -eq 0 ] && \
+             [ "$EXIT_TIMEOUT_INSUFFICIENT" -eq 1 ]; then
+            echo "    running, but launchd's effective ExitTimeOut (${EXIT_TIMEOUT_ACTUAL}s) is not" >&2
+            echo "    greater than app.py's _DRAIN_DEADLINE_SECONDS (${DRAIN_DEADLINE}s), or the two" >&2
+            echo "    could not be compared — a SIGTERM would be SIGKILLed before the graceful drain" >&2
+            echo "    finishes" >&2
+          fi
+          ;;
+        *)
+          echo "    not running:" >&2
+          echo "$JOB_STATE" | sed 's/^/        /' >&2 ;;
+      esac
+    fi
+    if [ -n "$OLD" ] && [ -n "$PLIST_BACKUP" ]; then
+      echo "  the previous release and plist are kept, not deleted, in case you roll back:" >&2
+      echo "    previous release tree: $OLD" >&2
+      echo "    previous plist:        $PLIST_BACKUP" >&2
+      echo "  to roll back to the previous release:" >&2
+      echo "    $LAUNCHCTL bootout $LAUNCHD_DOMAIN/$LABEL" >&2
+      echo "    rm -rf $DEPLOY_DIR && mv $OLD $DEPLOY_DIR" >&2
+      echo "    $LAUNCHCTL bootstrap $LAUNCHD_DOMAIN $PLIST_BACKUP" >&2
+    fi
+    echo "  to retry loading the new pair as installed:" >&2
+    echo "    $LAUNCHCTL bootout $LAUNCHD_DOMAIN/$LABEL; $LAUNCHCTL bootstrap $LAUNCHD_DOMAIN $PLIST_LIVE" >&2
+    echo "  to inspect: $LAUNCHCTL print $LAUNCHD_DOMAIN/$LABEL" >&2
+    exit 1
+  fi
+fi
+
+if [ "$RELOADING" -eq 1 ]; then
+  cat <<EOF
+
+Install complete. The plist changed, so $LABEL was taken down (bootout)
+before this install staged anything, and reloaded (bootstrap) once the new
+code and plist were both in place. Expect a gap in service across that
+restart of roughly the drain time plus startup: up to app.py's
+_DRAIN_DEADLINE_SECONDS (${DRAIN_DEADLINE:-unknown}s) for the old process to quiesce,
+plus however long the new one takes to come up. This install already
+verified $LABEL came back up running the new environment before printing
+this.
+
+To confirm what it's actually serving, compare "commit" against
+"staged_commit" in:
+  curl -s http://127.0.0.1:8100/health
+
+To check what commit is currently deployed:
+  $0 --status
+EOF
+else
+  # Read fresh here (never cached from the RELOADING=1 branch's own
+  # _verify_reload call, which this branch never runs) so the drain bound
+  # named below is the deployed app.py's own value, not a guess.
+  DRAIN_DEADLINE="$(_drain_deadline_seconds "$DEPLOY_DIR/app.py")"
+  cat <<EOF
+
+Install complete. The plist did not change, so $LABEL was not reloaded —
+this script neither loaded, unloaded, nor restarted it. The running
+process restarts ITSELF onto this release with no operator step needed:
+it polls its own deploy area for a staged commit that differs from what
+it has loaded, and once it sees one, refuses new work, drains whatever is
+already in flight, and exits so launchd's KeepAlive brings it back up on
+the new code — a graceful restart, not the hard one \`launchctl bootout\`/
+\`bootstrap\` would be, which is why this script does not hand you those
+commands. Expect that restart within moments if the service was idle, or
+up to app.py's own _DRAIN_DEADLINE_SECONDS (${DRAIN_DEADLINE:-unknown}s)
+if a request was in flight when it noticed.
+
+To confirm the running process has picked up this release, compare
+"commit" against "staged_commit" in:
+  curl -s http://127.0.0.1:8100/health
+They read the same once the restart has happened; until then, "commit"
+still names the release this process loaded before this install ran.
+
+To check what commit is currently deployed (staged, not necessarily yet
+running):
+  $0 --status
+EOF
+fi

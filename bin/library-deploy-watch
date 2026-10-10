@@ -1,0 +1,398 @@
+#!/usr/bin/env python3.11
+"""library-deploy-watch — runs `bin/library-install` whenever `origin/main`
+is ahead of what `~/.local/deploy/library/DEPLOYED_COMMIT` records (CQ·94,
+issue_01M1G7G14FMD7M30ZFQK9YZVST), closing the gap `library#74` left open: a
+merge that fixed a defect kept producing it, every poller cycle, until
+somebody happened to re-check the thing the fix was supposed to have fixed.
+
+The operator ruled on 2026-10-09 (issue comment 5111, reversing library#231's "the
+install is his to run by hand"): "every merge should autodeploy, and we
+should basically automatically invoke the script rather than have me do
+it." `bin/library-install` already carries the guards this needs — it
+refuses off `main`, on a dirty tree or a non-fast-forward; compares against
+`DEPLOYED_COMMIT` rather than the checkout; backs up and migrates, stopping
+on an unknown vault revision or a `LIBRARY_AUTO_APPLY = False` revision; and
+checks `/health`. This file adds only the trigger and the once-per-target-
+commit failure report.
+
+**launchd runs this file from the checkout, never the deploy area.**
+`bin/install-library` exports the whole tracked tree into
+`~/.local/deploy/library` on every install, this file included — but that
+copy has no `.git`, and `REPO_DIR` below has to be a real checkout with an
+`origin` remote to fetch and compare against. The plist names the checkout's
+own copy (`convivy-orient/deploy_watch.py`'s identical comment gives the
+same reason, one repo over, for the identical layout).
+
+**No lock file guards overlapping ticks.** launchd does not start a second
+instance of a job while one with the same `Label` is still running — this
+job carries no `KeepAlive` that would change that.
+
+**Failure reporting is once per target commit, not once per tick.** A
+refusal from `bin/library-install` (a dirty tree, a checkout off `main`, a
+non-fast-forward, an unknown vault revision, a `LIBRARY_AUTO_APPLY = False`
+revision, a failed migration, or a failed `/health` verdict) writes the
+target commit to `~/.library/deploy-watch-failed-target.json` and posts one
+`deploy_failure` signal; a later tick for the SAME target neither reruns
+`bin/library-install` nor reposts — rerunning an installer whose own job
+includes a vault backup and a migration on every failing tick would be its
+own hazard. A new `origin/main` commit is a new target, so it clears the
+suppression and tries again on its own, with no action needed to "reset" it.
+
+**Posts with a dedicated credential, `~/.library/deploy-watch-token`**,
+minted the same way `~/.library/ci-fetch-token` was —
+`mint_credential.py --file agents --name library_deploy_watch --out
+~/.library/deploy-watch-token` — an `agent`-role credential, which already
+holds `signal.create` (identity.py's `ROLE_CAPS`). The POST and 429-retry
+handling below are a deliberate copy of `bin/ci_result_fetch.py`'s own
+`post_signal`/`_retry_after_seconds`, not a shared import: that file's own
+module docstring gives the reason for duplicating `install-library`'s
+helpers rather than importing them, and the same reasoning applies here —
+two independently-scheduled jobs should not be wired together through a
+module neither owns.
+
+**The checkout's own `git fetch` failing is reported too, the same way
+`convivy-orient/deploy_watch.py` reports it**: a fixed, non-target-keyed
+`dedup_key` (there is no target commit yet to key on), relying on the
+Library's own `dedup_key` collision to keep a stuck network from posting
+more than once.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+REPO_DIR = Path(__file__).resolve().parent.parent
+
+DEPLOY_DIR = Path.home() / ".local" / "deploy" / "library"
+DEPLOYED_COMMIT_FILE = DEPLOY_DIR / "DEPLOYED_COMMIT"
+
+# STATE, NOT CONFIGURATION SHIPPED WITH THE CODE (platform/decisions/0059
+# rule 3), matching bin/ci_result_fetch.py's own STATE_DIR: the failed-target
+# marker and the credential both outlive any one deploy, and an atomic
+# install swap replaces ~/.local/deploy/library wholesale, which would
+# destroy either if it lived there.
+STATE_DIR = Path(os.environ.get("LIBRARY_STATE_DIR", str(Path.home() / ".library")))
+FAILED_TARGET_FILE = STATE_DIR / "deploy-watch-failed-target.json"
+TOKEN_FILE = STATE_DIR / "deploy-watch-token"
+
+LIBRARY_URL = os.environ.get("LIBRARY_URL", "http://127.0.0.1:8100")
+PROTOCOL_VERSION = "1"
+
+SOURCE = "library-deploy-watch"
+KIND = "deploy_failure"
+PRODUCT = "library"
+
+# `bin/library-install` builds a fresh venv from requirements.txt on an
+# ordinary run and may also back up and migrate the vault — matching
+# convivy-orient/deploy_watch.py's own INSTALL_TIMEOUT_S and its reasoning:
+# nothing here touches the network beyond pip's index, but a cold pip cache
+# has no ceiling the way a local git call does.
+# com.convivy.library.deploy-watch's StartInterval is 300s; launchd will not
+# start a second instance of a label that's still running, so a cycle that
+# runs long delays the next scheduled kick rather than racing it.
+INSTALL_TIMEOUT_S = 600
+NETWORK_TIMEOUT_S = 120
+
+# The last TAIL_MAX_CHARS characters of bin/library-install's combined
+# stdout+stderr go in the deploy_failure signal's refs — enough to show which
+# refusal fired, bounded rather than unbounded.
+TAIL_MAX_CHARS = 4000
+
+# Same shape and same bound as bin/ci_result_fetch.py's own constants, for
+# the identical reason (see that file's module docstring): ten retries at up
+# to five minutes each is far above one rate-gate window's reset, while still
+# bounding one POST's pathological case to under an hour.
+RATE_LIMIT_MAX_RETRIES = 10
+RATE_LIMIT_MAX_WAIT_SECONDS = 300
+RATE_LIMIT_FALLBACK_RETRY_SECONDS = 60
+
+
+class DeployWatchError(Exception):
+    """A step failed in a way that needs a human — never auto-retried harder."""
+
+
+def _run(argv: list[str], timeout_s: float) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, check=False,
+                              timeout=timeout_s)
+    except subprocess.TimeoutExpired as ex:
+        raise DeployWatchError(f"{' '.join(argv)} timed out after {timeout_s}s") from ex
+
+
+def _git(*args: str, timeout_s: float = NETWORK_TIMEOUT_S) -> subprocess.CompletedProcess:
+    return _run(["git", "-C", str(REPO_DIR), *args], timeout_s)
+
+
+def _stash_hint_on_fetch_failure() -> str:
+    """One more line naming refs/stash and the command to remove it, when it
+    exists — a stash pushed in ANY linked worktree of this repo lands at this
+    one shared ref (library issue: on 2026-10-08 a dispatched run's `git
+    stash` in a linked worktree left refs/stash pointing at a commit whose
+    objects were never completed, and every fetch in every worktree of that
+    repo then failed with "fatal: bad object refs/stash"). A deliberate copy
+    of `bin/library-install`'s and `bin/install-library`'s own function of
+    the same purpose, not a shared one — each of the three scripts is
+    independent on purpose, same reason `bin/library-install`'s own copy
+    gives for not sharing it with `bin/install-library`."""
+    cp = _git("show-ref", "--verify", "--quiet", "refs/stash", timeout_s=10)
+    if cp.returncode != 0:
+        return ""
+    return (f"\n  refs/stash exists in {REPO_DIR} and may be why — it is shared "
+            f"by every worktree of this repo, so a stash pushed in any of "
+            f"them lands here. Remove it with:\n"
+            f"    git -C {REPO_DIR} update-ref -d refs/stash")
+
+
+def fetch_origin_main() -> None:
+    cp = _git("fetch", "origin", "main", "--quiet", timeout_s=NETWORK_TIMEOUT_S)
+    if cp.returncode != 0:
+        raise DeployWatchError(
+            f"git fetch origin main failed: {cp.stderr.strip()}"
+            f"{_stash_hint_on_fetch_failure()}")
+
+
+def origin_main_sha() -> str:
+    cp = _git("rev-parse", "refs/remotes/origin/main")
+    if cp.returncode != 0:
+        raise DeployWatchError(
+            f"git rev-parse refs/remotes/origin/main failed: {cp.stderr.strip()}")
+    return cp.stdout.strip()
+
+
+def read_deployed_commit() -> str | None:
+    """The commit `bin/library-install` last staged (format: `ref: …` /
+    `commit: <sha>` / `installed_at: …` / `installed_from: …`). Missing or
+    unparseable both read as "nothing deployed" — None — so either state
+    means "install", never "up to date" (matching
+    `convivy-orient/deploy_watch.py`'s `read_deployed_commit`, same
+    reasoning)."""
+    try:
+        text = DEPLOYED_COMMIT_FILE.read_text()
+    except OSError:
+        return None
+    for line in text.splitlines():
+        if line.startswith("commit:"):
+            sha = line[len("commit:"):].strip()
+            return sha or None
+    return None
+
+
+def load_failed_target() -> str | None:
+    try:
+        data = json.loads(FAILED_TARGET_FILE.read_text())
+    except (OSError, ValueError):
+        return None
+    target = data.get("target") if isinstance(data, dict) else None
+    return target if isinstance(target, str) and target else None
+
+
+def save_failed_target(target: str, exit_code: int) -> None:
+    """Records the one target commit `bin/library-install` has already
+    failed, and already been reported, for — written BEFORE the signal POST
+    is even attempted, so a failed POST (the server itself may be down; see
+    the module docstring) still leaves the suppression in place rather than
+    retrying the installer every tick. Atomic (temp file, then `os.replace`),
+    matching `bin/ci_result_fetch.py`'s own `save_cursor`/`save_status`, for
+    the same reason: a process killed mid-write must never leave this file
+    holding a truncated JSON fragment that a later `load_failed_target` reads
+    as "nothing has ever failed."""
+    FAILED_TARGET_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = FAILED_TARGET_FILE.with_name(f"{FAILED_TARGET_FILE.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps({"target": target, "exit_code": exit_code},
+                              indent=1, sort_keys=True))
+    os.replace(tmp, FAILED_TARGET_FILE)
+
+
+def clear_failed_target() -> None:
+    try:
+        FAILED_TARGET_FILE.unlink()
+    except OSError:
+        pass
+
+
+def run_library_install() -> subprocess.CompletedProcess:
+    """Runs this checkout's own `bin/library-install` — never a copy,
+    matching `convivy-orient/deploy_watch.py`'s `run_install`: an installer
+    staged into the deploy area is read fresh from the checkout every cycle,
+    so a broken installer can still deploy its own fix."""
+    return _run([str(REPO_DIR / "bin" / "library-install")], INSTALL_TIMEOUT_S)
+
+
+def load_token() -> str:
+    tok = os.environ.get("LIBRARY_DEPLOY_WATCH_TOKEN", "").strip()
+    if tok:
+        return tok
+    try:
+        return TOKEN_FILE.read_text().strip()
+    except OSError as ex:
+        raise DeployWatchError(
+            f"no deploy-watch token: set LIBRARY_DEPLOY_WATCH_TOKEN or create "
+            f"{TOKEN_FILE} (0600)") from ex
+
+
+def _retry_after_seconds(e: urllib.error.HTTPError) -> int:
+    """A deliberate copy of `bin/ci_result_fetch.py`'s own
+    `_retry_after_seconds` — see that file for the exact incident (an
+    uncaught `OverflowError` on a hostile or broken `Retry-After: inf`) this
+    shape exists to avoid."""
+    try:
+        raw = e.read()
+    except Exception:
+        raw = b""
+    try:
+        value = json.loads(raw.decode("utf-8")).get("retry_after")
+        if isinstance(value, (int, float)) and math.isfinite(value) and value >= 0:
+            return int(value)
+    except Exception:
+        pass
+    try:
+        header = e.headers.get("Retry-After") if e.headers else None
+        if header is not None:
+            value = float(header)
+            if math.isfinite(value) and value >= 0:
+                return int(value)
+    except (TypeError, ValueError, OverflowError):
+        pass
+    return RATE_LIMIT_FALLBACK_RETRY_SECONDS
+
+
+def post_signal(payload: dict, token: str) -> str:
+    """POST one signal. Returns `'created'` | `'duplicate'` | `'conflict'` |
+    `'error:<code-or-exception-name>'` — a deliberate copy of
+    `bin/ci_result_fetch.py`'s own `post_signal`, including its 429 retry
+    (see that file's module docstring for the livelock a bare post-failure
+    count used to cause)."""
+    req = urllib.request.Request(
+        f"{LIBRARY_URL}/signals",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Library-Protocol": PROTOCOL_VERSION,
+        },
+        method="POST")
+    retries = 0
+    while True:
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                if resp.status == 201:
+                    return "created"
+                if resp.status == 200:
+                    return "duplicate"
+                if resp.status == 409:
+                    return "conflict"
+                return f"error:{resp.status}"
+        except urllib.error.HTTPError as e:
+            if e.code == 409:
+                return "conflict"
+            if e.code == 429:
+                if retries >= RATE_LIMIT_MAX_RETRIES:
+                    return "error:429"
+                time.sleep(min(_retry_after_seconds(e), RATE_LIMIT_MAX_WAIT_SECONDS))
+                retries += 1
+                continue
+            return f"error:{e.code}"
+        except Exception as ex:
+            return f"error:{type(ex).__name__}"
+
+
+def post_failure_signal(body: str, dedup_key: str, refs: dict) -> None:
+    """Best-effort, matching `convivy-orient/deploy_watch.py`'s own
+    `post_failure_signal` — a failure here is swallowed and printed to
+    stderr, never raised, because the guaranteed-visible path is the
+    caller's own stderr print (and this process's nonzero exit), not this
+    POST.
+
+    `body` stays a fixed, closed-set reason string, never raw git/
+    library-install output — every observed value travels in `refs` instead,
+    the same rule `convivy-orient/deploy_watch.py`'s own `post_failure_signal`
+    states."""
+    payload = {
+        "source": SOURCE,
+        "kind": KIND,
+        "actor": SOURCE,
+        "product": PRODUCT,
+        "body": body,
+        "refs": refs,
+        "dedup_key": dedup_key,
+    }
+    try:
+        token = load_token()
+        result = post_signal(payload, token)
+        print(f"library-deploy-watch: deploy_failure signal {dedup_key}: {result}",
+              file=sys.stderr)
+    except DeployWatchError as ex:
+        print(f"library-deploy-watch: could not post deploy_failure signal: {ex}",
+              file=sys.stderr)
+
+
+def run() -> int:
+    try:
+        fetch_origin_main()
+    except DeployWatchError as ex:
+        print(str(ex), file=sys.stderr)
+        post_failure_signal("git fetch origin main failed",
+                            "library-deploy-watch:fail:fetch", {})
+        return 1
+
+    try:
+        target = origin_main_sha()
+    except DeployWatchError as ex:
+        print(str(ex), file=sys.stderr)
+        post_failure_signal("origin/main could not be read after fetch",
+                            "library-deploy-watch:fail:fetch", {})
+        return 1
+
+    deployed = read_deployed_commit()
+    if deployed == target:
+        return 0
+
+    failed_target = load_failed_target()
+    if failed_target == target:
+        print(f"library-deploy-watch: target {target} already failed and was "
+              f"reported; waiting for origin/main to move", file=sys.stderr)
+        return 1
+
+    try:
+        cp = run_library_install()
+    except DeployWatchError as ex:
+        print(str(ex), file=sys.stderr)
+        save_failed_target(target, -1)
+        post_failure_signal("bin/library-install timed out",
+                            f"library-deploy-watch:fail:{target}",
+                            {"target": target})
+        return 1
+
+    if cp.returncode == 0:
+        clear_failed_target()
+        print(f"library-deploy-watch: bin/library-install succeeded for {target}")
+        return 0
+
+    output = cp.stdout + cp.stderr
+    print(output, file=sys.stderr)
+    tail = output[-TAIL_MAX_CHARS:]
+    save_failed_target(target, cp.returncode)
+    post_failure_signal("bin/library-install exited non-zero",
+                        f"library-deploy-watch:fail:{target}",
+                        {"target": target, "exit_code": cp.returncode,
+                         "output_tail": tail})
+    return 1
+
+
+def main() -> None:
+    argparse.ArgumentParser(
+        description="Run bin/library-install whenever origin/main is ahead "
+                     "of the deploy area").parse_args()
+    sys.exit(run())
+
+
+if __name__ == "__main__":
+    main()

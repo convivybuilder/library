@@ -1,0 +1,66 @@
+The Library's migration tree.
+
+It runs against the Library's own database and nothing else: `env.py` asks
+`store.resolve_db()` and refuses unless `LIBRARY_DB` named the file. During the
+read-only shadow there is nothing here to run, because the Library owns no schema
+until the cutover hands it one.
+
+The baseline is STAMPED, not run, on the database the cutover produces:
+
+    LIBRARY_DB=~/.library/library.db alembic stamp head
+
+`migrate.py` has already created every table by copying Orient's schema, so
+`upgrade head` is a no-op from that point and every later revision has an ancestor
+to attach to. Stage B step 5 of the cutover sequence is this command.
+
+Autogenerate is unavailable on purpose. There is no `target_metadata`, because the
+schema is defined by DDL in the revisions rather than by ORM models — `store`
+holds raw SQL with explicit column lists for the reason its own docstring gives.
+`alembic revision --autogenerate` would compare the database against empty
+metadata and propose dropping every table in it. Write revisions by hand.
+
+The two vec0 tables are outside this tree. `library_vectors` and `signal_vectors`
+are invisible to a connection that has not loaded `sqlite-vec`, and alembic's does
+not load it. They arrived through `migrate.py` at the cutover; on a fresh
+database — nothing to migrate from — run `init_vectors.py` right after
+`upgrade head`:
+
+    LIBRARY_DB=~/.library/library.db .venv/bin/python -m alembic upgrade head
+    LIBRARY_DB=~/.library/library.db .venv/bin/python init_vectors.py
+
+`init_vectors.py` is idempotent (`CREATE VIRTUAL TABLE IF NOT EXISTS`), so
+running it against a database `migrate.py` already populated is a no-op.
+
+A revision that must never run as part of an ordinary install sets a
+module-level flag:
+
+    LIBRARY_AUTO_APPLY = False
+
+`bin/install-library` backs up the vault and runs `alembic upgrade head`
+itself before an install whenever the vault is behind — except when a
+pending revision carries this flag, which stops it instead, naming the
+file and the command to run by hand. No revision sets it today; the
+Phase 3 drop stage (a drop migration plus a VACUUM, gated on a soak
+window recorded in the epic, not here) will be the first, since running
+it on an install's own timing is exactly the harm that stage is gated
+against.
+
+The check fails closed rather than matching only this one spelling: a
+pending revision whose text mentions `LIBRARY_AUTO_APPLY` anywhere stops
+the auto-migrate unless every mention is exactly a module-level
+`LIBRARY_AUTO_APPLY = True` (optionally typed, `LIBRARY_AUTO_APPLY: bool
+= True`). An indented assignment, a computed value, or any spelling of
+`False` all stop it too, the same as the documented form above — so a
+revision that needs to opt back in after carrying this flag has to say
+`True` exactly that way, not just remove the line.
+
+Write a column change as a batch operation:
+
+    with op.batch_alter_table("courses") as batch:
+        batch.alter_column("title", nullable=True)
+
+`op.alter_column` on its own renders `ALTER TABLE ... ALTER COLUMN`, which
+standard SQLite has no statement for. CI rejects it; the deployment machine's
+much newer SQLite accepts it, so that shape passes by hand on the mini and fails
+in CI. `render_as_batch` does not help — it governs how autogenerate renders a
+revision, and this tree has no autogenerate.

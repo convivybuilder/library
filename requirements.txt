@@ -1,0 +1,43 @@
+fastapi==0.121.2
+# **TLS 1.3 0-RTT EARLY DATA MUST STAY UNREACHABLE FROM THIS PIN**
+# (platform/decisions/0066): it is replayable by construction (RFC 8446 §8)
+# and would silently void the replay resistance mutual TLS was chosen for
+# (platform/decisions/0065). CPython's `ssl` module exposes no early-data
+# interface at all today, which is the only reason this is a note rather
+# than a runtime guard — there is nothing to disable. The risk is a future
+# swap of uvicorn (or of the interpreter this venv pins) for something that
+# does expose one; `tests/test_no_early_data_interface.py` asserts this
+# mechanically, on every push and PR, which is every bump of the line below.
+uvicorn==0.42.0
+# Semantic search over the Archives (contract section 3). sqlite-vec supplies the
+# vec0 virtual table the vector index lives in — a plain sqlite3.connect reports
+# "no such module: vec0" against the same file, the seam
+# platform/reference/keel-goal-baselines records. fastembed is the query
+# embedder: ONNX on CPU, BAAI/bge-small-en-v1.5 at
+# 384 dimensions, no API key and no per-call billing. It is imported LAZILY, so a
+# deployment that never calls /signals/search never loads the model.
+sqlite-vec==0.1.9
+fastembed==0.8.0
+
+# The Library's own migration tree (the cutover sequence, Stage B step 5). Not on
+# the request path — nothing this service serves imports alembic — but a runtime
+# requirement of the DEPLOYMENT rather than a development one: step 5 stamps the
+# baseline on the mini, in the window, using the pinned venv `serve.sh` execs.
+# A tool that has to be installed at that moment is a tool nobody has.
+#
+# Pinned to the versions Orient already runs, so the one machine holding both
+# services resolves one SQLAlchemy rather than two. SQLAlchemy is alembic's own
+# dependency and is named here so the version is a decision rather than whatever
+# the resolver picked on the day.
+alembic==1.18.5
+SQLAlchemy==2.0.51
+
+# `load_crew_registry.py` parses the knowledge repository's profile YAML
+# (issue_01M19QP8S0QPKM0MN7XHYWNGKY). Already resolving transitively through
+# fastembed==0.8.0 above — checked 2026-09-06, the deploy venv carries
+# PyYAML 6.0.3 under Python 3.11.15 with neither requirements file naming it
+# — so this declares an existing resolution rather than adding a new one.
+# Declared explicitly for the reason `python-explicit-deps` gives for
+# `email-validator` and `greenlet`: pip may otherwise prune a transitive dep
+# on a lock-file regeneration, and this repo now imports it directly.
+PyYAML==6.0.3
