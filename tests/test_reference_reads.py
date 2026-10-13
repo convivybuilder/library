@@ -448,6 +448,28 @@ def test_listing_needs_reference_read(client, monkeypatch):
     assert r.status_code == 403 and "reference.read" in r.json()["error"]
 
 
+def test_listing_refuses_an_unrecognised_parameter(client):
+    r = client.get("/reference/documents?sort=newest", headers=_h())
+    assert r.status_code == 400
+    assert r.json()["unknown"] == ["sort"]
+    assert r.json()["supported"] == sorted(
+        ["audience", "binds_agents", "binds_crews", "binds_topics", "kind",
+         "limit", "offset", "project", "status"])
+
+
+def test_listing_ordinary_request_still_succeeds(client):
+    r = _list(client, kind="decision", project="platform", status="current",
+              audience="team")
+    assert r.status_code == 200
+
+
+def test_single_document_refuses_any_parameter(client):
+    r = client.get(f"/reference/documents/{DOC_ID}?sort=newest", headers=_h())
+    assert r.status_code == 400
+    assert r.json()["unknown"] == ["sort"]
+    assert r.json()["supported"] == []
+
+
 # --- the checkout status read -------------------------------------------------
 
 
@@ -481,6 +503,14 @@ def test_the_status_read_takes_nothing(client):
     assert _row() is None
     # ...and a subsequent checkout by anyone still succeeds.
     assert _checkout(client).status_code == 200
+
+
+def test_the_status_read_refuses_any_parameter(client):
+    r = client.get(f"/reference/documents/{DOC_ID}/checkout?holder=anyone",
+                   headers=_h())
+    assert r.status_code == 400
+    assert r.json()["unknown"] == ["holder"]
+    assert r.json()["supported"] == []
 
 
 def test_a_dead_checkout_is_reported_rather_than_hidden(client):

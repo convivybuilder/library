@@ -26,6 +26,7 @@ import lease
 import profile_sync
 import protocol
 import reference
+import black_box_tables
 import store
 
 AGENT = "agent-token-vivy"
@@ -80,7 +81,7 @@ def client(tmp_path, monkeypatch, vector_index, ledger_tables):
             blocking_root_id TEXT, blocking_holder TEXT, blocks_by TEXT);
         CREATE TABLE call_slips (
             id TEXT PRIMARY KEY, item_id TEXT, product TEXT, claim_owner_label TEXT,
-            issued_at TEXT, expires_at TEXT);
+            issued_at TEXT, expires_at TEXT, grant_json TEXT);
         CREATE TABLE roster_agents (
             id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE,
             created_at TEXT NOT NULL, created_by TEXT NOT NULL,
@@ -91,7 +92,7 @@ def client(tmp_path, monkeypatch, vector_index, ledger_tables):
             created_at TEXT NOT NULL, created_by TEXT NOT NULL,
             updated_at TEXT NOT NULL, updated_by TEXT NOT NULL,
             UNIQUE (project, variant));
-    """)
+    """ + black_box_tables.DDL)
     conn.execute(
         "INSERT INTO issue_items (id, product, title, type, state, needs, "
         "created_by_kind, parent_id, created_at, refs) VALUES (?,?,?,?,?,?,?,?,?,?)",
@@ -128,6 +129,7 @@ def client(tmp_path, monkeypatch, vector_index, ledger_tables):
     vector_index(db)
     ledger_tables(db)
     monkeypatch.setattr(store, "DB_PATH", db)
+    black_box_tables.use_registry(tmp_path, monkeypatch)
     monkeypatch.setattr(reference, "INDEX_DB", index)
     monkeypatch.setattr(identity, "TOKENS", tokens)
     monkeypatch.setattr(store, "WRITES_ENABLED", True)

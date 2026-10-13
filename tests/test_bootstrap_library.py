@@ -175,6 +175,16 @@ def test_it_makes_the_named_person_an_administrator(first_install, capsys):
     assert admins == [(person[0][0], "bootstrap_library")]
 
 
+def test_the_bootstrapped_person_has_no_sign_in_email(first_install, capsys):
+    """`sign_in_email` (issue_01M4QQZ7VTANJ5ZGF630DCB0Y7) is additive and
+    nullable, and the bootstrap's own person is created without one, exactly
+    as every person was before this column existed — the item's own
+    instruction that the bootstrap keep working with no email."""
+    rc, _, _ = _run(capsys, NAME)
+    assert rc == 0
+    assert _rows(first_install, "SELECT sign_in_email FROM people") == [(None,)]
+
+
 def test_administrator_is_not_a_product_grant(first_install, capsys):
     """A product grant and an administrator are different facts (the schema's
     stated reason for two tables). Making someone an administrator must not

@@ -134,6 +134,28 @@ def test_an_out_of_scope_queue_reads_exactly_like_a_missing_one(client):
     assert missing.json() == foreign.json()
 
 
+# --- an unrecognised query parameter (issue_01M1MTCTH3PW0DWDEXAZA5KFET) -----
+
+
+def test_list_refuses_an_unrecognised_parameter(client):
+    r = client.get("/corrections-queues?stream=kb-audit", headers=_h(WIDE))
+    assert r.status_code == 400
+    assert r.json()["unknown"] == ["stream"]
+    assert r.json()["supported"] == ["product"]
+
+
+def test_list_ordinary_request_still_succeeds(client):
+    r = client.get("/corrections-queues?product=constance", headers=_h(WIDE))
+    assert r.status_code == 200
+
+
+def test_get_one_queue_refuses_any_parameter(client):
+    r = client.get("/corrections-queues/cq_vivy?stream=kb-audit", headers=_h(AGENT))
+    assert r.status_code == 400
+    assert r.json()["unknown"] == ["stream"]
+    assert r.json()["supported"] == []
+
+
 # --- the lease root, once a leaf's parent can name a queue ------------------
 
 

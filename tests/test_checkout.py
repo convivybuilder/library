@@ -27,6 +27,7 @@ import call_slips
 import identity
 import lease
 import protocol
+import reference
 import store
 
 AGENT = "agent-token-vivy"
@@ -72,7 +73,10 @@ def client(tmp_path, monkeypatch, vector_index, ledger_tables):
             blocking_root_id TEXT, blocking_holder TEXT, blocks_by TEXT);
         CREATE TABLE call_slips (
             id TEXT PRIMARY KEY, item_id TEXT, product TEXT, claim_owner_label TEXT,
-            issued_at TEXT, expires_at TEXT);
+            issued_at TEXT, expires_at TEXT, grant_json TEXT);
+        CREATE TABLE issue_comments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, item_id TEXT, actor TEXT,
+            kind TEXT, body TEXT, run_id TEXT, at TEXT);
     """)
     # A three-level tree, which is what makes the downward check meaningful:
     #   top_epic
@@ -723,14 +727,258 @@ def test_docs_is_an_empty_list_of_ids_until_a_bundler_exists(client):
 
 
 def test_model_is_a_labelled_placeholder_not_a_real_resolution(client):
-    """Resolving `(persona, work item, project)` to one model is a separate
-    task (issue_01M12NE12WF9V0721WSHH34A2W). This pins presence and type, not
-    the value, which is free to change the moment that task lands."""
+    """`(persona, work item, project)` resolve to a real `model`
+    (issue_01M12NE12WF9V0721WSHH34A2W) only when one of them names something
+    to resolve against. `task_a` carries no `model_choice` and this checkout
+    names no `persona`, so there is nothing to resolve and the labelled
+    placeholder is what checkout still serves — the value every client that
+    predates resolution already saw."""
     model = _co(client, "task_a").json()["model"]
     assert isinstance(model, str) and model
     assert "not-implemented" in model or "unresolved" in model, (
         "the placeholder must be legible as unresolved, not a real model id "
         "a caller could mistake for one")
+
+
+# --- resolving `model` (issue_01M12NE12WF9V0721WSHH34A2W) ---------------------
+
+
+def _agent_index(tmp_path, monkeypatch, docs):
+    """A knowledge index holding `docs`, each `(id, project, extra)`, shaped
+    like the real one (`frontmatter_extra` included, agent-platform#517), and
+    pointed at by `reference.INDEX_DB` for the rest of the test. `extra` is a
+    dict serialized the way the indexer writes it, or `None` for a row with no
+    usable frontmatter at all."""
+    index = tmp_path / "agent-index.db"
+    conn = sqlite3.connect(index)
+    conn.executescript("""
+        CREATE TABLE docs (
+            id TEXT PRIMARY KEY, source_ref TEXT, kind TEXT, project TEXT,
+            title TEXT, status TEXT, topics TEXT, audience TEXT,
+            last_reviewed TEXT, updated_at TEXT, body TEXT, body_hash TEXT,
+            frontmatter_extra TEXT);
+    """)
+    for doc_id, project, extra in docs:
+        conn.execute(
+            "INSERT INTO docs (id, source_ref, kind, project, title, status, "
+            "topics, audience, last_reviewed, updated_at, body, body_hash, "
+            "frontmatter_extra) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (doc_id, f"{doc_id}.md", "agent", project, doc_id, "current",
+             "[]", "[]", "2026-08-01", "2026-08-02", "the agent's body",
+             "deadbeef", None if extra is None else json.dumps(extra)))
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(reference, "INDEX_DB", index)
+
+
+def test_the_items_model_choice_wins_over_the_personas_pin(
+        client, tmp_path, monkeypatch):
+    """§2 of the task: the work item's own choice beats what the named
+    persona's agent definition pins, exactly the priority
+    platform/contracts/work-item-model-override gives the Bosun's own
+    `model_choice` read."""
+    _agent_index(tmp_path, monkeypatch,
+                [("agent-platform/agents/coder", "agent-platform",
+                  {"model": "sonnet"})])
+    conn = _db()
+    conn.execute("UPDATE issue_items SET model_choice = 'opus' "
+                "WHERE id = 'task_a'")
+    conn.commit()
+    conn.close()
+    assert _co(client, "task_a", persona="coder").json()["model"] == "opus"
+
+
+def test_the_personas_pin_is_used_when_no_item_choice_is_set(
+        client, tmp_path, monkeypatch):
+    _agent_index(tmp_path, monkeypatch,
+                [("agent-platform/agents/coder", "agent-platform",
+                  {"model": "sonnet"})])
+    assert _co(client, "task_a", persona="coder").json()["model"] == "sonnet"
+
+
+def test_an_ambiguous_persona_stays_on_the_placeholder(
+        client, tmp_path, monkeypatch):
+    """Two projects hold `reviewer` and neither is `agent-platform`
+    (ARCH-426's tiebreak does not apply), so the name is ambiguous — refusing
+    the whole checkout over an unresolved model would be worse than the
+    placeholder a client already knows to treat as unresolved."""
+    _agent_index(tmp_path, monkeypatch,
+                [("svc-coder/agents/reviewer", "svc-coder", {"model": "opus"}),
+                 ("svc-planner/agents/reviewer", "svc-planner",
+                  {"model": "sonnet"})])
+    model = _co(client, "task_a", persona="reviewer").json()["model"]
+    assert model == libapp._MODEL_NOT_RESOLVED
+
+
+def test_an_ambiguity_the_agent_platform_tiebreak_cannot_resolve_stays_on_the_placeholder(
+        client, tmp_path, monkeypatch):
+    """Two *agent-platform* docs hold `reviewer` (alongside a third, outside
+    `agent-platform`, that the tiebreak already discards) — the ambiguity
+    survives the tiebreak rather than being resolved by it, so this still
+    has to stay on the placeholder.
+
+    **This is the case that separates `len(matches) != 1: return None` from
+    "use `matches[0]` when non-empty"**: every other ambiguity test here
+    filters down to zero or one match, where both checks agree. Here the
+    filtered set still has two, so a mutant that stopped checking the count
+    and just took `matches[0]` would silently pick one of them — this is the
+    only input in this file where that mutant answers differently from the
+    real check."""
+    _agent_index(tmp_path, monkeypatch,
+                [("svc-coder/agents/reviewer", "svc-coder", {"model": "opus"}),
+                 ("agent-platform/agents/reviewer", "agent-platform",
+                  {"model": "sonnet"}),
+                 ("agent-platform/legacy/agents/reviewer", "agent-platform",
+                  {"model": "haiku"})])
+    model = _co(client, "task_a", persona="reviewer").json()["model"]
+    assert model == libapp._MODEL_NOT_RESOLVED
+
+
+def test_an_ambiguous_persona_resolves_to_the_agent_platform_copy(
+        client, tmp_path, monkeypatch):
+    """The success side of the same tiebreak `test_an_ambiguous_persona_
+    stays_on_the_placeholder` proves the failure side of: three projects
+    hold `reviewer`, exactly one of them `agent-platform`, and ARCH-426's
+    tiebreak — mirrored from `agentctl`'s `_library_agent` — resolves to that
+    one's pin rather than leaving the name ambiguous."""
+    _agent_index(tmp_path, monkeypatch,
+                [("svc-coder/agents/reviewer", "svc-coder", {"model": "opus"}),
+                 ("agent-platform/agents/reviewer", "agent-platform",
+                  {"model": "sonnet"}),
+                 ("svc-planner/agents/reviewer", "svc-planner",
+                  {"model": "opus"})])
+    model = _co(client, "task_a", persona="reviewer").json()["model"]
+    assert model == "sonnet"
+
+
+def test_an_unknown_persona_stays_on_the_placeholder(
+        client, tmp_path, monkeypatch):
+    """A readable index that holds no `agent` document named `no-such-agent`
+    at all, so this covers the zero-match branch of `len(matches) != 1`
+    rather than `reference.ReferenceIndexUnavailable`, which
+    `test_an_unreadable_index_stays_on_the_placeholder` already covers.
+    Replacing the check with "use `matches[0]` when non-empty" cannot pass
+    this: there is no `matches[0]` to use."""
+    _agent_index(tmp_path, monkeypatch,
+                [("agent-platform/agents/coder", "agent-platform",
+                  {"model": "sonnet"})])
+    model = _co(client, "task_a", persona="no-such-agent").json()["model"]
+    assert model == libapp._MODEL_NOT_RESOLVED
+
+
+def test_an_unreadable_index_stays_on_the_placeholder(
+        client, tmp_path, monkeypatch):
+    """**A FAILURE HERE MUST NOT COST THE CALLER ITS CHECKOUT**, the same
+    contract `_slip_docs` holds for a profile bundle: a corrupt index falls
+    back to the placeholder rather than failing the whole checkout."""
+    corrupt = tmp_path / "corrupt-index.db"
+    corrupt.write_bytes(b"not a sqlite database")
+    monkeypatch.setattr(reference, "INDEX_DB", corrupt)
+    r = _co(client, "task_a", persona="coder")
+    assert r.status_code == 200
+    assert r.json()["model"] == libapp._MODEL_NOT_RESOLVED
+
+
+def test_two_checkouts_with_the_same_persona_get_the_same_model(
+        client, tmp_path, monkeypatch):
+    """Two different items, the same persona, no item choice on either: the
+    persona's pin resolves the same way both times rather than drifting
+    between checkouts of the same kind of agent."""
+    _agent_index(tmp_path, monkeypatch,
+                [("agent-platform/agents/coder", "agent-platform",
+                  {"model": "sonnet"})])
+    first = _co(client, "task_a", owner="session-1", persona="coder").json()
+    second = _co(client, "lone", owner="session-2", persona="coder").json()
+    assert first["model"] == second["model"] == "sonnet"
+
+
+def test_the_stored_grant_carries_the_resolved_model(
+        client, tmp_path, monkeypatch):
+    """Extends `test_the_slip_stores_exactly_the_grant_checkout_served` to the
+    two real resolutions this task adds. `POST /tokens/redeem` returns
+    exactly the grant stored on the slip (`test_token_redeem.py` pins that
+    read), so a resolved model stored here is a resolved model redemption
+    hands the Individuator — this is the half of that chain this file owns."""
+    _agent_index(tmp_path, monkeypatch,
+                [("agent-platform/agents/coder", "agent-platform",
+                  {"model": "sonnet"})])
+    conn = _db()
+    conn.execute("UPDATE issue_items SET model_choice = 'opus' "
+                "WHERE id = 'task_a'")
+    conn.commit()
+    conn.close()
+    for item, persona, expected in (("task_a", "coder", "opus"),
+                                    ("lone", "coder", "sonnet")):
+        body = _co(client, item, owner=f"session-{item}", persona=persona).json()
+        assert body["model"] == expected
+        conn = _db()
+        row = conn.execute("SELECT * FROM call_slips WHERE id = ?",
+                          (body["slip_id"],)).fetchone()
+        conn.close()
+        stored = call_slips.grant_of(row)
+        assert stored["model"] == expected
+
+
+def test_a_checkout_that_races_a_concurrent_model_choice_write(
+        client, tmp_path, monkeypatch):
+    """Reproduces the security-reviewer's finding on PR #249: `_do_checkout`
+    resolved `model` from `item["model_choice"]`, read once before
+    `lease.take()` — an unlocked, autocommit snapshot — so a
+    `PUT /items/{id}/model` landing in that window was silently dropped from
+    the minted slip. The fix re-reads `model_choice` off `locked`, the row
+    `lease.take()` itself holds the lock on, the same way `cap_usd` is
+    already refreshed there.
+
+    **Deterministic, the same way `test_a_checkout_that_races_a_concurrent_
+    resolve_is_rolled_back` is**: `lease.take` is patched to pause exactly
+    where the real race window opens — after the unlocked `item` read and
+    the unlocked grant build, before the write lock is taken — while the
+    model write runs to completion and commits; only then is checkout
+    allowed to proceed into the lock.
+    """
+    import threading
+
+    clients = tmp_path / "client-tokens.json"
+    clients.write_text(json.dumps({
+        "approved-client-token": {"name": "deck", "products": ["*"]}}))
+    monkeypatch.setattr(identity, "CLIENT_TOKENS", clients)
+
+    checkout_ready = threading.Event()
+    write_done = threading.Event()
+    real_take = lease.take
+
+    def take_racer(*args, **kwargs):
+        checkout_ready.set()
+        assert write_done.wait(timeout=20), "model write never completed"
+        return real_take(*args, **kwargs)
+
+    monkeypatch.setattr(lease, "take", take_racer)
+
+    results = {}
+
+    def do_checkout():
+        results["checkout"] = _co(client, "lone")
+
+    def do_write():
+        assert checkout_ready.wait(timeout=20), "checkout never reached the seam"
+        results["write"] = client.post(
+            "/items/lone/model",
+            json={"model": "opus", "acting_human": "operator@example.com"},
+            headers=_h("approved-client-token"))
+        write_done.set()
+
+    threads = [threading.Thread(target=do_checkout),
+               threading.Thread(target=do_write)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert set(results) == {"checkout", "write"}, (
+        "a request died before reaching the race seam")
+    assert results["write"].status_code == 200, results["write"].json()
+    assert results["checkout"].status_code == 200, results["checkout"].json()
+    assert results["checkout"].json()["model"] == "opus"
 
 
 def test_budget_bounds_this_run_and_carries_no_project_total(client):
@@ -821,7 +1069,7 @@ def test_the_grant_carries_exactly_the_slip_id_and_no_other_undecided_field(
 
 @pytest.mark.parametrize("persona", [None, "coder"])
 def test_the_checkout_response_carries_nothing_beyond_the_base_fields_and_the_grant(
-        client, persona):
+        client, persona, tmp_path, monkeypatch):
     """`_do_checkout` builds its response as a literal —
     `{"item": ..., "lease": ..., "policy": ..., "adjacency": ...,
     **_call_slip_grant(persona, slip_id)}` — and this pins that literal from
@@ -866,6 +1114,7 @@ def test_the_checkout_response_carries_nothing_beyond_the_base_fields_and_the_gr
     platform/decisions/0079): a checkout of a blocked item takes the lease and
     not the claim, so every checkout now says which it got. It is a boolean,
     not a bearer-shaped value."""
+    monkeypatch.setattr(reference, "INDEX_DB", tmp_path / "no-such-index.db")
     extra = {} if persona is None else {"persona": persona}
     body = _co(client, "task_a", **extra).json()
     assert set(body) - {"item", "lease", "policy", "claimed", "adjacency"} == set(
@@ -873,7 +1122,8 @@ def test_the_checkout_response_carries_nothing_beyond_the_base_fields_and_the_gr
 
 
 @pytest.mark.parametrize("persona", [None, "coder"])
-def test_the_served_grant_matches_what_the_builder_returned(client, persona):
+def test_the_served_grant_matches_what_the_builder_returned(
+        client, persona, tmp_path, monkeypatch):
     """Distinct from the previous two tests: this one doesn't care what keys
     are present, only whether the grant *values* actually served match what
     `_call_slip_grant` computed. A value changed or overridden after the
@@ -901,10 +1151,39 @@ def test_the_served_grant_matches_what_the_builder_returned(client, persona):
     pins that `slip_id` round-trips unchanged from the builder's return value
     into the response; that it names a real persisted row at all is
     `test_the_slip_id_names_a_real_persisted_row`'s job, not this one's."""
+    monkeypatch.setattr(reference, "INDEX_DB", tmp_path / "no-such-index.db")
     extra = {} if persona is None else {"persona": persona}
     body = _co(client, "task_a", **extra).json()
     expected = libapp._call_slip_grant(persona, body["slip_id"])
     assert {k: body[k] for k in expected} == expected
+
+
+@pytest.mark.parametrize("persona", [None, "coder"])
+def test_the_slip_stores_exactly_the_grant_checkout_served(
+        client, persona, tmp_path, monkeypatch):
+    """`POST /tokens/redeem` returns the grant stored on the slip
+    (issue_01M3VN8WV1K891BT866K82ZBPX), so what redemption tells the
+    Individuator equals what checkout told the Bosun only if the stored copy
+    is the served one. Read back from the row rather than through the redeem
+    route, so this pins the store; `test_token_redeem.py` pins the read."""
+    monkeypatch.setattr(reference, "INDEX_DB", tmp_path / "no-such-index.db")
+    extra = {} if persona is None else {"persona": persona}
+    body = _co(client, "task_a", **extra).json()
+    conn = _db()
+    row = conn.execute("SELECT * FROM call_slips WHERE id = ?",
+                       (body["slip_id"],)).fetchone()
+    conn.close()
+    stored = call_slips.grant_of(row)
+    assert stored is not None
+    assert stored == {k: body[k] for k in stored}
+    assert set(stored) == set(libapp._call_slip_grant(persona, body["slip_id"]))
+
+
+def test_claim_mints_no_slip_and_so_stores_no_grant(client):
+    client.post("/items/task_a/claim", json={"owner": "session-1"}, headers=_h())
+    conn = _db()
+    assert conn.execute("SELECT COUNT(*) FROM call_slips").fetchone()[0] == 0
+    conn.close()
 
 
 def test_claim_keeps_its_old_shape_without_the_grant(client):

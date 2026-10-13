@@ -10,15 +10,29 @@ this script does regardless of which checkout it points at.
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 import textwrap
 
 import pytest
 
 import load_crew_registry
+import black_box_tables
+import projects
 import store
 
 ACTOR = "test, 2026-09-06"
+MARKER = "the-operator"
+
+
+@pytest.fixture(autouse=True)
+def operator_config(tmp_path, monkeypatch):
+    """An operator config for every test, so no test reads the real
+    `~/.config/convivy/operator.json` of the machine running it."""
+    path = tmp_path / "operator.json"
+    path.write_text(json.dumps({"operator_marker": MARKER}))
+    monkeypatch.setenv("CONVIVY_OPERATOR_CONFIG", str(path))
+    return path
 
 
 @pytest.fixture
@@ -46,10 +60,11 @@ def db(tmp_path, monkeypatch):
             updated_by TEXT NOT NULL,
             UNIQUE (project, variant)
         );
-    """)
+    """ + black_box_tables.DDL)
     conn.commit()
     conn.close()
     monkeypatch.setattr(store, "DB_PATH", path)
+    black_box_tables.use_registry(tmp_path, monkeypatch)
     monkeypatch.setattr(store, "WRITES_ENABLED", True)
     return path
 
@@ -104,8 +119,46 @@ def test_roster_subcommand_loads_every_name(db, tmp_path):
     rc = load_crew_registry.main(["roster", str(path), "--actor", ACTOR])
     assert rc == 0
     assert {r["name"] for r in _rows(db, "roster_agents")} == \
-        {"coder", "reviewer"}
+        {"coder", "reviewer", MARKER}
     assert all(r["created_by"] == ACTOR for r in _rows(db, "roster_agents"))
+
+
+def test_roster_reads_a_literal_followed_by_a_marker_statement(db, tmp_path):
+    """The shape agent-platform's knowledge.py takes once the marker leaves
+    the literal: a pure set literal, then a separate statement adding a name
+    read at runtime. `literal_eval` on the first assignment still succeeds,
+    and the marker arrives from the operator config instead."""
+    path = tmp_path / "knowledge.py"
+    path.write_text(
+        "OPERATOR_MARKER = config.get('operator_marker')\n"
+        "ALLOWED_AUDIENCE = {'coder', 'reviewer'}\n"
+        "ALLOWED_AUDIENCE.add(OPERATOR_MARKER)\n")
+    rc = load_crew_registry.main(["roster", str(path), "--actor", ACTOR])
+    assert rc == 0
+    assert {r["name"] for r in _rows(db, "roster_agents")} == \
+        {"coder", "reviewer", MARKER}
+
+
+def test_roster_refuses_without_an_operator_config_and_writes_nothing(
+        db, tmp_path, monkeypatch):
+    monkeypatch.setenv("CONVIVY_OPERATOR_CONFIG",
+                       str(tmp_path / "missing.json"))
+    path = _write_knowledge_py(tmp_path, ["coder"])
+    with pytest.raises(SystemExit, match="missing.json"):
+        load_crew_registry.main(["roster", str(path), "--actor", ACTOR])
+    assert _rows(db, "roster_agents") == []
+
+
+@pytest.mark.parametrize("content", [
+    "{}", '{"operator_marker": ""}', '{"operator_marker": 7}', "[]",
+    "not json"])
+def test_roster_refuses_a_config_without_a_usable_marker(
+        db, tmp_path, operator_config, content):
+    operator_config.write_text(content)
+    path = _write_knowledge_py(tmp_path, ["coder"])
+    with pytest.raises(SystemExit, match="operator config"):
+        load_crew_registry.main(["roster", str(path), "--actor", ACTOR])
+    assert _rows(db, "roster_agents") == []
 
 
 def test_roster_subcommand_refuses_a_second_run_against_a_populated_table(
@@ -118,11 +171,11 @@ def test_roster_subcommand_refuses_a_second_run_against_a_populated_table(
     path = _write_knowledge_py(tmp_path, ["coder"])
     rc1 = load_crew_registry.main(["roster", str(path), "--actor", ACTOR])
     assert rc1 == 0
-    assert {r["name"] for r in _rows(db, "roster_agents")} == {"coder"}
+    assert {r["name"] for r in _rows(db, "roster_agents")} == {"coder", MARKER}
 
     rc2 = load_crew_registry.main(["roster", str(path), "--actor", ACTOR])
     assert rc2 != 0
-    assert {r["name"] for r in _rows(db, "roster_agents")} == {"coder"}
+    assert {r["name"] for r in _rows(db, "roster_agents")} == {"coder", MARKER}
     err = capsys.readouterr().err
     assert "roster_agents already holds" in err
     assert "--reseed" in err
@@ -141,7 +194,7 @@ def test_roster_subcommand_reseed_overwrites_a_populated_table(
         ["roster", str(path2), "--actor", ACTOR, "--reseed"])
     assert rc == 0
     assert {r["name"] for r in _rows(db, "roster_agents")} == \
-        {"coder", "reviewer"}
+        {"coder", "reviewer", MARKER}
 
 
 # --- profiles: reading the YAML tree ----------------------------------------
@@ -402,3 +455,32 @@ def test_the_roster_subcommand_refuses_while_writes_are_disabled(
     rc = load_crew_registry.main(["roster", str(path), "--actor", ACTOR])
     assert rc == 1
     assert "read-only shadow" in capsys.readouterr().err
+
+
+def test_roster_skips_a_withheld_name_and_loads_the_rest(
+        db, tmp_path, monkeypatch, capsys):
+    """A black-box or private crew's name in `ALLOWED_AUDIENCE` is skipped
+    and named rather than crashing the load partway (reviewer, PR #255
+    round 1)."""
+    black_box_tables.use_registry(
+        tmp_path, monkeypatch,
+        {**black_box_tables.ORDINARY_REGISTRY,
+         "cfo": {"repos": [], "private": True}})
+    path = _write_knowledge_py(tmp_path, ["coder", "cfo-scribe", "reviewer"])
+    rc = load_crew_registry.main(["roster", str(path), "--actor", ACTOR])
+    assert rc == 0
+    assert {r["name"] for r in _rows(db, "roster_agents")} == \
+        {"coder", "reviewer", MARKER}
+    assert "cfo-scribe withheld" in capsys.readouterr().out
+
+
+def test_roster_writes_nothing_when_the_registry_cannot_be_read(
+        db, tmp_path, monkeypatch):
+    """Every name is checked before any is written, so an unreadable
+    registry stops the load with an empty table rather than a partial one."""
+    monkeypatch.setattr(projects, "REGISTRY_PATH", tmp_path / "missing.json")
+    projects.reload()
+    path = _write_knowledge_py(tmp_path, ["coder", "reviewer"])
+    rc = load_crew_registry.main(["roster", str(path), "--actor", ACTOR])
+    assert rc == 1
+    assert _rows(db, "roster_agents") == []

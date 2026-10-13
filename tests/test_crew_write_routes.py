@@ -25,6 +25,7 @@ from fastapi.testclient import TestClient
 import app as libapp
 import identity
 import protocol
+import black_box_tables
 import store
 
 ORCHESTRATOR = "orchestrator-token"
@@ -57,7 +58,7 @@ def client(tmp_path, monkeypatch):
             updated_by TEXT NOT NULL,
             UNIQUE (project, variant)
         );
-    """)
+    """ + black_box_tables.DDL)
     conn.commit()
     conn.close()
 
@@ -70,6 +71,7 @@ def client(tmp_path, monkeypatch):
     }))
 
     monkeypatch.setattr(store, "DB_PATH", db)
+    black_box_tables.use_registry(tmp_path, monkeypatch)
     monkeypatch.setattr(identity, "TOKENS", tokens)
     monkeypatch.setattr(store, "WRITES_ENABLED", True)
     return TestClient(libapp.app)

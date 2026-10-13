@@ -255,6 +255,17 @@ def test_get_acks_with_no_acting_human_is_refused(client):
     assert r.status_code == 403
 
 
+def test_get_acks_refuses_an_unrecognised_parameter(client):
+    r = client.get("/signals/acks",
+                   params=[("signal_id", "sig_internal"),
+                           ("acting_human", "operator@example.com"),
+                           ("kind", "note")],
+                   headers=_h(CLIENT))
+    assert r.status_code == 400
+    assert r.json()["unknown"] == ["kind"]
+    assert r.json()["supported"] == ["acting_human", "signal_id"]
+
+
 def test_get_acks_reports_only_ids_the_human_acked(client):
     _call(client, "POST", signal_id="sig_internal", acting_human="operator@example.com")
     r = _get_acks(client, ["sig_internal", "sig_customer"])

@@ -27,6 +27,7 @@ results, and is a different thing from a boundary it cannot cross.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -178,6 +179,39 @@ def connect() -> sqlite3.Connection:
         raise ReferenceIndexUnavailable(f"{INDEX_DB} could not be opened: {e}") from e
     conn.row_factory = sqlite3.Row
     return conn
+
+
+@contextlib.contextmanager
+def reading():
+    """`connect()`, closed on exit, with a failed READ raised as
+    `ReferenceIndexUnavailable` too (issue_01M4RD3919HN309R1S2KHR0JDQ).
+
+    **The watcher rebuilds the index in place, so a connection that opened
+    cleanly can fail on its first statement** with `database disk image is
+    malformed` or `file is not a database`. That is a `sqlite3.Error` raised
+    by the read rather than by `connect()`, and before this it reached the
+    caller as a 500 at nine routes. Raised as the open's failure instead, the
+    registered handler logs the detail and answers its sanitized 503, the
+    answer library#259 gave `resolve_profile`.
+
+    **`SQLITE_BUSY` is re-raised unchanged**, so `app.py`'s `database_busy`
+    handler still answers it with `Retry-After`. Contention is not an
+    unavailable index, and relabelling it would drop the retry hint.
+
+    Use it only around reads of the index. A `sqlite3.Error` from any other
+    database inside the block would be reported as the index's.
+    """
+    conn = connect()
+    try:
+        yield conn
+    except sqlite3.OperationalError as e:
+        if (getattr(e, "sqlite_errorcode", 0) or 0) & 0xFF == sqlite3.SQLITE_BUSY:
+            raise
+        raise ReferenceIndexUnavailable(f"{INDEX_DB} could not be read: {e}") from e
+    except sqlite3.Error as e:
+        raise ReferenceIndexUnavailable(f"{INDEX_DB} could not be read: {e}") from e
+    finally:
+        conn.close()
 
 
 def build_match(query: str) -> str | None:
@@ -550,6 +584,13 @@ def doc_dict(row: sqlite3.Row, *, body: bool, snippet: str | None = None,
             out["binds_topics"] = extra.get("binds_topics")
             out["scope"] = extra.get("scope")
             out["binds_roles"] = extra.get("binds_roles")
+    if row["kind"] == "build-plan":
+        # A build plan's one selector (issue_01M2TWRWHJMA6MF9NKZ9Z05KXN): a
+        # coder dispatched on matching topics receives it. Without this
+        # branch the filter matched on it and every response dropped it.
+        extra = _frontmatter_extra_dict(row)
+        if extra is not None:
+            out["binds_topics"] = extra.get("binds_topics")
     if snippet is not None:
         out["snippet"] = snippet
     if score is not None:

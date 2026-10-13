@@ -40,6 +40,7 @@ import crew_registry
 import identity
 import protocol
 import reference
+import black_box_tables
 import store
 
 REPO = Path(__file__).resolve().parent.parent
@@ -137,6 +138,7 @@ def client(migrated_db, tmp_path, monkeypatch):
     monkeypatch.setattr(identity, "TOKENS", tokens)
     monkeypatch.setattr(identity, "CLIENT_TOKENS", tmp_path / "none.json")
     monkeypatch.setattr(store, "WRITES_ENABLED", True)
+    black_box_tables.use_registry(tmp_path, monkeypatch)
     for name in ROSTER:
         crew_registry.roster_add(ORCHESTRATOR, name)
     crew_registry.profile_put(
@@ -792,6 +794,34 @@ def test_an_unreadable_index_is_a_503_and_mints_nothing(client, monkeypatch,
     monkeypatch.setattr(reference, "INDEX_DB", tmp_path / "gone.db")
     assert _issue(client).status_code == 503
     assert _token_count() == 0
+
+
+def _break_the_index(monkeypatch, tmp_path):
+    """An index the watcher replaced mid-request: `connect()` succeeds on
+    it and the first read fails (issue_01M4RD3919HN309R1S2KHR0JDQ)."""
+    broken = tmp_path / "broken-index.db"
+    broken.write_bytes(b"not a database, " * 256)
+    monkeypatch.setattr(reference, "INDEX_DB", broken)
+    return broken
+
+
+def test_issuing_against_an_index_that_cannot_be_read_is_a_503_and_mints_nothing(
+        client, monkeypatch, tmp_path):
+    broken = _break_the_index(monkeypatch, tmp_path)
+    r = _issue(client)
+    assert r.status_code == 503, r.text
+    assert str(broken) not in r.text
+    assert _token_count() == 0
+
+
+def test_redeeming_against_an_index_that_cannot_be_read_is_a_503_and_spends_nothing(
+        client, monkeypatch, tmp_path):
+    token_id = _issue(client).json()["token_id"]
+    broken = _break_the_index(monkeypatch, tmp_path)
+    r = _redeem(client, token_id)
+    assert r.status_code == 503, r.text
+    assert str(broken) not in r.text
+    assert _token_row(client, token_id)["redeemed_at"] is None
 
 
 def test_a_redeemed_bundle_carries_an_agent_documents_role_and_no_other(client):

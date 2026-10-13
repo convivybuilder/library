@@ -27,6 +27,7 @@ import identity
 import profile_sync
 import protocol
 import reference
+import black_box_tables
 import store
 
 REPO = Path(__file__).resolve().parent.parent
@@ -147,6 +148,7 @@ def client(migrated_db, served, tmp_path, monkeypatch):
     monkeypatch.setattr(identity, "TOKENS", tokens)
     monkeypatch.setattr(identity, "CLIENT_TOKENS", tmp_path / "none.json")
     monkeypatch.setattr(store, "WRITES_ENABLED", True)
+    black_box_tables.use_registry(tmp_path, monkeypatch)
     crew_registry.roster_add(ORCHESTRATOR, "coder")
     return TestClient(libapp.app)
 

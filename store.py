@@ -773,6 +773,14 @@ def new_ulid() -> str:
 MAX_TEXT = 200_000
 MAX_IDENT = 64
 MAX_ACTOR = 200
+# RFC 5321 §4.5.3.1.3's own bound on an address, and `people.sign_in_email`'s
+# column width (`ad6a0a903c09`) — not a deliverability check, only a ceiling
+# on what this service will store.
+MAX_EMAIL = 254
+# `people.display_name`'s column width (`76bfd9912739`); SQLite does not
+# enforce it, so this is the ceiling `bootstrap_library.py`'s own
+# `DISPLAY_NAME_MAX` and `create_person` both hold the line at.
+MAX_DISPLAY_NAME = 300
 MAX_STREAM = 200
 
 # The operator, 2026-09-30: `POST /signals` refuses a submitter's 121st capture inside
@@ -1001,6 +1009,14 @@ MAX_DEDUP_KEY = 300
 # The Chart House vocabularies, carried across from Orient's `control_db`. Held
 # as sets for the same reason `PRIVACY_CLASSES` is: a value outside them stored
 # once is a row every filter and every view silently disagrees about.
+#
+# **"WORK ITEM" IN EVERY STRING A PERSON OR AN AGENT READS; "issue" IN EVERY
+# IDENTIFIER, ON PURPOSE** (issue_01M12NE0SE2PN0HBTS8RB8XAN9, epic
+# issue_01M0EEPS591VQHYEBJY7NGF4C3). Route documentation, refusal text and the
+# protocol contract say work item. The `issue_items` table, the `issue_` id
+# prefix and Orient's `/engineering/issues/` URLs keep their names: each is
+# stored in rows or linked from elsewhere, so renaming one is a migration and
+# a protocol version, not a wording fix.
 MAX_TITLE = 300
 MAX_ITEM_TEXT = 100_000
 ITEM_TYPE_EPIC = "epic"
@@ -1017,13 +1033,6 @@ ITEM_TYPE_EPIC = "epic"
 # want work items"). A work item carries no type at all; `epic` is the only
 # value this vocabulary still holds. A non-epic row stores `type = NULL`.
 ITEM_TYPES = frozenset({ITEM_TYPE_EPIC})
-# Accepted and silently dropped, never stored: agent-platform's `bin/mcp-ops-
-# server` (`issue_create`, `bug_create`) still sends `"type"` on every create,
-# defaulting to `"bug"`, so refusing these outright would break every filing
-# until the Bosun's tools stop sending one (issue_01M3VN8RZN8D3NT19KG744FQG7,
-# comment 5133). `POST /items` accepts a value in this set, drops it, and
-# says so in the response (`type_ignored`); every other route refuses it.
-ITEM_TYPES_ACCEPTED_AND_DROPPED = frozenset({"bug", "nit", "improvement", "task"})
 
 # The maturity ladder (ADR-0024). `approved` is the bucket that becomes the build
 # queue, which is why moving an item into it is worth an operator's attention.
@@ -1157,7 +1166,7 @@ ITEM_INSERT_COLUMNS = ("id", "product", "title", "body", "refs", "severity",
 
 # **THE SHORT, STABLE KEY A PERSON TYPES** (issue_01M2P5CBY5JY8SK5W344CV82AE)
 # — `E9` for an epic, `E9·4` for a sub-item of it, `CQ·63` for a correction (an
-# item with no parent that is not itself an epic). U+00B7 MIDDLE DOT, short
+# item whose parent is its product's corrections queue). U+00B7 MIDDLE DOT, short
 # enough for a 320pt panel and distinct from a decimal point or a slug's own
 # hyphen. Minted once, by `mint_item_key`, at the one place an item comes into
 # existence; nothing afterwards — a retype, a re-parent under `/correct` —
@@ -1269,12 +1278,24 @@ COURSE_ACTION_SUPERSEDED = "superseded"
 # Both carry the snapshot, and both name the epic and the reason in `note`.
 COURSE_ACTION_APPROVED = "approved"
 COURSE_ACTION_DEMOTED = "demoted"
+# `courses.waypoints` moved — a synthetic waypoint was named
+# (issue_01M12NE0VHY8828VJPFX8ARZ24). Carries a `waypoints` snapshot on the
+# event rather than `entries`, which this action never touches.
+COURSE_ACTION_WAYPOINT_ADDED = "waypoint_added"
 
 # A bound on the order rather than a target. A project's route to its bead is a
 # planning artifact a human reads end to end, so a Course of 500 epics is a
 # symptom rather than a plan. The cap exists so a client loop cannot grow one
 # array until every read of the table is expensive for everyone.
 MAX_COURSE_ENTRIES = 500
+
+# The same reasoning as `MAX_COURSE_ENTRIES`, applied to the two axes a
+# synthetic waypoint adds: how many a Course can hold, and how many items one
+# of them can name. Both are unbounded client input otherwise, and a Course
+# nobody reads to the bottom of is the failure `MAX_COURSE_ENTRIES` already
+# guards against on the other axis.
+MAX_COURSE_WAYPOINTS = 100
+MAX_WAYPOINT_MEMBERS = 50
 
 # The optional note a caller may attach to a reorder or a supersede, saying why
 # the route changed. Long enough for a real argument and short enough that it
@@ -1406,9 +1427,20 @@ def insert_item(row: dict, can_return_existing, claim_for,
         now = _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None)
         values = dict(row)
         values["created_at"] = now.isoformat(" ")
+        # **A NON-EPIC WITH NO PARENT GETS ITS PRODUCT'S CORRECTIONS QUEUE,
+        # NEVER A BARE NULL** (`library/specs/one-home-per-work-item`, PR 2).
+        # `mint_item_key` would mint the same `CQ·n` either way — its own
+        # lookup treats a queue id exactly like a missing parent — so this
+        # has to run before that call only to make `values["parent_id"]`
+        # itself correct for the row this transaction is about to write, not
+        # to change what key it gets.
+        if (values["type"] != ITEM_TYPE_EPIC
+                and values["parent_id"] is None):
+            values["parent_id"] = get_or_create_corrections_queue(
+                conn, row["product"])
         values["item_key"] = mint_item_key(
             conn, product=row["product"], item_type=row["type"],
-            parent_id=row["parent_id"])
+            parent_id=values["parent_id"])
         cols = (*ITEM_INSERT_COLUMNS, "created_at")
         try:
             conn.execute(
@@ -1476,6 +1508,31 @@ def corrections_queue_dict(row) -> dict:
     """Serialise a `corrections_queues` row for the wire."""
     return {"id": row["id"], "product": row["product"],
             "created_at": _iso(row["created_at"])}
+
+
+def get_or_create_corrections_queue(conn, product: str) -> str:
+    """`product`'s corrections queue id, minting the row the first time a
+    correction needs one (`library/specs/one-home-per-work-item`, PR 2).
+
+    **CALL ONLY INSIDE A `BEGIN IMMEDIATE` THE CALLER ALREADY HOLDS.** This
+    is the same check-then-act shape `_next_item_key_number` states for
+    itself, and for the same reason: SQLite's single writer lock, taken
+    before this runs, is what stops two concurrent first-corrections in one
+    product from each seeing no row and minting two. `UNIQUE(product)`
+    (migration `8d88e5026d39`) is the schema-level backstop behind that
+    lock, not a substitute for holding it.
+    """
+    row = conn.execute(
+        "SELECT id FROM corrections_queues WHERE product = ?",
+        (product,)).fetchone()
+    if row is not None:
+        return row["id"]
+    queue_id = f"cq_{new_ulid()}"
+    now = _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None)
+    conn.execute(
+        "INSERT INTO corrections_queues (id, product, created_at) "
+        "VALUES (?, ?, ?)", (queue_id, product, now.isoformat(" ")))
+    return queue_id
 
 
 def parse_timestamp(value):
@@ -1848,6 +1905,65 @@ def upsert_policy(row: dict) -> dict:
         conn.close()
 
 
+# What a removal records in `tool_policy_events.decision`, a NOT NULL column
+# whose other values are `POLICY_DECISIONS`. Never a decision a row can hold.
+POLICY_REMOVED = "removed"
+
+
+def remove_policy(key: dict, actor: str) -> dict | None:
+    """Delete the explicit row for one (agent, crew, model, target)
+    combination, returning it, or None when no row is on file (CQ·134).
+
+    **The event is written in the same transaction as the delete**, as
+    `upsert_policy` does for a write, so a row never leaves the table without
+    a history entry saying who removed it and when. The event's `decision`
+    is `POLICY_REMOVED`, and its id moves `policy_version`, so a cache sees
+    a removal the way it sees a write."""
+    conn = connect_rw()
+    try:
+        now_iso = _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None).isoformat(" ")
+        params = (key["agent"], key["crew"], key["model"], key["target"])
+        row = conn.execute(
+            "SELECT * FROM tool_policy WHERE agent = ? AND crew = ? AND "
+            "model = ? AND target = ?", params).fetchone()
+        if row is None:
+            return None
+        conn.execute(
+            "DELETE FROM tool_policy WHERE agent = ? AND crew = ? AND "
+            "model = ? AND target = ?", params)
+        conn.execute(
+            "INSERT INTO tool_policy_events "
+            "(actor, agent, crew, model, target, decision, at) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (actor, *params, POLICY_REMOVED, now_iso))
+        conn.commit()
+        return dict(row)
+    finally:
+        conn.close()
+
+
+def list_policy(filters: dict, limit: int, offset: int) -> tuple[list[dict], int]:
+    """Every explicit row, optionally narrowed by exact match on any of
+    agent, crew, model and target, ordered by that key, with the total
+    (CQ·134). `filters` keys are always those four names, chosen by the
+    route, so only values reach the query as parameters."""
+    where = "".join(f" AND {field} = ?" for field in filters)
+    params = list(filters.values())
+    conn = connect()
+    try:
+        total = conn.execute(
+            f"SELECT COUNT(*) FROM tool_policy WHERE 1 = 1{where}",
+            params).fetchone()[0]
+        rows = conn.execute(
+            "SELECT agent, crew, model, target, decision, created_by, "
+            "created_at, updated_by, updated_at FROM tool_policy "
+            f"WHERE 1 = 1{where} ORDER BY agent, crew, model, target "
+            "LIMIT ? OFFSET ?", [*params, limit, offset]).fetchall()
+        return [dict(r) for r in rows], total
+    finally:
+        conn.close()
+
+
 def is_administrator(conn: sqlite3.Connection, person_id: str) -> bool:
     """Whether `person_id` has a row in `administrators`.
 
@@ -1866,11 +1982,36 @@ def person_exists(conn: sqlite3.Connection, person_id: str) -> bool:
 
 
 def change_person_products(administrator: str, person_id: str,
-                           grant: list[str], revoke: list[str]) -> dict | None:
+                           grant: list[str], revoke: list[str],
+                           default: "list[str] | tuple[str, ...]" = ()) -> dict | None:
     """Grant and revoke products for one person, recording each change.
     Returns `{"granted": [...], "revoked": [...]}`, listing only the products
-    that actually changed, or `None` when `administrator` is not an
+    that actually changed visibility, or `None` when `administrator` is not an
     administrator or `person_id` names nobody.
+
+    **`default` is this person's visibility default — the project slugs the
+    caller found `created_by` this person in the registry
+    (`projects.slugs_created_by`) — and this function never resolves it
+    itself.** `projects` has no cycle with `store` the way `identity` does, but
+    the obligation is the same one `identity.in_scope` names below: a second
+    caller computing the same default a different way, or forgetting to, is
+    drift this keeps from happening by construction only if every caller
+    passes the one the registry gives. Omitted, every name in `grant`/`revoke`
+    is treated as an explicit grant exactly as before this parameter existed —
+    every call in this file's tests that predates this parameter still means
+    what it said.
+
+    **A removed default has no row in `person_products` to delete, because it
+    was never granted — it was never absent either.**
+    `person_product_removals` is that table's mirror for the other direction:
+    one row per product this person's default currently excludes, identified
+    by who excluded it and when. Restoring a removed default deletes that row
+    and never touches `person_products`, since no grant row for a default
+    project should exist to begin with. A product that is both an explicit
+    grant and a default (an explicit grant made before the registry recorded
+    this person as its creator, say) is revoked in both tables at once, so a
+    single revoke closes both paths to visibility rather than leaving the
+    default one open.
 
     **The administrator and the person are re-checked INSIDE the write
     transaction**, after `BEGIN IMMEDIATE` has taken the lock, even though the
@@ -1887,7 +2028,9 @@ def change_person_products(administrator: str, person_id: str,
     and revoking one of those appends a `revoke` with no `grant` before it. A
     history that starts with a revocation is therefore a real state and not a
     corruption — read it as "nothing recorded how this grant arrived", not as a
-    lost row.
+    lost row. `action` stays `'grant'`/`'revoke'` whichever table a change
+    touches: the vocabulary names what the call did to visibility ("made it
+    visible", "made it invisible"), not which table recorded it.
 
     A revocation deletes the `person_products` row and its
     `granted_by`/`granted_at` with it, which is the reason the history is a
@@ -1916,20 +2059,44 @@ def change_person_products(administrator: str, person_id: str,
             conn.rollback()
             return None
         now_iso = _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None).isoformat(" ")
-        held = {r["product"] for r in conn.execute(
+        default_set = set(default)
+        explicit_held = {r["product"] for r in conn.execute(
             "SELECT product FROM person_products WHERE person_id = ?",
             (person_id,))}
-        granted = sorted(set(grant) - held)
-        revoked = sorted(set(revoke) & held)
+        # A product can only ever be removed from a default it belongs to, so
+        # an empty `default_set` means `removed_defaults` is necessarily
+        # empty too — queried and written only when `default_set` is
+        # non-empty, which is also what keeps this call working against a
+        # schema predating `person_product_removals` for a caller that never
+        # passes a default (every call in this file's tests before this
+        # parameter existed, and any call for a person the registry names no
+        # creations for).
+        removed_defaults = {r["product"] for r in conn.execute(
+            "SELECT product FROM person_product_removals WHERE person_id = ?",
+            (person_id,))} if default_set else set()
+        visible = (default_set - removed_defaults) | explicit_held
+        granted = sorted(set(grant) - visible)
+        revoked = sorted(set(revoke) & visible)
         for product in granted:
-            conn.execute(
-                "INSERT INTO person_products (person_id, product, granted_at, "
-                "granted_by) VALUES (?, ?, ?, ?)",
-                (person_id, product, now_iso, administrator))
+            if product in removed_defaults:
+                conn.execute(
+                    "DELETE FROM person_product_removals WHERE person_id = ? "
+                    "AND product = ?", (person_id, product))
+            elif product not in default_set:
+                conn.execute(
+                    "INSERT INTO person_products (person_id, product, "
+                    "granted_at, granted_by) VALUES (?, ?, ?, ?)",
+                    (person_id, product, now_iso, administrator))
         for product in revoked:
-            conn.execute(
-                "DELETE FROM person_products WHERE person_id = ? AND product = ?",
-                (person_id, product))
+            if product in explicit_held:
+                conn.execute(
+                    "DELETE FROM person_products WHERE person_id = ? AND "
+                    "product = ?", (person_id, product))
+            if product in default_set and product not in removed_defaults:
+                conn.execute(
+                    "INSERT INTO person_product_removals (person_id, "
+                    "product, removed_at, removed_by) VALUES (?, ?, ?, ?)",
+                    (person_id, product, now_iso, administrator))
         for action, products in (("grant", granted), ("revoke", revoked)):
             for product in products:
                 conn.execute(
@@ -1938,6 +2105,141 @@ def change_person_products(administrator: str, person_id: str,
                     (person_id, product, action, now_iso, administrator))
         conn.commit()
         return {"granted": granted, "revoked": revoked}
+    finally:
+        conn.close()
+
+
+def person_id_by_email(conn: sqlite3.Connection, email: str) -> str | None:
+    """The `person_id` whose `sign_in_email` equals `email`, or `None`.
+
+    `email` is compared exactly, so the caller must already have trimmed and
+    lower-cased it the way `set_person_email` stores it — this function does
+    no normalisation of its own, the same division of labour
+    `change_person_products` draws for a product name."""
+    row = conn.execute("SELECT id FROM people WHERE sign_in_email = ?",
+                       (email,)).fetchone()
+    return row["id"] if row else None
+
+
+# A sentinel rather than an exception: `set_person_email` already answers
+# "not an administrator, or no such person" with `None`, the shape
+# `change_person_products` uses, and a second failure mode needs a value
+# distinguishable from both that and a successful `{"email": ...}`. Compare
+# with `is`, never `==` — it is not a dict and carries no fields of its own.
+EMAIL_TAKEN = object()
+
+
+def set_person_email(administrator: str, person_id: str,
+                     email: "str | None") -> dict | None:
+    """Set or clear `person_id`'s sign-in email, recording the change with its
+    administrator and time. Returns `{"email": email}` (the value now on the
+    record, `None` for a clear) on success; `None` when `administrator` is
+    not an administrator or `person_id` names nobody, `change_person_products`'s
+    own refusal shape; or `EMAIL_TAKEN` when a DIFFERENT person already holds
+    `email`.
+
+    **`email` must already be trimmed and lower-cased** — this function does
+    no normalisation, the same division `change_person_products` draws for
+    product scope: validation is the caller's to do, this just writes.
+
+    **The administrator, the person and the uniqueness are all re-checked
+    INSIDE the write transaction**, after `BEGIN IMMEDIATE` has taken the
+    lock, for the reason `change_person_products` gives for its own
+    re-check: `BEGIN IMMEDIATE` serializes every write against this
+    database, so nothing else can land a conflicting email, or remove the
+    administrator or the person, between the route's read-only check and
+    this one.
+
+    Every change appends to `person_email_changes` in the same transaction as
+    the row it describes, `change_person_products`'s reason: a change this
+    function makes always has its own history row. A request that changes
+    nothing still writes a row here, unlike `change_person_products` — an
+    administrator re-setting the same email, or clearing one already clear,
+    is a real act this function was asked to perform and not a no-op the
+    caller forgot it already did.
+    """
+    conn = connect_rw()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        if not (is_administrator(conn, administrator)
+                and person_exists(conn, person_id)):
+            conn.rollback()
+            return None
+        if email is not None:
+            holder = person_id_by_email(conn, email)
+            if holder is not None and holder != person_id:
+                conn.rollback()
+                return EMAIL_TAKEN
+        now_iso = _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None).isoformat(" ")
+        conn.execute("UPDATE people SET sign_in_email = ? WHERE id = ?",
+                    (email, person_id))
+        conn.execute(
+            "INSERT INTO person_email_changes (person_id, email, changed_at, "
+            "changed_by) VALUES (?, ?, ?, ?)",
+            (person_id, email, now_iso, administrator))
+        conn.commit()
+        return {"email": email}
+    finally:
+        conn.close()
+
+
+def create_person(administrator: str, display_name: str,
+                  email: "str | None" = None) -> dict | None:
+    """Create a new person with a fresh `person_<ulid>` id, recording
+    `administrator` as both `created_by` and `updated_by`. Returns
+    `{"person_id": ..., "display_name": ..., "email": email}` on success;
+    `None` when `administrator` is not an administrator,
+    `change_person_products`'s own refusal shape; or `EMAIL_TAKEN` when
+    `email` is given and some other person already holds it.
+
+    **`display_name` and `email` must already be validated and, for `email`,
+    trimmed and lower-cased** — the same division of labour
+    `set_person_email` draws: validation is the caller's to do, this just
+    writes.
+
+    **The administrator and the email's uniqueness are checked INSIDE the
+    write transaction**, after `BEGIN IMMEDIATE` has taken the lock, the same
+    reason `set_person_email` gives for its own re-check — nothing else can
+    land a conflicting email, or remove the administrator, between the
+    route's read-only check and this one. There is no person to re-check for
+    existence, since this call is what creates one.
+
+    **The person row and the email write are one transaction**, so a
+    refused email (`EMAIL_TAKEN`) leaves no person row behind. When `email`
+    is given, the write and its `person_email_changes` row are exactly the
+    ones `set_person_email` would make for this person, so the new row
+    reads back identically either way.
+
+    This never writes `administrators`, mints no credential, and grants no
+    project: a new person starts with the default set alone, computed by
+    `projects.slugs_created_by` finding nothing for a brand-new id.
+    """
+    conn = connect_rw()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        if not is_administrator(conn, administrator):
+            conn.rollback()
+            return None
+        if email is not None and person_id_by_email(conn, email) is not None:
+            conn.rollback()
+            return EMAIL_TAKEN
+        person_id = f"person_{new_ulid()}"
+        now_iso = _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None).isoformat(" ")
+        conn.execute(
+            "INSERT INTO people (id, display_name, created_at, created_by, "
+            "updated_at, updated_by) VALUES (?, ?, ?, ?, ?, ?)",
+            (person_id, display_name, now_iso, administrator, now_iso,
+             administrator))
+        if email is not None:
+            conn.execute("UPDATE people SET sign_in_email = ? WHERE id = ?",
+                        (email, person_id))
+            conn.execute(
+                "INSERT INTO person_email_changes (person_id, email, "
+                "changed_at, changed_by) VALUES (?, ?, ?, ?)",
+                (person_id, email, now_iso, administrator))
+        conn.commit()
+        return {"person_id": person_id, "display_name": display_name,
+                "email": email}
     finally:
         conn.close()
 
@@ -2290,6 +2592,10 @@ def epic_progress(conn, epic_id: str, epic_state: str, *,
     materialized progress column to keep in step with a child's state; this is
     the one aggregate query that answers the question fresh on every read.
 
+    "Epic" is defined once, in `lease.py`'s module docstring, beside
+    "waypoint" — this function computes progress for the first of the two;
+    `waypoint_progress` below computes it for the second.
+
     **`children`/`by_state`/`terminal`/`percent_terminal` describe the
     children; `reachable` and `reached` answer two different questions.**
     `reachable` asks whether the children are done — every child in
@@ -2322,6 +2628,55 @@ def epic_progress(conn, epic_id: str, epic_state: str, *,
         "percent_terminal": (terminal / children) if children else None,
         "reachable": terminal == children,
         "reached": epic_state in ITEM_TERMINAL,
+    }
+
+
+def waypoint_progress(member_ids: list[str], items: dict) -> dict:
+    """One synthetic waypoint's progress — `lease.py`'s module docstring
+    defines the term — computed from its own named `member_ids` rather than
+    from a `parent_id` query, which is the one way this differs from
+    `epic_progress` above. `items` maps an id to its resolved row, batched by
+    the caller the same way `get_course` already batches entry resolution; a
+    missing key means the id could not be resolved, in scope or otherwise.
+
+    **PURE, over data a caller already loaded.** No query here, matching
+    `lease.course_position`'s own rule for the same reason: a per-waypoint
+    query would be the N+1 this file keeps finding and removing elsewhere.
+
+    **A MISSING MEMBER IS REPORTED, NOT DROPPED** (the work item's own
+    words: "An entry whose member was deleted reports that rather than
+    being dropped"). It counts toward `total` and never toward `terminal`,
+    so a deleted member blocks `reached` rather than silently shrinking the
+    set it was removed from.
+
+    **`reached` AND `reachable` ARE THE SAME QUESTION HERE, unlike on an
+    epic.** An epic has its own `state`, independent of its children, so
+    `epic_progress` keeps the two apart. A synthetic waypoint has no row and
+    no state of its own — the specification's own rule is "reached when
+    every member it names is terminal" — so there is only one answer to
+    give, under the name the Course-level read already uses.
+    """
+    members = []
+    by_state: dict[str, int] = {}
+    missing = 0
+    for mid in member_ids:
+        item = items.get(mid)
+        if item is None:
+            missing += 1
+            members.append({"id": mid, "missing": True})
+            continue
+        members.append({"id": mid, "state": item["state"]})
+        by_state[item["state"]] = by_state.get(item["state"], 0) + 1
+    total = len(member_ids)
+    terminal = sum(n for s, n in by_state.items() if s in ITEM_TERMINAL)
+    return {
+        "members": members,
+        "total": total,
+        "by_state": by_state,
+        "missing": missing,
+        "terminal": terminal,
+        "percent_terminal": (terminal / total) if total else None,
+        "reached": terminal == total,
     }
 
 
@@ -2573,6 +2928,18 @@ def course_dict(row: sqlite3.Row) -> dict:
     thing nobody discovers until it is wrong in production. Orient puts this one
     on the object and the Library now agrees, so the divergence is closed rather
     than left for the cutover to find.
+
+    **`waypoints` IS THE RAW CONFIG, UNRESOLVED, THE SAME SHAPE `entries`
+    ALREADY IS HERE.** Neither route that calls this resolves an id against
+    `issue_items` — that costs a query, and a caller that only wants the list
+    page should not pay for a resolution it never reads. `GET /courses/{id}`
+    layers the resolved form on top, under its own key, the same way it
+    already does for `entries` (`items`) rather than mutating this one in
+    place — two keys with different shapes under the same name on two
+    routes is the `count` collision above, and this file does not repeat it.
+    **ADDITIVE and absent from no row**: the column backing it carries a
+    `DEFAULT '[]'`, so a Course that predates it reads as having none rather
+    than raising on a missing key.
     """
     entries = _json_or(row["entries"], [])
     return {
@@ -2583,6 +2950,7 @@ def course_dict(row: sqlite3.Row) -> dict:
         "version": row["version"],
         "entries": entries,
         "count": len(entries),
+        "waypoints": _json_or(row["waypoints"], []),
         "created_by": row["created_by"],
         "created_at": _iso(row["created_at"]),
         "updated_by": row["updated_by"],
@@ -3162,11 +3530,6 @@ LEDGER_SOURCES = frozenset({"agentctl", "app"})
 # write with no `lane` is the second step, made once `agentctl` sends one.
 LEDGER_LANES = frozenset({"gateway", "subscription"})
 
-# The epic a spend sits under when its work item has no parent and is not
-# itself an epic — the corrections queue, per `ITEM_TYPES`'s own comment that
-# a work item is either an epic's sub-item or a correction.
-LEDGER_EPIC_CORRECTIONS = "corrections"
-
 MAX_LEDGER_SCOPE_ID = MAX_IDENT
 # Millionths of a dollar. A day's cap of $160 is 160_000_000, and SQLite's
 # INTEGER is 64-bit, so the range above any real budget is not worth bounding
@@ -3600,10 +3963,17 @@ def record_spend(row: dict) -> tuple[bool, dict, str | None]:
             if item is not None:
                 if item["type"] == ITEM_TYPE_EPIC:
                     epic_id = item_id
-                elif item["parent_id"] is not None:
-                    epic_id = item["parent_id"]
                 else:
-                    epic_id = LEDGER_EPIC_CORRECTIONS
+                    # A non-epic's `parent_id` IS the epic dimension: an
+                    # epic's own id for a sub-item, or a corrections queue id
+                    # for a correction (`library/specs/one-home-per-work-
+                    # item`, PR 2 — every non-epic row carries one or the
+                    # other once this PR's backfill has run). `None` here
+                    # names a row the backfill could not reach — a direct
+                    # insert outside `insert_item`, surfaced by `GET
+                    # /items?home=invalid` — and derives nothing, the same
+                    # answer a dangling or missing `item_id` gets.
+                    epic_id = item["parent_id"]
         now = _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None)
         now_iso = now.isoformat(" ")
         entry_id = f"lde_{new_ulid()}"

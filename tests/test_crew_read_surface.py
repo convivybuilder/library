@@ -27,6 +27,7 @@ import crew_registry
 import identity
 import protocol
 import reference
+import black_box_tables
 import store
 
 AGENT = "agent-token-vivy"
@@ -86,7 +87,7 @@ def client(tmp_path, monkeypatch):
             updated_by TEXT NOT NULL,
             UNIQUE (project, variant)
         );
-    """)
+    """ + black_box_tables.DDL)
     conn.commit()
     conn.close()
 
@@ -116,6 +117,7 @@ def client(tmp_path, monkeypatch):
     }))
 
     monkeypatch.setattr(store, "DB_PATH", db)
+    black_box_tables.use_registry(tmp_path, monkeypatch)
     monkeypatch.setattr(reference, "INDEX_DB", index)
     monkeypatch.setattr(identity, "TOKENS", tokens)
     monkeypatch.setattr(store, "WRITES_ENABLED", True)
@@ -167,6 +169,13 @@ def test_roster_refuses_without_roster_read(client, monkeypatch):
     assert "roster.read" in r.json()["error"]
 
 
+def test_roster_refuses_any_parameter(client):
+    r = client.get("/roster?name=alpha", headers=_h())
+    assert r.status_code == 400
+    assert r.json()["unknown"] == ["name"]
+    assert r.json()["supported"] == []
+
+
 # --- GET /profiles ----------------------------------------------------------
 
 
@@ -189,6 +198,13 @@ def test_profiles_refuses_without_roster_read(client, monkeypatch):
         "agent": identity.ROLE_CAPS["agent"] - {"roster.read"}})
     r = client.get("/profiles", headers=_h())
     assert r.status_code == 403
+
+
+def test_profiles_list_refuses_any_parameter(client):
+    r = client.get("/profiles?project=vivy", headers=_h())
+    assert r.status_code == 400
+    assert r.json()["unknown"] == ["project"]
+    assert r.json()["supported"] == []
 
 
 # --- GET /profiles/{project}/{variant} -------------------------------------
@@ -387,6 +403,14 @@ def test_resolve_refuses_without_roster_read(client, monkeypatch):
     assert "roster.read" in r.json()["error"]
 
 
+def test_resolve_refuses_any_parameter(client):
+    _seed_profile("vivy", "daytime", [{"kind": "agent", "project": ["vivy"]}])
+    r = client.get("/profiles/vivy/daytime?status=all", headers=_h())
+    assert r.status_code == 400
+    assert r.json()["unknown"] == ["status"]
+    assert r.json()["supported"] == []
+
+
 def test_resolve_refuses_503_when_the_index_is_unreadable(
         client, monkeypatch, tmp_path):
     """The exception handler that covers the Reference Room's own six
@@ -399,6 +423,23 @@ def test_resolve_refuses_503_when_the_index_is_unreadable(
     r = client.get("/profiles/vivy/daytime", headers=_h())
     assert r.status_code == 503
     assert "knowledge index" in r.json()["error"]
+
+
+def test_resolve_refuses_503_when_the_index_opens_but_cannot_be_read(
+        client, monkeypatch, tmp_path, capsys):
+    """issue_01M229WQ78Y6AV9RPVM5JSSNJF: `reference.connect()` succeeds on a
+    file it cannot yet tell is broken, and the read raises `sqlite3.Error`,
+    which reached the client as a 500. A file that is not a database stands
+    in for an index the watcher replaced mid-request."""
+    _seed_profile("vivy", "daytime", [{"kind": "agent", "project": ["vivy"]}])
+    broken = tmp_path / "broken.db"
+    broken.write_bytes(b"not a database, " * 256)
+    monkeypatch.setattr(reference, "INDEX_DB", broken)
+    r = client.get("/profiles/vivy/daytime", headers=_h())
+    assert r.status_code == 503
+    assert r.json()["error"] == "the knowledge index is unavailable"
+    assert str(broken) not in r.text
+    assert "reference index unavailable" in capsys.readouterr().err
 
 
 # --- no caller ever sees the selection rule ---------------------------------

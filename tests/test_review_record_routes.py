@@ -687,6 +687,24 @@ def test_an_oversized_field_is_refused(client):
     assert "longer than" in r.json()["error"]
 
 
+@pytest.mark.parametrize("prose", [0, 0.0, False, [], {}])
+def test_a_falsy_non_string_prose_is_refused_and_nothing_is_written(client, prose):
+    """`or ""` once stored each of these as empty prose with a 201
+    (issue_01M3XPJX701JSV60GNM5ZK0NJ0)."""
+    r = post(client, prose=prose)
+    assert r.status_code == 400
+    assert r.json()["error"] == "prose must be a string"
+    assert record_count(store.DB_PATH) == 0
+    assert signal_count(store.DB_PATH) == 0
+
+
+@pytest.mark.parametrize("prose", [None, ""])
+def test_an_absent_or_null_prose_is_stored_empty(client, prose):
+    r = post(client, prose=prose)
+    assert r.status_code == 201, r.text
+    assert r.json()["prose"] == ""
+
+
 def test_an_unknown_auth_value_is_refused(client):
     r = post(client, auth="bogus-value")
     assert r.status_code == 400

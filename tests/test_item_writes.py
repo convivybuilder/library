@@ -357,6 +357,57 @@ def test_a_queue_id_as_a_prerequisite_is_refused_as_an_unknown_item_id(client):
     assert "unknown item id" in r.json()["error"]
 
 
+# --- a create with no parent stores the product's queue, never NULL
+# (library/specs/one-home-per-work-item, PR 2) ------------------------------
+
+
+def test_a_create_with_no_parent_stores_the_products_queue(client):
+    r = client.post("/items", json=_body(), headers=_h())
+    assert r.status_code == 201, r.text
+    assert r.json()["parent_id"] == "cq_vivy"
+
+
+def test_an_epic_created_with_no_parent_stays_top_level(client):
+    """The queue-assignment is for a non-epic only; an epic's own NULL
+    parent is unaffected."""
+    r = client.post("/items", json=_body(type="epic"), headers=_h())
+    assert r.status_code == 201, r.text
+    assert r.json()["parent_id"] is None
+
+
+def test_a_new_products_first_corrections_get_exactly_one_queue(client):
+    """`get_or_create_corrections_queue`'s check-then-act is safe for the
+    same reason `mint_item_key`'s counter is (`test_concurrent_creates_in_
+    the_same_scope_never_collide`, just above): `insert_item` already holds
+    `BEGIN IMMEDIATE` before either runs. Eight real threads racing to file
+    `keel`'s very first correction — a product with no seeded queue, unlike
+    `vivy` and `constance` above — must still end with one queue row, not
+    eight."""
+    results = []
+    results_lock = threading.Lock()
+
+    def _create():
+        r = client.post("/items", json=_body(product="keel"), headers=_h(WIDE))
+        with results_lock:
+            results.append(r)
+
+    threads = [threading.Thread(target=_create) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert all(r.status_code == 201 for r in results), [r.text for r in results]
+    parent_ids = {r.json()["parent_id"] for r in results}
+    assert len(parent_ids) == 1, f"more than one queue was minted: {parent_ids}"
+    conn = sqlite3.connect(store.DB_PATH)
+    count = conn.execute(
+        "SELECT COUNT(*) FROM corrections_queues WHERE product = 'keel'"
+    ).fetchone()[0]
+    conn.close()
+    assert count == 1
+
+
 # --- found_during, which epic's work turned an item up without the lane change
 # `parent_id` carries (issue_01M3BFN34Y8P8K39RWS6MM89ZT) -----------------------
 
@@ -366,10 +417,12 @@ def test_an_item_can_be_filed_with_found_during(client):
                     headers=_h())
     assert r.status_code == 201
     assert r.json()["found_during"] == "issue_epic_v"
-    # NEITHER `parent_id` NOR THE CORRECTIONS LANE MOVES: `found_during`
-    # attributes the item to an epic's work without nesting it beneath that
-    # epic.
-    assert r.json()["parent_id"] is None
+    # `found_during` attributes the item to an epic's work without nesting
+    # it beneath that epic — it is not an epic parent, so the item still
+    # gets no epic and lands in its product's corrections queue exactly as
+    # it would with no `found_during` at all (`library/specs/one-home-per-
+    # work-item`, PR 2).
+    assert r.json()["parent_id"] == "cq_vivy"
 
 
 def test_found_during_absent_is_none(client):
@@ -439,17 +492,16 @@ def test_feature_is_refused_like_any_other_unknown_type(client):
     assert "feature" in r.json()["error"]
 
 
-@pytest.mark.parametrize("dropped", ["bug", "nit", "improvement", "task"])
-def test_a_dropped_type_is_accepted_and_the_response_says_so(client, dropped):
-    """Transitional: agent-platform's `bin/mcp-ops-server` still sends `type`
-    on every create, defaulting to `bug` (issue_01M3VN8RZN8D3NT19KG744FQG7,
-    comment 5133), so this stores no type rather than refusing the filing, and
-    names the dropped value in `type_ignored`."""
-    r = client.post("/items", json=_body(type=dropped), headers=_h())
-    assert r.status_code == 201, r.json()
-    body = r.json()
-    assert body["type"] is None
-    assert body["type_ignored"] == dropped
+@pytest.mark.parametrize("retired", ["bug", "nit", "improvement", "task"])
+def test_a_retired_type_is_refused_on_create(client, retired):
+    """Work items carry no type (issue_01M4J3E6BDF2G6JFGHR1KS9N4J), so a
+    create naming one of the four retired values is refused with a 400 naming
+    it and files nothing, as `/correct` refuses them."""
+    before = len(client.get("/items", headers=_h()).json()["items"])
+    r = client.post("/items", json=_body(type=retired), headers=_h())
+    assert r.status_code == 400, r.json()
+    assert retired in r.json()["error"]
+    assert len(client.get("/items", headers=_h()).json()["items"]) == before
 
 
 def test_the_defaults_leave_the_item_untyped(client):
@@ -458,7 +510,6 @@ def test_the_defaults_leave_the_item_untyped(client):
     rather than defaulting to one."""
     r = client.post("/items", json=_body(), headers=_h()).json()
     assert r["type"] is None and r["needs"] == "agent" and r["state"] == "open"
-    assert "type_ignored" not in r
 
 
 def test_severity_is_required_the_way_orient_requires_it(client):

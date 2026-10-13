@@ -481,6 +481,16 @@ def test_window_days_out_of_bounds_is_refused(env):
     assert r.status_code == 400
 
 
+def test_storage_refuses_an_unrecognised_parameter(env):
+    client = TestClient(libapp.app)
+    r = client.get("/signals/storage", params={"kind": "note"}, headers=_h(WIDE))
+    assert r.status_code == 400
+    assert r.json()["unknown"] == ["kind"]
+    assert r.json()["supported"] == sorted(
+        ["threshold_bytes_cold", "threshold_bytes_hot",
+         "threshold_bytes_vectors", "window_days"])
+
+
 # --- scoping: a product-scoped caller sees only its own by_kind ----------
 
 

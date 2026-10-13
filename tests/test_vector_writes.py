@@ -73,6 +73,8 @@ def db(tmp_path, monkeypatch, vector_index):
             model TEXT NOT NULL, gateway TEXT NOT NULL,
             created_by TEXT NOT NULL, created_at TEXT NOT NULL,
             updated_by TEXT NOT NULL, updated_at TEXT NOT NULL);
+        CREATE TABLE corrections_queues (
+            id TEXT PRIMARY KEY, product TEXT UNIQUE, created_at TEXT);
     """)
     conn.executemany(
         "INSERT INTO issue_items (id, product, title, body, type, state, "

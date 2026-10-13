@@ -425,6 +425,21 @@ def test_an_approved_client_reads_both_routes(client):
     assert listed.json()["count"] == 1
 
 
+def test_list_registrations_refuses_any_parameter(client):
+    r = client.get("/black-box/registrations?crew=cfo", headers=_h(CLIENT))
+    assert r.status_code == 400
+    assert r.json()["unknown"] == ["crew"]
+    assert r.json()["supported"] == []
+
+
+def test_get_registration_refuses_any_parameter(client):
+    _register(client, crew="cfo", model="sonnet", gateway="anthropic")
+    r = client.get("/black-box/registrations/cfo?model=opus", headers=_h(CLIENT))
+    assert r.status_code == 400
+    assert r.json()["unknown"] == ["model"]
+    assert r.json()["supported"] == []
+
+
 def test_the_list_route_returns_each_registered_crew_once(client):
     _register(client, crew="cfo", model="sonnet", gateway="anthropic")
     _register(client, crew="ea", model="opus", gateway="bedrock")

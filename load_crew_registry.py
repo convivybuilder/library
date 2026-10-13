@@ -6,7 +6,13 @@ current roster and per-project profiles into `roster_agents` and `profiles`
 **Run on the machine that serves the Library, against its own database
 directly** — the same shape `enroll_machine.py` and `bind_credential.py`
 use: an administrative command with no network and no token, trusted
-because it runs as the operator who already has a shell on the mini.
+because it runs as the operator who already has a shell on the machine
+the Library runs on.
+
+**`roster` also loads the operator's audience marker**, read from the
+operator config file (`_operator_marker`) rather than from
+`ALLOWED_AUDIENCE`, and refuses before writing anything when that file
+or its `operator_marker` key is missing.
 
 **Reads two sibling checkouts the migration tree itself cannot** — see
 `52afccc56e4f_roster_and_profiles.py`'s docstring for why the data load is
@@ -57,6 +63,7 @@ import sys
 import crew_profiles
 import crew_registry
 import identity
+import operator_marker
 import profile_sync
 import store
 
@@ -77,6 +84,28 @@ def _roster_from_knowledge_py(path: str) -> list[str]:
     raise SystemExit(
         f"load_crew_registry: no ALLOWED_AUDIENCE assignment found in "
         f"{path}")
+
+
+def _operator_marker() -> str:
+    """The operator's audience marker, read as data from the operator config
+    via `operator_marker.read_marker` — the module `app.py`'s admission
+    routes read the same marker through, so the path and the failure wording
+    are defined in one place rather than twice.
+
+    **NOT FROM `ALLOWED_AUDIENCE`.** agent-platform 729be139 put the marker
+    into that set as a name read at runtime, which `ast.literal_eval` cannot
+    evaluate, so the literal now holds the agent names alone and the marker
+    comes from the file the Bosun reads it from. It has to reach the roster
+    all the same: knowledge admission refuses any `audience` value that is
+    not in `GET /roster`, so a fresh seed without it refuses every document
+    addressed to the operator.
+
+    **No default.** A missing file or key exits naming the path, because a
+    guessed marker would seed a roster name no document uses."""
+    try:
+        return operator_marker.read_marker()
+    except operator_marker.OperatorMarkerUnavailable as e:
+        raise SystemExit(f"load_crew_registry: {e}")
 
 
 def _profiles_from_knowledge_repo(root: str) -> list[dict]:
@@ -118,12 +147,29 @@ def _roster(args) -> int:
             "anyway.", file=sys.stderr)
         return 1
 
-    names = _roster_from_knowledge_py(args.knowledge_py)
+    names = sorted(set(_roster_from_knowledge_py(args.knowledge_py))
+                   | {_operator_marker()})
+    # **EVERY NAME IS CHECKED BEFORE ANY IS WRITTEN** (reviewer, PR #255
+    # round 1). `roster_add` commits each name on its own, so an unreadable
+    # registry met halfway through would leave a partial roster; here it
+    # stops the load before the first write. A withheld name (a black-box or
+    # private crew's) is skipped and named, since `roster_add` would refuse
+    # it anyway.
+    try:
+        skipped = {name for name in names if crew_registry.withheld(name)}
+    except crew_registry.RegistryUnreadable as e:
+        print(f"load_crew_registry: {e}; nothing was loaded", file=sys.stderr)
+        return 1
     ident = identity.Identity(actor=args.actor, kind="orchestrator")
+    loaded = 0
     for name in names:
+        if name in skipped:
+            print(f"roster: {name} withheld, a black-box or private crew's name")
+            continue
         crew_registry.roster_add(ident, name)
         print(f"roster: {name}")
-    print(f"loaded {len(names)} roster name(s)")
+        loaded += 1
+    print(f"loaded {loaded} roster name(s)")
     return 0
 
 
@@ -202,7 +248,8 @@ def main(argv=None) -> int:
     sub = p.add_subparsers(dest="command", required=True)
 
     roster_p = sub.add_parser(
-        "roster", help="load every name in ALLOWED_AUDIENCE")
+        "roster", help="load every name in ALLOWED_AUDIENCE, plus the "
+                       "operator marker from the operator config")
     roster_p.add_argument(
         "knowledge_py",
         help="path to agent-platform's lib/knowledge/knowledge.py")

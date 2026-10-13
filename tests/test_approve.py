@@ -98,6 +98,8 @@ def client(tmp_path, monkeypatch):
         CREATE TABLE issue_epic_relations (
             id INTEGER PRIMARY KEY AUTOINCREMENT, item_id TEXT, epic_id TEXT,
             created_by TEXT, created_at TEXT);
+        CREATE TABLE corrections_queues (
+            id TEXT PRIMARY KEY, product TEXT UNIQUE, created_at TEXT);
     """)
     # (id, product, type, state, maturity, specification, definition_of_done)
     rows = [
@@ -612,7 +614,11 @@ def test_the_retype_launder_still_ends_proposed_and_off_the_course(client):
                                     headers=_h(AGENT))
     assert post({"type": None}).status_code == 200
     assert post({"specification": "text nobody approved"}).status_code == 200
-    assert post({"type": "epic"}).status_code == 200
+    # Retyping away from `epic` with no `parent_id` sent moved it into its
+    # product's corrections queue (`library/specs/one-home-per-work-item`,
+    # PR 2); clearing it is what the retype back to epic needs in the same
+    # request.
+    assert post({"type": "epic", "parent_id": None}).status_code == 200
     assert _row("epic_a")["maturity"] == "proposed"
     assert "epic_a" not in _course()["entries"]
 

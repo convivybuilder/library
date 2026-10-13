@@ -107,7 +107,7 @@ def client(tmp_path, monkeypatch, vector_index, ledger_tables):
             id TEXT PRIMARY KEY, product TEXT, state TEXT, refs TEXT);
         CREATE TABLE call_slips (
             id TEXT PRIMARY KEY, item_id TEXT, product TEXT, claim_owner_label TEXT,
-            issued_at TEXT, expires_at TEXT);
+            issued_at TEXT, expires_at TEXT, grant_json TEXT);
     """)
     conn.executemany(
         "INSERT INTO issue_items (id, product, title, body, type, state, "

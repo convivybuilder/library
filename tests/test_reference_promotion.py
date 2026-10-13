@@ -40,7 +40,25 @@ DEFINITION = {
 def client(tmp_path, monkeypatch):
     db = tmp_path / "control.db"
     conn = sqlite3.connect(db)
-    conn.executescript("CREATE TABLE issue_items (id TEXT PRIMARY KEY);")
+    # `roster_agents` is seeded with one name so a test that gives the
+    # promotion route an `audience` reads a real, non-empty roster rather
+    # than tripping the empty-roster refusal by accident of an unpopulated
+    # table (issue_01M34SYVH2M48K2S0FQK3K6REY).
+    conn.executescript("""
+        CREATE TABLE issue_items (id TEXT PRIMARY KEY);
+        CREATE TABLE roster_agents (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL,
+            created_by TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL
+        );
+    """)
+    conn.execute(
+        "INSERT INTO roster_agents "
+        "(name, created_at, created_by, updated_at, updated_by) "
+        "VALUES ('architect', '2026-01-01', 'test', '2026-01-01', 'test')")
     conn.commit()
     conn.close()
 
@@ -189,6 +207,19 @@ def test_a_non_dict_frontmatter_is_a_may_land_false_not_a_500(client):
     r = _promote(client, frontmatter=["not", "a", "mapping"])
     assert r.status_code == 200
     assert r.json()["may_land"] is False
+
+
+def test_an_unrostered_audience_is_refused_as_a_frontmatter_clause(client):
+    """`issue_01M34SYVH2M48K2S0FQK3K6REY`: promotion runs the same
+    `validate_frontmatter` clause `/reference/admission` does, so an agent
+    definition naming an audience the roster does not carry is refused here
+    too, before it ever reaches the pull request this route skips."""
+    r = _promote(client, frontmatter={**DEFINITION, "audience": ["ghost"]})
+    body = r.json()
+    assert body["may_land"] is False
+    assert "frontmatter" in body["clauses_refused"]
+    assert any("audience value not in roster: ghost" in e
+               for e in body["errors"])
 
 
 def test_the_checkout_clause_never_runs_here(client):

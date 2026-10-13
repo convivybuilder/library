@@ -287,9 +287,14 @@ def test_the_correction_route_still_corrects_every_other_field(client):
     assert _row("epic")["specification"] == "new scope"
 
 
-def test_an_explicit_null_detaches_the_item(client):
+def test_an_explicit_null_moves_a_work_item_to_its_corrections_queue(client):
+    """A work item's parent is never NULL (`library/specs/one-home-per-
+    work-item`, PR 2): an explicit `null` moves it into its product's
+    corrections queue, which an epic's `null` does not do (that case is
+    covered separately). The move writes no note."""
     r = _correct(client, "child", {"parent_id": None})
-    assert r.status_code == 200 and r.json()["parent_id"] is None
+    assert r.status_code == 200 and r.json()["parent_id"] == "cq_vivy"
+    assert _notes("child") == []
 
 
 def test_an_explicit_null_clears_a_specification(client):
@@ -332,6 +337,17 @@ def test_retyping_an_epic_with_children_is_refused(client):
 
 def test_a_childless_epic_may_be_retyped(client):
     assert _correct(client, "epic_bare", {"type": None}).status_code == 200
+
+
+def test_a_parentless_epic_retyped_to_a_work_item_gets_the_queue(client):
+    """Otherwise the retype leaves a non-epic row with a NULL parent, the
+    shape `library/specs/one-home-per-work-item` retires — this is the
+    other direction from `test_an_item_in_a_queue_cannot_be_retyped_to_epic_
+    in_a_later_request`'s epic-from-queue case, and no `parent_id` is sent
+    in the request either way."""
+    r = _correct(client, "epic_bare", {"type": None})
+    assert r.status_code == 200, r.text
+    assert _row("epic_bare")["parent_id"] == "cq_vivy"
 
 
 # --- ADR-0030's approval invariant ---------------------------------------------
@@ -441,9 +457,16 @@ def test_an_approval_cannot_be_laundered_through_a_retype_round_trip(client):
     because an approval outlives the call."""
     assert _correct(client, "epic_ok", {"type": None}).status_code == 200
     assert _row("epic_ok")["maturity"] == "proposed"          # closed at step one
+    # Retyping away from `epic` with no parent sent moved it into its
+    # product's corrections queue (`library/specs/one-home-per-work-item`,
+    # PR 2); clearing `parent_id` is what the retype back to epic needs in
+    # the same request, the same door `test_an_item_in_a_queue_cannot_be_
+    # retyped_to_epic_in_a_later_request` documents.
+    assert _row("epic_ok")["parent_id"] == "cq_vivy"
     assert _correct(client, "epic_ok",
                     {"specification": "text nobody approved"}).status_code == 200
-    assert _correct(client, "epic_ok", {"type": "epic"}).status_code == 200
+    assert _correct(client, "epic_ok",
+                    {"type": "epic", "parent_id": None}).status_code == 200
     assert _row("epic_ok")["maturity"] == "proposed"
 
 
@@ -637,10 +660,15 @@ def test_the_assertion_does_not_reopen_the_retype_launder(client):
 
     assert _correct(client, "epic_ok", {"type": None}).status_code == 200
     assert _row("epic_ok")["maturity"] == "proposed"
+    # Moved into its product's corrections queue by the retype above
+    # (`library/specs/one-home-per-work-item`, PR 2); cleared below in the
+    # same request that retypes it back to epic.
+    assert _row("epic_ok")["parent_id"] == "cq_vivy"
     assert _correct(client, "epic_ok",
                     {"specification": "text nobody approved",
                      "end_state_unchanged": True}).status_code == 200
-    assert _correct(client, "epic_ok", {"type": "epic"}).status_code == 200
+    assert _correct(client, "epic_ok",
+                    {"type": "epic", "parent_id": None}).status_code == 200
     assert _row("epic_ok")["maturity"] == "proposed"
 
 
@@ -834,6 +862,87 @@ def test_moving_out_of_a_live_lease_into_a_queue_is_refused(client):
     assert _row("child")["parent_id"] == "epic"
 
 
+# --- a move changes parent_id alone (library/specs/one-home-per-work-item,
+# PR 2, section 5 test 1) -----------------------------------------------------
+
+
+def _seed_a_filed_work_item(item_id, *, parent_id="cq_vivy", key="CQ·9"):
+    """A row shaped the way a real `POST /items` create with no parent would
+    leave it, under PR 2: the queue from the start, never NULL."""
+    conn = _db()
+    conn.execute(
+        "INSERT INTO issue_items (id, product, title, body, refs, severity, "
+        "state, type, created_by, created_by_kind, needs, parent_id, "
+        "topics, created_at, item_key) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (item_id, "vivy", "A filed work item", "body text", "{}", "low",
+         "open", None, "agent", "agent", "agent", parent_id, "[]",
+         _ts(days=1), key))
+    conn.commit()
+    conn.close()
+
+
+def _events(item_id):
+    conn = _db()
+    rows = conn.execute(
+        "SELECT * FROM issue_events WHERE item_id = ? ORDER BY id",
+        (item_id,)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def test_a_move_changes_parent_id_alone(client):
+    """File a work item, landing in the queue as `CQ·n`; snapshot its row,
+    its comments and its events. Move it to an epic with `/correct`, then
+    back with the queue id; separately, move it back with `parent_id:
+    null`. After each move the row must match the snapshot in every column
+    but `parent_id` — `item_key` included — and its comments and events
+    must match the snapshot exactly, with nothing added (the operator's
+    first ruling, 2026-10-09)."""
+    _seed_a_filed_work_item("filed")
+    before = dict(_row("filed"))
+    assert before["item_key"] == "CQ·9"
+    assert _notes("filed") == []
+    assert _events("filed") == []
+
+    def _assert_only_parent_moved(expected_parent):
+        row = dict(_row("filed"))
+        assert row["parent_id"] == expected_parent
+        for col in before:
+            if col == "parent_id":
+                continue
+            assert row[col] == before[col], (
+                f"{col} moved: {before[col]!r} -> {row[col]!r}")
+        assert _notes("filed") == []
+        assert _events("filed") == []
+
+    assert _correct(client, "filed", {"parent_id": "epic"}).status_code == 200
+    _assert_only_parent_moved("epic")
+
+    assert _correct(client, "filed",
+                    {"parent_id": "cq_vivy"}).status_code == 200
+    _assert_only_parent_moved("cq_vivy")
+
+    assert _correct(client, "filed", {"parent_id": "epic"}).status_code == 200
+    _assert_only_parent_moved("epic")
+
+    assert _correct(client, "filed", {"parent_id": None}).status_code == 200
+    _assert_only_parent_moved("cq_vivy")
+
+
+def test_a_parent_move_with_another_field_notes_only_the_other_field(client):
+    """`parent_id` never joins the note, whatever else the same request
+    changes — the note names only the field that earns one, and the parent
+    still moves (section 5 test 12)."""
+    r = _correct(client, "bug", {"parent_id": "epic", "severity": "high"})
+    assert r.status_code == 200, r.text
+    assert _row("bug")["parent_id"] == "epic"
+    assert _row("bug")["severity"] == "high"
+    [note] = _notes("bug")
+    assert "severity" in note
+    assert "parent_id" not in note
+
+
 # --- found_during, which epic's work turned an item up without the lane change
 # `parent_id` carries (issue_01M3BFN34Y8P8K39RWS6MM89ZT) -----------------------
 
@@ -922,7 +1031,7 @@ def test_the_holder_may_move_an_item_out_of_its_own_epic(client):
     _take_lease("epic", holder="session-1")
     r = _correct(client, "child", {"parent_id": None, "owner": "session-1"})
     assert r.status_code == 200, r.json()
-    assert _row("child")["parent_id"] is None
+    assert _row("child")["parent_id"] == "cq_vivy"
 
 
 def test_the_holder_may_move_an_item_into_an_epic_it_holds(client):

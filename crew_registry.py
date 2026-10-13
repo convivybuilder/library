@@ -43,8 +43,10 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import re
 
 import identity
+import projects
 import store
 
 
@@ -60,6 +62,19 @@ class RosterWriteForbidden(PermissionError):
     `store.WritesDisabled` (the shadow gate) so a caller can tell "you may
     never do this" from "this request was malformed" from "nobody may write
     right now"."""
+
+
+class RosterNameWithheld(PermissionError):
+    """`name` belongs to a black-box or private crew, so the roster may not
+    carry it (platform/decisions/0043, layer 3: the roster never renders a
+    black box's agents). The route answers it with the same 404 as a name
+    that is not there, so a refusal says nothing about which crews are
+    black boxes."""
+
+
+class RegistryUnreadable(RuntimeError):
+    """The project registry could not be read, so a black-box crew's name
+    cannot be told apart from an ordinary one and nothing is added."""
 
 
 # Matches `store.MAX_IDENT` — every string this module stores is
@@ -214,6 +229,68 @@ def _profile_dict(row) -> dict:
 # --- roster ---------------------------------------------------------------
 
 
+# **A ROSTER NAME IS PLAIN ASCII: letters, digits, `.`, `_` and `-`.** The
+# black-box check below compares names, and a name carrying a zero-width or
+# lookalike character renders as a withheld name while comparing unequal to
+# it (security-reviewer, PR #255 round 1: `ask-scribe` plus U+200B). Every
+# name on the live roster and in `ALLOWED_AUDIENCE` already fits.
+_ROSTER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+
+
+def withholding_crews() -> set[str]:
+    """The casefolded crews whose agent names the roster withholds: the
+    project registry's private repositories and private crew names, and every
+    crew registered as a black box. `withheld` reads it, and so does
+    `DELETE /policy`, which refuses to remove one of these crews' rows because
+    `withheld` finds their agents through those rows. Fails closed: an
+    unreadable registry raises `RegistryUnreadable`."""
+    private = projects.private_repos()
+    crew_names = projects.private_crew_names()
+    if private is None or crew_names is None:
+        raise RegistryUnreadable(
+            "the project registry could not be read, so a black-box crew's "
+            "name cannot be told apart from an ordinary one")
+    return {c.casefold() for c in private | crew_names
+            | store.black_box_registration_crews()}
+
+
+def withheld(name: str) -> bool:
+    """Whether `name` belongs to a black-box or private crew
+    (issue_01M4PMVNHVSM4698ME4W72P0E8), so the roster may not carry it.
+
+    A roster name carries no crew field, so membership is read from two
+    places the crews themselves write, never from a list kept here:
+
+    - **The agents a black-box crew declared.** `POST /black-box/
+      registrations` stores each declared permission as a `tool_policy` row
+      keyed by agent and crew, so a registered crew has already named its
+      agents.
+    - **The crew's own name, or that name plus a hyphen and anything
+      after.** A private crew in the project registry (`cfo`, `ea`) need not
+      register, so it has declared no agents; `cfo-scribe` is caught by its
+      prefix. A crew whose agents use an abbreviation (`sel-` for
+      `selector`) escapes this rule, and only its registration covers it.
+
+    The crews are the union `POST /signals` uses: `projects.private_repos()`,
+    `projects.private_crew_names()` and `store.black_box_registration_crews()`.
+    Fails closed: an unreadable registry raises `RegistryUnreadable`.
+    """
+    crews = withholding_crews()
+    folded = name.strip().casefold()
+    if any(folded == c or folded.startswith(c + "-") for c in crews):
+        return True
+    if not crews:
+        return False
+    conn = store.connect()
+    try:
+        rows = conn.execute(
+            "SELECT crew FROM tool_policy WHERE agent = ? COLLATE NOCASE",
+            (name.strip(),)).fetchall()
+    finally:
+        conn.close()
+    return any(r["crew"].casefold() in crews for r in rows)
+
+
 def roster_add(ident: identity.Identity, name: str, *, now=None) -> dict:
     """Add `name` to the roster, or refresh its `updated_at`/`updated_by` if
     it is already on it. Returns the stored row.
@@ -225,9 +302,17 @@ def roster_add(ident: identity.Identity, name: str, *, now=None) -> dict:
     """
     _require_write(ident)
     _validate_ident_str(name, "name")
+    if not _ROSTER_NAME.match(name):
+        raise InvalidRosterRow(
+            "name must be ASCII letters, digits, '.', '_' or '-', starting "
+            "with a letter or digit")
     now_iso = _now_iso(now)
     conn = store.connect_rw()
     try:
+        # After `connect_rw`, so the shadow gate's `WritesDisabled` still
+        # answers first while nobody may write.
+        if withheld(name):
+            raise RosterNameWithheld(name)
         conn.execute(
             "INSERT INTO roster_agents "
             "(name, created_at, created_by, updated_at, updated_by) "

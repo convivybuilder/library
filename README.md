@@ -1,6 +1,10 @@
 # library
 
-The **Library** is the Keel's retrieval and arbitration service: a process with its own storage
+Builder's website is [convivybuilder.org](https://convivybuilder.org). It carries the documentation
+and the install pages.
+
+The **Library** keeps everything a project knows and serves its work queue. Inside Convivy it is
+the Keel's retrieval and arbitration service: a process with its own storage
 that clients call over a versioned protocol. It holds three vaults.
 
 - **The Chart House** — work items, epics, Courses, and the leases that arbitrate them. This is the
@@ -16,7 +20,7 @@ client, the store and the API at once. Extracting it makes Orient a client like 
 ## What this repository holds, and what it does not
 
 **This repository holds code.** Two of the three vaults keep their data outside it: the Chart House
-is a database on the mini outside any repository, and the Archives are a database plus blob
+is a database on the Mac Studio outside any repository, and the Archives are a database plus blob
 storage. Cloning `library` gives you neither, **so both need backups that are not git.**
 
 **`agentctl` does not live here.** ADR-0021 makes the Library and `agentctl` separately deployable

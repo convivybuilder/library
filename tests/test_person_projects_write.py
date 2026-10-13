@@ -31,6 +31,7 @@ from fastapi.testclient import TestClient
 import app as libapp
 import bootstrap_library
 import identity
+import projects
 import protocol
 import store
 
@@ -100,9 +101,19 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(identity, "CLIENT_TOKENS", client_tokens)
     monkeypatch.setattr(identity, "TOKENS", agent_tokens)
     monkeypatch.setattr(store, "WRITES_ENABLED", True)
+    # A synthetic registry naming no creator, so every default is empty and
+    # these tests keep asserting on explicit grants alone. Without one the
+    # routes fail closed with 503 wherever no agent-platform checkout exists,
+    # which is CI.
+    registry = tmp_path / "projects.json"
+    registry.write_text(json.dumps(
+        {"vivy": {}, "hollis": {}, "constance": {}}))
+    monkeypatch.setattr(projects, "REGISTRY_PATH", registry)
+    projects.reload()
     test_client = TestClient(libapp.app)
     test_client.db = db
-    return test_client
+    yield test_client
+    projects.reload()
 
 
 def _h(token=None):
@@ -294,6 +305,10 @@ def test_the_credential_bootstrap_mints_is_the_attested_channel(
     monkeypatch.setattr(store, "WRITES_ENABLED", True)
     monkeypatch.setattr(identity, "CLIENT_TOKENS", tokens)
     monkeypatch.setattr(identity, "TOKENS", tmp_path / "no-agent-tokens.json")
+    registry = tmp_path / "projects.json"
+    registry.write_text(json.dumps({"vivy": {}}))
+    monkeypatch.setattr(projects, "REGISTRY_PATH", registry)
+    projects.reload()
     person_id, token = bootstrap_library.bootstrap("Ada Lovelace")
     conn = sqlite3.connect(db)
     conn.execute(
@@ -312,6 +327,7 @@ def test_the_credential_bootstrap_mints_is_the_attested_channel(
     assert r.status_code == 200, r.text
     assert r.json()["changed_by"] == person_id
     assert _held(db) == ["vivy"]
+    projects.reload()
 
 
 # --- history --------------------------------------------------------------

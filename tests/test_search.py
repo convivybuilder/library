@@ -408,6 +408,14 @@ def test_an_unrecognised_vault_is_refused_and_names_the_accepted_values(client):
         assert v in r.json()["error"]
 
 
+def test_an_unrecognised_query_parameter_is_refused(client):
+    r = _search(client, sort="newest")
+    assert r.status_code == 400
+    assert r.json()["unknown"] == ["sort"]
+    assert r.json()["supported"] == sorted(
+        ["kind", "limit", "offset", "product", "q", "vault"])
+
+
 def test_the_product_filter_narrows_every_vault_at_once(client):
     """The Reference Room is deliberately NOT product-scoped
     (`reference.py`'s own module docstring) — `project` is a caller-chosen

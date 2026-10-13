@@ -188,6 +188,16 @@ def test_verdicts_out_of_scope_is_not_found(client):
     assert r.status_code == 404
 
 
+def test_verdicts_refuses_an_unrecognised_parameter(client):
+    r = client.get("/review-records/verdicts",
+                   params={"repo_identity": REPO_IDENTITY, "pr": 1,
+                            "role": "reviewer"},
+                   headers=_h())
+    assert r.status_code == 400
+    assert r.json()["unknown"] == ["role"]
+    assert r.json()["supported"] == ["pr", "repo_identity", "reviewed_ref"]
+
+
 # --- retrieval by path, doc_id, item_id ---------------------------------------
 
 def test_retrieval_by_path(client):
@@ -301,6 +311,15 @@ def test_an_unknown_record_id_is_not_found(client):
     assert r.status_code == 404
 
 
+def test_single_record_refuses_an_unrecognised_parameter(client):
+    status, outcome, rec = seed(reviewed_ref="7" * 40)
+    assert status == 201, outcome
+    r = client.get(f"/review-records/{rec['id']}?role=reviewer", headers=_h())
+    assert r.status_code == 400
+    assert r.json()["unknown"] == ["role"]
+    assert r.json()["supported"] == ["include_versions"]
+
+
 # --- pagination -------------------------------------------------------------------
 
 def test_limit_is_bounded_by_max_page_and_total_truncated_are_correct(client):
@@ -316,6 +335,16 @@ def test_limit_is_bounded_by_max_page_and_total_truncated_are_correct(client):
     assert body["count"] == libapp.MAX_PAGE
     assert body["total"] == n
     assert body["truncated"] is True
+
+
+def test_listing_refuses_an_unrecognised_parameter(client):
+    r = client.get("/review-records",
+                   params={"path": "app.py", "role": "reviewer"}, headers=_h())
+    assert r.status_code == 400
+    assert r.json()["unknown"] == ["role"]
+    assert r.json()["supported"] == sorted(
+        ["doc_id", "item_id", "limit", "offset", "path", "pr", "repo_identity",
+         "reviewed_ref"])
 
 
 # --- selector validation -----------------------------------------------------------

@@ -47,6 +47,9 @@ DECISION_EXTRA = {"source_author": "operator"}  # non-block; must not leak the t
 
 MALFORMED_ID = "platform/blocks/malformed-extra"
 
+PLAN_ID = "library/build-plans/example-plan"
+PLAN_EXTRA = {"binds_topics": ["reference-room"], "source_author": "library"}
+
 
 @pytest.fixture
 def client(tmp_path, monkeypatch):
@@ -79,6 +82,9 @@ def client(tmp_path, monkeypatch):
          "a row this service did not write",
          "an instruction-block with unparseable frontmatter_extra",
          "not valid json at all"),
+        (PLAN_ID, "build-plan", "platform",
+         "an example build plan", "the steps between the decision and the code",
+         json.dumps(PLAN_EXTRA)),
     ]
     for doc_id, kind, project, title, body, extra in rows:
         iconn.execute(
@@ -152,3 +158,16 @@ def test_a_decision_document_carries_neither_field(client):
     body = r.json()
     assert "scope" not in body
     assert "binds_roles" not in body
+
+
+def test_a_build_plan_serves_its_binds_topics_and_no_block_fields(client):
+    """issue_01M2TWRWHJMA6MF9NKZ9Z05KXN: `doc_dict` served `binds_topics` for
+    instruction blocks only, so a build plan's one selector was dropped from
+    every response (reviewer, library#257 round 1)."""
+    r = client.get(f"/reference/documents/{PLAN_ID}", headers=_h())
+    assert r.status_code == 200
+    body = r.json()
+    assert body["binds_topics"] == ["reference-room"]
+    for field in ("scope", "binds_roles", "binds_crews", "binds_agents",
+                  "source_author"):
+        assert field not in body

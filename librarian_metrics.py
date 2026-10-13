@@ -106,7 +106,7 @@ def refusals(conn, *, window_days: int = DEFAULT_WINDOW_DAYS,
 
     **A ZERO HERE IS AMBIGUOUS UNTIL THE EPIC MODEL IS USED**, and the
     response says so. Nothing can be refused for a fence reason while there
-    are no epics: a parentless issue leases only itself, so its collisions
+    are no epics: a correction leases only itself, so its collisions
     surface as `already claimed` on the ordinary claim path rather than as a
     fence refusal.
     """
@@ -145,7 +145,7 @@ def refusals(conn, *, window_days: int = DEFAULT_WINDOW_DAYS,
         "distinct_subtrees": len({r["blocking_root_id"] for r in rows}),
         "epics_in_store": epics,
         "note": ("a fence refusal requires an epic to fence: with 0 epics a "
-                 "parentless issue leases only itself, so collisions appear "
+                 "correction leases only itself, so collisions appear "
                  "as 'already claimed' rather than here. Read a zero against "
                  "epics_in_store before reading it as 'no collisions'."
                  if not epics else

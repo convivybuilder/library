@@ -39,8 +39,10 @@ def test_the_migration_creates_both_tables_at_head(tmp_path):
             "PRAGMA table_info(person_products)")}
     finally:
         conn.close()
+    # `sign_in_email` arrives at head with ad6a0a903c09 (issue_01M4QQZ7VTANJ5ZGF630DCB0Y7).
     assert people_columns == {"id", "display_name", "created_at",
-                              "created_by", "updated_at", "updated_by"}
+                              "created_by", "updated_at", "updated_by",
+                              "sign_in_email"}
     assert grant_columns == {"person_id", "product", "granted_at",
                              "granted_by"}
 

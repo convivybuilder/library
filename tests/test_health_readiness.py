@@ -58,6 +58,16 @@ def test_health_still_answers_status_and_protocol(client):
     assert body["protocol"]["current"] == libapp.protocol.CURRENT
 
 
+def test_health_refuses_any_parameter(client):
+    """`/health` reads no filter, so a caller sending one is not doing what it
+    believes (issue_01M1MTCTH3PW0DWDEXAZA5KFET) — and no known caller sends
+    one, confirmed by survey, so the refusal costs nothing in the fleet."""
+    r = client.get("/health?commit=abc")
+    assert r.status_code == 400
+    assert r.json()["unknown"] == ["commit"]
+    assert r.json()["supported"] == []
+
+
 def _boot_stderr(capsys) -> str:
     """The stderr `lifespan` writes at boot, the way test_merge_admission does."""
     import asyncio

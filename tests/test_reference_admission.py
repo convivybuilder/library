@@ -19,6 +19,7 @@ import identity
 import projects
 import protocol
 import reference_admission
+import black_box_tables
 import store
 
 AGENT = "agent-token-vivy"
@@ -76,6 +77,14 @@ def test_empty_required_field(field):
 def test_invalid_kind():
     errs = reference_admission.validate_frontmatter(_fm(kind="not-a-kind"))
     assert any("invalid kind" in e for e in errs)
+
+
+def test_a_build_plan_carrying_binds_topics_is_admitted():
+    """issue_01M2TWRWHJMA6MF9NKZ9Z05KXN: the kind reaches this port with the
+    validator, rather than after it the way `instruction-block` did."""
+    fm = _fm(id="library/build-plans/example", kind="build-plan",
+             binds_topics=["reference-room"])
+    assert reference_admission.validate_frontmatter(fm) == []
 
 
 def test_invalid_project():
@@ -145,6 +154,144 @@ def test_multiple_errors_all_reported():
         {"kind": "not-a-kind", "project": "not-a-project"})
     # id, title, status missing + invalid kind + invalid project = 5
     assert len(errs) == 5
+
+
+# --- audience/binds_agents against a roster (issue_01M34SYVH2M48K2S0FQK3K6REY) --
+#
+# Admission is deliberately stricter here than `knowledge/scripts/validate.py`:
+# that file only warns on `audience` drift and never checks `binds_agents`
+# against the roster at all. Each pair below is identical except for the one
+# value that is or is not on the roster passed in, so the case under test is
+# the only thing that differs between the two.
+
+
+def test_a_rostered_audience_admits():
+    assert reference_admission.validate_frontmatter(
+        _fm(audience=["architect"]), roster=frozenset({"architect"})) == []
+
+
+def test_an_unrostered_audience_refuses_naming_the_value():
+    errs = reference_admission.validate_frontmatter(
+        _fm(audience=["ghost"]), roster=frozenset({"architect"}))
+    assert errs == ["audience value not in roster: ghost"]
+
+
+def test_a_rostered_binds_agents_admits():
+    assert reference_admission.validate_frontmatter(
+        _fm(binds_agents=["architect"]), roster=frozenset({"architect"})) == []
+
+
+def test_an_unrostered_binds_agents_refuses_naming_the_value():
+    errs = reference_admission.validate_frontmatter(
+        _fm(binds_agents=["ghost"]), roster=frozenset({"architect"}))
+    assert errs == ["binds_agents names an unknown agent: ghost"]
+
+
+# --- binds_agents refuses a group or the operator marker even when
+# rostered (NON_AGENT_GROUPS/operator_marker, ported from
+# knowledge/scripts/validate.py's NON_AGENT_AUDIENCE) --
+#
+# `team` and the marker are both on the roster in every case below:
+# `load_crew_registry.py` seeds `roster_agents` from the same superset
+# `validate.py`'s `ALLOWED_AUDIENCE` is, so a plain membership test would
+# pass either straight through.
+
+
+def test_an_agent_in_binds_agents_admits_even_with_a_non_agent_on_the_roster():
+    assert reference_admission.validate_frontmatter(
+        _fm(binds_agents=["architect"]),
+        roster=frozenset({"architect", "team"})) == []
+
+
+def test_a_group_in_binds_agents_refuses_the_person_wording():
+    errs = reference_admission.validate_frontmatter(
+        _fm(binds_agents=["team"]), roster=frozenset({"architect", "team"}))
+    assert errs == [
+        "binds_agents names a person or a group, not an agent: team"]
+
+
+def test_the_operator_marker_in_binds_agents_refuses_the_person_wording():
+    errs = reference_admission.validate_frontmatter(
+        _fm(binds_agents=["the-operator"]),
+        roster=frozenset({"architect", "the-operator"}),
+        operator_marker="the-operator")
+    assert errs == [
+        "binds_agents names a person or a group, not an agent: the-operator"]
+
+
+def test_the_operator_marker_in_audience_is_unaffected():
+    """`audience` may still name the operator — only `binds_agents` names
+    what obeys a document."""
+    assert reference_admission.validate_frontmatter(
+        _fm(audience=["the-operator"]),
+        roster=frozenset({"architect", "the-operator"}),
+        operator_marker="the-operator") == []
+
+
+def test_without_a_roster_neither_field_is_checked():
+    """`roster=None` — not an empty set — means no live roster was offered,
+    matching a caller that never read `frontmatter_needs_roster` as true. A
+    value that would refuse against a real roster validates clean here."""
+    assert reference_admission.validate_frontmatter(
+        _fm(audience=["ghost"], binds_agents=["ghost"])) == []
+
+
+def test_an_empty_roster_refuses_both_fields_naming_the_cause():
+    """An empty roster is read the same way `agent-platform`'s indexer reads
+    one: as unreadable rather than as a roster of zero legitimate names, so
+    admission fails closed instead of refusing `ghost` by name."""
+    errs = reference_admission.validate_frontmatter(
+        _fm(audience=["ghost"], binds_agents=["ghost"]), roster=frozenset())
+    assert errs == [
+        "audience: the roster could not be read or is empty",
+        "binds_agents: the roster could not be read or is empty"]
+
+
+def test_an_absent_field_needs_no_roster():
+    """Matching `frontmatter_needs_roster`: a frontmatter naming neither
+    field is unaffected by whether a roster was given at all, including an
+    empty one."""
+    assert reference_admission.validate_frontmatter(
+        _fm(), roster=frozenset()) == []
+
+
+@pytest.mark.parametrize("field", ["audience", "binds_agents"])
+def test_frontmatter_needs_roster_true_when_the_field_has_a_string(field):
+    assert reference_admission.frontmatter_needs_roster(
+        _fm(**{field: ["architect"]})) is True
+
+
+@pytest.mark.parametrize("field", ["audience", "binds_agents"])
+def test_frontmatter_needs_roster_false_when_the_field_is_absent_or_empty(field):
+    assert reference_admission.frontmatter_needs_roster(_fm()) is False
+    assert reference_admission.frontmatter_needs_roster(_fm(**{field: []})) is False
+
+
+def test_frontmatter_needs_roster_false_on_a_non_dict():
+    assert reference_admission.frontmatter_needs_roster("not a dict") is False
+
+
+def test_binds_agents_needs_operator_marker_true_when_the_field_has_a_string():
+    assert reference_admission.binds_agents_needs_operator_marker(
+        _fm(binds_agents=["architect"])) is True
+
+
+def test_binds_agents_needs_operator_marker_false_when_absent_or_empty():
+    assert reference_admission.binds_agents_needs_operator_marker(_fm()) is False
+    assert reference_admission.binds_agents_needs_operator_marker(
+        _fm(binds_agents=[])) is False
+
+
+def test_binds_agents_needs_operator_marker_false_for_audience_alone():
+    """Only `binds_agents` is compared against the marker — an `audience`-
+    only document should not cost a config read."""
+    assert reference_admission.binds_agents_needs_operator_marker(
+        _fm(audience=["architect"])) is False
+
+
+def test_binds_agents_needs_operator_marker_false_on_a_non_dict():
+    assert reference_admission.binds_agents_needs_operator_marker(
+        "not a dict") is False
 
 
 # --- the knowledge-tree-derived project catalogue (agent-platform#685) ---------
@@ -458,6 +605,7 @@ def test_the_validation_constants_have_not_drifted():
     assert reference_admission.ISO_DATE.pattern == r"^\d{4}-\d{2}-\d{2}$"
     assert "bead" in reference_admission.ALLOWED_KINDS
     assert "instruction-block" in reference_admission.ALLOWED_KINDS
+    assert "build-plan" in reference_admission.ALLOWED_KINDS
 
     configured = os.environ.get("KNOWLEDGE_ROOT")
     if configured:
@@ -565,6 +713,27 @@ def test_the_validation_constants_have_not_drifted():
     compare("ISO_DATE",
             iso_date.group(1),
             reference_admission.ISO_DATE.pattern)
+
+    # `NON_AGENT_GROUPS` is NOT compared for equality: `validate.py`'s
+    # `NON_AGENT_AUDIENCE` holds the operator's own marker as a literal,
+    # and this module holds it as data instead (`operator_marker.
+    # read_marker`), not as a literal (library#228). So the two sets must
+    # differ by EXACTLY ONE name — the marker — and every other name must
+    # agree; a fifth group added to `validate.py` without a matching add
+    # here widens that difference past one and fails this.
+    non_agent = re.search(r"NON_AGENT_AUDIENCE = \{([^}]+)\}", text)
+    assert non_agent, "could not find NON_AGENT_AUDIENCE in validate.py"
+    found_non_agent = set(re.findall(r'"(\w+)"', non_agent.group(1)))
+    missing_here = found_non_agent - reference_admission.NON_AGENT_GROUPS
+    extra_here = reference_admission.NON_AGENT_GROUPS - found_non_agent
+    if len(missing_here) != 1 or extra_here:
+        drifted.append(
+            f"  NON_AGENT_GROUPS: expected validate.py's NON_AGENT_AUDIENCE "
+            f"to be NON_AGENT_GROUPS plus exactly one more name (the "
+            f"operator marker); found {sorted(missing_here)} beyond "
+            f"NON_AGENT_GROUPS" +
+            (f", and {sorted(extra_here)} in NON_AGENT_GROUPS but not "
+             f"validate.py" if extra_here else ""))
 
     assert not drifted, (
         f"{len(drifted)} constant(s) have drifted from "
@@ -841,3 +1010,181 @@ def test_an_orient_editor_save_for_an_adopters_own_project_is_admitted(
     assert r.status_code == 200
     body = r.json()
     assert body["may_land"] is True, body
+
+
+# --- the live roster, read fresh through the route (issue_01M34SYVH2M48K2S0FQK3K6REY) --
+
+ORCHESTRATOR = "orchestrator-token"
+
+
+@pytest.fixture
+def roster_db(tmp_path, monkeypatch):
+    """A real `roster_agents` table on the same `control.db` `held` uses,
+    seeded with one name so a roster read is never mistaken for an
+    unreadable/empty one just because the table under test is new."""
+    db = tmp_path / "control.db"
+    conn = sqlite3.connect(db)
+    conn.executescript("""
+        CREATE TABLE roster_agents (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL,
+            created_by TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL
+        );
+    """ + black_box_tables.DDL)
+    conn.execute(
+        "INSERT INTO roster_agents "
+        "(name, created_at, created_by, updated_at, updated_by) "
+        "VALUES ('architect', '2026-01-01', 'test', '2026-01-01', 'test')")
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(store, "DB_PATH", db)
+    monkeypatch.setattr(store, "WRITES_ENABLED", True)
+
+
+def test_a_name_added_by_put_is_admitted_and_removed_by_delete_is_refused(
+        client, roster_db, tmp_path, monkeypatch):
+    """The definition of done's own shape: presented as real credentials over
+    the real routes rather than asserted from the roster table, so a `PUT`
+    that reached a different table than `GET /roster` reads from would still
+    fail this the way it would fail a real caller."""
+    tokens = tmp_path / "api-tokens-with-orchestrator.json"
+    tokens.write_text(json.dumps({
+        AGENT: {"name": "vivy-agent", "products": ["vivy"]},
+        ORCHESTRATOR: {"name": "co-library", "products": ["*"],
+                       "kind": "orchestrator"},
+    }))
+    monkeypatch.setattr(identity, "TOKENS", tokens)
+    black_box_tables.use_registry(tmp_path, monkeypatch)
+    fm = _fm(audience=["newcomer"])
+
+    before = client.post("/reference/admission", headers=_h(AGENT),
+                          json={"frontmatter": fm}).json()
+    assert any("audience value not in roster: newcomer" in e
+               for e in before["errors"])
+
+    put = client.put("/roster/newcomer", headers=_h(ORCHESTRATOR))
+    assert put.status_code == 200
+
+    after = client.post("/reference/admission", headers=_h(AGENT),
+                        json={"frontmatter": fm}).json()
+    assert "frontmatter" not in after["clauses_refused"]
+
+    delete = client.delete("/roster/newcomer", headers=_h(ORCHESTRATOR))
+    assert delete.status_code == 200
+
+    again = client.post("/reference/admission", headers=_h(AGENT),
+                        json={"frontmatter": fm}).json()
+    assert any("audience value not in roster: newcomer" in e
+               for e in again["errors"])
+
+
+@pytest.fixture
+def empty_roster_db(tmp_path, monkeypatch):
+    """A real `roster_agents` table with zero rows — distinct from
+    `roster_db`, which seeds one row specifically so a roster read is never
+    mistaken for empty just because the table under test is new. This
+    fixture is that case: a table that exists and reads clean, genuinely
+    empty."""
+    db = tmp_path / "control.db"
+    conn = sqlite3.connect(db)
+    conn.executescript("""
+        CREATE TABLE roster_agents (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL,
+            created_by TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL
+        );
+    """)
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(store, "DB_PATH", db)
+
+
+def test_an_audience_against_a_genuinely_empty_roster_refuses_through_the_route(
+        client, empty_roster_db):
+    """The pure-function version of this case (`test_an_empty_roster_refuses_
+    both_fields_naming_the_cause`) passes a literal `frozenset()`; this sends
+    real credentials through the real route against a real, freshly-created
+    `roster_agents` table that nobody has written a row to, the way
+    `test_a_name_added_by_put_is_admitted_and_removed_by_delete_is_refused`
+    exercises the populated case."""
+    r = client.post("/reference/admission", headers=_h(AGENT),
+                    json={"frontmatter": _fm(audience=["architect"])})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["may_land"] is False
+    assert any("audience: the roster could not be read or is empty" in e
+               for e in body["errors"])
+
+
+# --- the operator marker, read fresh through the route -----------------------
+
+
+OPERATOR_MARKER = "the-operator"
+
+
+@pytest.fixture
+def operator_config(tmp_path, monkeypatch):
+    """A synthetic operator config, so no test reads the real
+    `~/.config/convivy/operator.json` of the machine running it — the same
+    fixture shape `test_load_crew_registry.py` uses."""
+    path = tmp_path / "operator.json"
+    path.write_text(json.dumps({"operator_marker": OPERATOR_MARKER}))
+    monkeypatch.setenv("CONVIVY_OPERATOR_CONFIG", str(path))
+    return path
+
+
+def test_the_operator_marker_in_binds_agents_refuses_through_the_route(
+        client, roster_db, operator_config):
+    """The marker is rostered, the same as `team` is in the pure-function
+    pair above — `load_crew_registry.py` seeds it alongside the real
+    agents — so this proves the refusal is not just an accident of the
+    marker being unrostered."""
+    conn = sqlite3.connect(store.DB_PATH)
+    conn.execute(
+        "INSERT INTO roster_agents "
+        "(name, created_at, created_by, updated_at, updated_by) "
+        "VALUES (?, '2026-01-01', 'test', '2026-01-01', 'test')",
+        (OPERATOR_MARKER,))
+    conn.commit()
+    conn.close()
+    r = client.post("/reference/admission", headers=_h(AGENT),
+                    json={"frontmatter": _fm(binds_agents=[OPERATOR_MARKER])})
+    body = r.json()
+    assert body["may_land"] is False
+    assert any(
+        f"binds_agents names a person or a group, not an agent: "
+        f"{OPERATOR_MARKER}" in e for e in body["errors"])
+
+
+def test_an_unreadable_operator_config_refuses_binds_agents_through_the_route(
+        client, roster_db, monkeypatch, tmp_path):
+    """`binds_agents` needs the marker to compare against; a config the
+    service cannot read refuses it outright, naming the cause, the same
+    fail-closed shape an empty roster gets — confirmed red without the
+    check by `test_the_operator_marker_in_binds_agents_refuses_through_the_
+    route` above, which depends on the config being readable."""
+    monkeypatch.setenv("CONVIVY_OPERATOR_CONFIG",
+                       str(tmp_path / "missing.json"))
+    r = client.post("/reference/admission", headers=_h(AGENT),
+                    json={"frontmatter": _fm(binds_agents=["architect"])})
+    body = r.json()
+    assert body["may_land"] is False
+    assert "binds_agents: the operator marker could not be read" in body["errors"]
+
+
+def test_an_unreadable_operator_config_leaves_audience_only_unaffected(
+        client, roster_db, monkeypatch, tmp_path):
+    """`audience` never needs the marker — a document naming only `audience`
+    is unaffected by whether the operator config can be read at all."""
+    monkeypatch.setenv("CONVIVY_OPERATOR_CONFIG",
+                       str(tmp_path / "missing.json"))
+    r = client.post("/reference/admission", headers=_h(AGENT),
+                    json={"frontmatter": _fm(audience=["architect"])})
+    body = r.json()
+    assert "frontmatter" not in body["clauses_refused"], body

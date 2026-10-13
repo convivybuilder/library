@@ -29,6 +29,25 @@ have been the worse order. **The gate itself is gone now**
 which is a later change than the one this paragraph explains; `take` and the
 fence stay exactly as landed here, independent of the gate that motivated their
 timing.
+
+**TWO WORDS THE COURSE CODE IN THIS MODULE USES, DEFINED HERE ONCE**
+(issue_01M35R7VK48D9JDYGZPP3SW7HB, under the Course-machinery epic
+issue_01KZFB4KXQD82G3PDHMADXD6NA). Before this, neither appeared anywhere a
+reader of Course code would land — `store.epic_progress`, `store.
+waypoint_progress`, `course_position` and `waypoint_course_position` below
+all point here rather than restating it.
+
+- **An epic** is the bundle of work: an `issue_items` row of type `epic`,
+  with other items parented under it (`issue_items.parent_id`).
+- **A waypoint** is a point on the route that an epic, or a named set,
+  reaches. Usually that set is one epic, and the waypoint needs no object
+  of its own — it is the epic seen from the Course rather than from the
+  work, reached when the epic's own state is terminal (`course_position`).
+  A waypoint may instead be SYNTHETIC, naming several items — an epic or a
+  work item, by id — that must all complete before it is reached. No
+  single row represents a synthetic waypoint, so it is its own entry on the
+  Course (`courses.waypoints`), reached when every member it names is
+  terminal (`waypoint_course_position`).
 """
 from __future__ import annotations
 
@@ -794,6 +813,51 @@ def course_position(entries, items: dict, entry_leases: dict, *, now=None) -> di
         "remaining": len(remaining_ids),
         "remaining_ids": remaining_ids,
         "missing": missing,
+    }
+
+
+def waypoint_course_position(waypoints: list[dict]) -> dict:
+    """A Course's synthetic waypoints, placed into the same three groups
+    `course_position` places its epic entries into — "epic" and "waypoint"
+    are defined once, in this module's own docstring above.
+
+    **PURE, over `store.waypoint_progress`'s own output, one dict per
+    waypoint plus its `id`.** No query here, same rule as `course_position`.
+
+    REACHED: `reached` is already true — every member terminal.
+
+    REMAINING: not reached, no member missing, no member terminal, and every
+    resolved member's state is the literal `open` — nothing has touched any
+    of them yet. **No lease walk**, unlike `course_position`'s epic entries:
+    a member here can be any item, not only an epic, so there is no single
+    rule for which id a checkout would have leased, and the specification
+    this computes asks only for "members and their states" — own state is
+    what that means.
+
+    IN FLIGHT: everything else not reached and not remaining — some member
+    has progressed, or one could not be resolved at all. A missing member
+    can never be `open`, so it always lands a waypoint here rather than in
+    remaining, which is the "reported, not dropped" rule this function's
+    share of it.
+    """
+    reached_ids, in_flight_ids, remaining_ids = [], [], []
+    for w in waypoints:
+        wid = w["id"]
+        if w["reached"]:
+            reached_ids.append(wid)
+        elif (w["missing"] == 0 and w["terminal"] == 0
+              and set(w["by_state"]) <= {store.ITEM_STATE_OPEN}):
+            remaining_ids.append(wid)
+        else:
+            in_flight_ids.append(wid)
+    return {
+        "total": len(waypoints),
+        "reached": len(reached_ids),
+        "reached_ids": reached_ids,
+        "in_flight": len(in_flight_ids),
+        "in_flight_ids": in_flight_ids,
+        "remaining": len(remaining_ids),
+        "remaining_ids": remaining_ids,
     }
 
 

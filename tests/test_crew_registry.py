@@ -21,6 +21,7 @@ import pytest
 
 import crew_registry
 import identity
+import black_box_tables
 import store
 
 WORKER = identity.Identity(actor="a-worker", kind="agent")
@@ -53,10 +54,11 @@ def db(tmp_path, monkeypatch):
             updated_by TEXT NOT NULL,
             UNIQUE (project, variant)
         );
-    """)
+    """ + black_box_tables.DDL)
     conn.commit()
     conn.close()
     monkeypatch.setattr(store, "DB_PATH", path)
+    black_box_tables.use_registry(tmp_path, monkeypatch)
     monkeypatch.setattr(store, "WRITES_ENABLED", True)
     return path
 

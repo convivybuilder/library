@@ -61,6 +61,8 @@ def client(tmp_path, monkeypatch):
             release_reason TEXT, released_by TEXT, note TEXT);
         CREATE UNIQUE INDEX ix_live_root ON issue_leases (root_id)
             WHERE released_at IS NULL;
+        CREATE TABLE corrections_queues (
+            id TEXT PRIMARY KEY, product TEXT UNIQUE, created_at TEXT);
     """)
     conn.commit()
     conn.close()
@@ -459,3 +461,68 @@ def test_json_each_is_never_handed_an_unguarded_column(client):
     guard = fragment.index("CASE WHEN json_valid(topics)")
     call = fragment.index("json_each(topics)")
     assert guard < call, "the CASE must open before json_each is reached"
+
+
+# --- home=invalid, the non-epic rows no ordinary write path can create any
+# more (library/specs/one-home-per-work-item, PR 2) --------------------------
+
+
+def queue(product, queue_id):
+    conn = sqlite3.connect(store.DB_PATH)
+    conn.execute(
+        "INSERT INTO corrections_queues (id, product, created_at) "
+        "VALUES (?,?,?)", (queue_id, product, "2026-08-01 00:00:00.000000"))
+    conn.commit()
+    conn.close()
+
+
+def test_home_invalid_surfaces_a_null_parent_non_epic(client):
+    seed("null_parent")
+    assert listed(client, "home=invalid") == {"null_parent"}
+
+
+def test_home_invalid_surfaces_a_dangling_parent(client):
+    seed("dangling", parent_id="issue_does_not_exist")
+    assert listed(client, "home=invalid") == {"dangling"}
+
+
+def test_home_invalid_excludes_a_valid_epic_parent(client):
+    seed("epic_1", type="epic")
+    seed("child_1", parent_id="epic_1")
+    assert listed(client, "home=invalid") == set()
+
+
+def test_home_invalid_excludes_a_valid_queue_parent(client):
+    queue("keel", "cq_keel")
+    seed("corrected", parent_id="cq_keel")
+    assert listed(client, "home=invalid") == set()
+
+
+def test_home_invalid_excludes_a_top_level_epic(client):
+    seed("epic_bare", type="epic")
+    assert listed(client, "home=invalid") == set()
+
+
+def test_home_invalid_catches_a_queue_from_another_product(client):
+    """A queue id is a valid home only in its own product
+    (`_validate_parent`'s same-product rule) — a row pointing at a queue
+    from elsewhere is as homeless as one pointing at nothing."""
+    queue("a-different-product", "cq_other")
+    seed("cross_product", parent_id="cq_other")
+    assert listed(client, "home=invalid") == {"cross_product"}
+
+
+def test_home_invalid_mixes_only_the_invalid_rows_in(client):
+    seed("epic_1", type="epic")
+    seed("child_1", parent_id="epic_1")
+    queue("keel", "cq_keel")
+    seed("corrected", parent_id="cq_keel")
+    seed("null_parent")
+    seed("dangling", parent_id="issue_does_not_exist")
+    assert listed(client, "home=invalid") == {"null_parent", "dangling"}
+
+
+def test_home_rejects_any_other_value(client):
+    r = client.get("/items?home=something-else", headers=_h())
+    assert r.status_code == 400
+    assert "home must be" in r.json()["error"]

@@ -70,21 +70,24 @@ def client(tmp_path, monkeypatch, vector_index, ledger_tables):
             blocking_root_id TEXT, blocking_holder TEXT, blocks_by TEXT);
         CREATE TABLE call_slips (
             id TEXT PRIMARY KEY, item_id TEXT, product TEXT, claim_owner_label TEXT,
-            issued_at TEXT, expires_at TEXT);
+            issued_at TEXT, expires_at TEXT, grant_json TEXT);
         CREATE TABLE courses (
             id TEXT PRIMARY KEY, product TEXT, title TEXT, entries TEXT,
+            waypoints TEXT DEFAULT '[]',
             status TEXT, version INTEGER, created_by TEXT, created_at TEXT,
             updated_by TEXT, updated_at TEXT);
         CREATE UNIQUE INDEX ix_courses_live_product ON courses (product)
             WHERE status = 'live';
         CREATE TABLE course_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT, course_id TEXT, actor TEXT,
-            action TEXT, entries TEXT, note TEXT, at TEXT);
+            action TEXT, entries TEXT, waypoints TEXT, note TEXT, at TEXT);
         CREATE TABLE signals (
             id TEXT PRIMARY KEY, source TEXT, stream TEXT, kind TEXT, actor TEXT,
             ingested_by TEXT, product TEXT, refs TEXT, body TEXT, meta TEXT,
             privacy_class TEXT, produced_at TEXT, ingested_at TEXT,
             embedded_at TEXT, dedup_key TEXT UNIQUE, acting_human TEXT);
+        CREATE TABLE corrections_queues (
+            id TEXT PRIMARY KEY, product TEXT UNIQUE, created_at TEXT);
     """)
     conn.commit()
     conn.close()

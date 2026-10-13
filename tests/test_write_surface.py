@@ -44,8 +44,8 @@ NOSCOPE = "agent-token-noscope"
 # project reachable by a spelling `private_repos()` does not carry.
 REGISTRY = {
     "_meta": {},
-    "vivy": {"repos": []},
-    "constance": {"repos": []},
+    "vivy": {"repos": ["vivy"], "aliases": ["vivy-old"]},
+    "constance": {"repos": ["constance"]},
     "secretproject": {"private": True, "repos": ["secret-repo"]},
     "privatecrew": {
         "private": True,
@@ -922,3 +922,157 @@ def test_an_unnamed_kind_is_stored_and_not_vectorised(client):
     assert created.status_code == 201
     signal_id = created.json()["id"]
     assert conftest.vectors_for(store.DB_PATH, signal_id) == []
+
+
+# --- `pr_state` and `model_resolution` derive `product` from `meta.repo` ------
+#
+# issue_01M2NZG7VT7M80GKSMZ04R5KC7 (CQ·130): `GET /signals/pr-state` ranks a
+# PR's rows before it applies scope, which is correct only while every
+# `pr_state` row for a PR carries the same product. These pin the write-time
+# check that keeps that true, mirroring `_review_record_product`'s own
+# registry derivation.
+
+
+def _signal_product(signal_id):
+    conn = sqlite3.connect(store.DB_PATH)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT product FROM signals WHERE id = ?",
+                       (signal_id,)).fetchone()
+    conn.close()
+    return row["product"]
+
+
+def test_a_pr_states_product_is_derived_from_meta_repo_and_stored(client):
+    r = client.post(
+        "/signals",
+        json=_body(kind="pr_state", product="vivy",
+                   meta={"repo": "convivy/vivy"}),
+        headers=_h(WIDE))
+    assert r.status_code == 201
+    assert _signal_product(r.json()["id"]) == "vivy"
+
+
+def test_a_pr_state_product_disagreeing_with_an_in_scope_derivation_is_refused(
+        client):
+    """The caller holds `*` scope, so naming the derived product is not new
+    information to it."""
+    before = _stored_signals()
+    r = client.post(
+        "/signals",
+        json=_body(kind="pr_state", product="constance",
+                   meta={"repo": "convivy/vivy"},
+                   dedup_key="pr-state-mismatch"),
+        headers=_h(WIDE))
+    assert r.status_code == 400
+    assert r.json()["product"] == "vivy"
+    assert _stored_signals() == before
+
+
+def test_a_pr_state_under_an_alias_is_stored_under_the_derived_slug(client):
+    """`vivy-old` resolves to `vivy`, so it passes the comparison; storing it
+    as spelled would put this PR's rows under two literal products
+    (reviewer, PR #262 round 1)."""
+    r = client.post(
+        "/signals",
+        json=_body(kind="pr_state", product="vivy-old",
+                   meta={"repo": "convivy/vivy"}),
+        headers=_h(WIDE))
+    assert r.status_code == 201
+    assert _signal_product(r.json()["id"]) == "vivy"
+
+
+@pytest.mark.parametrize("repo", ["secret-repo", "convivy/secret-repo"])
+def test_a_mismatch_against_a_private_repo_is_a_plain_404(client, repo):
+    """`WIDE` is scoped `*`, like every live client token, so the scope test
+    alone would let a 400 name `secretproject` and map a private repository
+    to its product (security-reviewer, PR #262 round 1)."""
+    before = _stored_signals()
+    r = client.post(
+        "/signals",
+        json=_body(kind="pr_state", product="vivy", meta={"repo": repo},
+                   dedup_key=f"pr-state-private-{repo}"),
+        headers=_h(WIDE))
+    assert r.status_code == 404
+    assert "secret" not in r.text
+    assert _stored_signals() == before
+
+
+def test_a_pr_state_product_disagreeing_with_an_out_of_scope_derivation_is_404(
+        client):
+    """`AGENT` is scoped only to `vivy`. Its `product: "vivy"` passes the
+    scope check at the top of the route, but `meta.repo` here resolves to
+    `constance`, a product this caller cannot see — the same 404 the scope,
+    black-box and handoff checks above answer with, so the route is not an
+    oracle for which repositories map to which products."""
+    before = _stored_signals()
+    r = client.post(
+        "/signals",
+        json=_body(kind="pr_state", product="vivy",
+                   meta={"repo": "convivy/constance"},
+                   dedup_key="pr-state-oracle"),
+        headers=_h(AGENT))
+    assert r.status_code == 404
+    assert "constance" not in r.text
+    assert _stored_signals() == before
+
+
+def test_a_pr_state_with_no_meta_repo_is_refused(client):
+    before = _stored_signals()
+    r = client.post(
+        "/signals",
+        json=_body(kind="pr_state", product="vivy", dedup_key="pr-state-no-repo"),
+        headers=_h(WIDE))
+    assert r.status_code == 404
+    assert _stored_signals() == before
+
+
+def test_a_pr_state_whose_repo_the_registry_does_not_know_is_refused(client):
+    before = _stored_signals()
+    r = client.post(
+        "/signals",
+        json=_body(kind="pr_state", product="vivy",
+                   meta={"repo": "convivy/no-such-repo"},
+                   dedup_key="pr-state-unresolvable"),
+        headers=_h(WIDE))
+    assert r.status_code == 404
+    assert _stored_signals() == before
+
+
+def test_a_pr_state_write_503s_on_an_unreadable_registry(
+        client, tmp_path, monkeypatch):
+    monkeypatch.setattr(projects, "REGISTRY_PATH", tmp_path / "gone-pr-state.json")
+    projects.reload()
+    before = _stored_signals()
+    r = client.post(
+        "/signals",
+        json=_body(kind="pr_state", product="vivy",
+                   meta={"repo": "convivy/vivy"},
+                   dedup_key="pr-state-registry-down"),
+        headers=_h(WIDE))
+    assert r.status_code == 503
+    assert "registry" in r.json()["error"]
+    assert _stored_signals() == before
+
+
+def test_a_model_resolutions_disagreeing_meta_repo_is_refused(client):
+    before = _stored_signals()
+    r = client.post(
+        "/signals",
+        json=_body(kind="model_resolution", product="constance",
+                   meta={"repo": "vivy"}, dedup_key="model-resolution-mismatch"),
+        headers=_h(WIDE))
+    assert r.status_code == 400
+    assert r.json()["product"] == "vivy"
+    assert _stored_signals() == before
+
+
+def test_a_model_resolution_with_no_meta_repo_is_left_unchecked(client):
+    """agent-platform#603 sends `meta.repo` only on new rows; one with none —
+    every row written before that change — is not even checked, let alone
+    refused for a field its writer never sent."""
+    r = client.post(
+        "/signals",
+        json=_body(kind="model_resolution", product="constance"),
+        headers=_h(WIDE))
+    assert r.status_code == 201
+    assert _signal_product(r.json()["id"]) == "constance"

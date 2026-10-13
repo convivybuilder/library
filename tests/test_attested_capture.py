@@ -235,6 +235,15 @@ def test_the_crew_scoped_view_is_the_same_route_with_product(client):
         "ref_1", "ref_2", "ref_3"}
 
 
+def test_refusals_refuses_an_unrecognised_parameter(client):
+    r = _refusals(client, since="2026-01-01")
+    assert r.status_code == 400
+    assert r.json()["unknown"] == ["since"]
+    assert r.json()["supported"] == sorted(
+        ["blocking_holder", "blocks_by", "limit", "offset", "product",
+         "requester"])
+
+
 def test_a_blocker_outside_the_callers_scope_is_not_named(client):
     """**The requested item's product is not the blocking lease's**
     (security-reviewer, PR #48). `record_refusal` stamps `product` from the item

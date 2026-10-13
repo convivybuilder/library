@@ -329,6 +329,14 @@ def test_an_unknown_fingerprint_is_200_not_404(client):
                         "active": False}
 
 
+def test_read_refuses_any_parameter(client):
+    r = client.get(f"/machine-certificates/{FP}?machine={MACHINE}",
+                   headers=_h(VERIFY))
+    assert r.status_code == 400
+    assert r.json()["unknown"] == ["machine"]
+    assert r.json()["supported"] == []
+
+
 def test_an_active_certificate_reads_active(client):
     client.post(f"/machines/{MACHINE}/certificates", json=_issue_body(),
                headers=_h(CLIENT))

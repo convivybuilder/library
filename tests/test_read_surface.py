@@ -15,6 +15,7 @@ someone who should not have it.
 """
 from __future__ import annotations
 
+import asyncio
 import datetime as _dt
 import hashlib
 import json
@@ -90,12 +91,13 @@ def _build_client(tmp_path, monkeypatch):
             from_state TEXT, to_state TEXT, note TEXT, at TEXT);
         CREATE TABLE course_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT, course_id TEXT, actor TEXT,
-            action TEXT, entries TEXT, note TEXT, at TEXT);
+            action TEXT, entries TEXT, waypoints TEXT, note TEXT, at TEXT);
         CREATE TABLE issue_comments (
             id INTEGER PRIMARY KEY AUTOINCREMENT, item_id TEXT, actor TEXT,
             kind TEXT, body TEXT, run_id TEXT, at TEXT);
         CREATE TABLE courses (
             id TEXT PRIMARY KEY, product TEXT, title TEXT, entries TEXT,
+            waypoints TEXT DEFAULT '[]',
             status TEXT, version INTEGER, created_by TEXT, created_at TEXT,
             updated_by TEXT, updated_at TEXT);
         CREATE TABLE issue_leases (
@@ -541,6 +543,30 @@ def test_a_malformed_limit_is_refused_rather_than_defaulted(client):
     assert r.status_code == 400
 
 
+def test_items_list_refuses_an_unrecognised_parameter(client):
+    """A dropped filter hands back MORE than was asked for, which is the
+    direction of failure issue_01M1MTCTH3PW0DWDEXAZA5KFET exists to close."""
+    r = client.get("/items?priority=high", headers=_h(WIDE))
+    assert r.status_code == 400
+    assert r.json()["unknown"] == ["priority"]
+    assert r.json()["supported"] == sorted(
+        ["found_during", "home", "limit", "needs", "offset", "parent_id",
+         "product", "sort", "state", "topics", "type"])
+
+
+def test_items_list_ordinary_request_still_succeeds(client):
+    r = client.get("/items?product=vivy&state=open&limit=5&offset=0"
+                   "&sort=created_at", headers=_h(WIDE))
+    assert r.status_code == 200
+
+
+def test_item_get_refuses_any_parameter(client):
+    r = client.get("/items/issue_v1?priority=high", headers=_h())
+    assert r.status_code == 400
+    assert r.json()["unknown"] == ["priority"]
+    assert r.json()["supported"] == []
+
+
 def test_a_course_resolves_its_entries_and_reports_a_missing_one(client):
     """A silently shorter list reads as a plan with fewer steps. `missing` says
     the plan points at something that no longer exists."""
@@ -599,6 +625,20 @@ def test_a_course_list_paginates_like_every_other_list(client):
     page2 = client.get("/courses?limit=1&offset=1", headers=_h(WIDE)).json()
     assert page2["truncated"] is False
     assert page2["courses"][0]["id"] != body["courses"][0]["id"]
+
+
+def test_course_list_refuses_an_unrecognised_parameter(client):
+    r = client.get("/courses?title=anything", headers=_h(WIDE))
+    assert r.status_code == 400
+    assert r.json()["unknown"] == ["title"]
+    assert r.json()["supported"] == ["limit", "offset", "product", "status"]
+
+
+def test_course_get_refuses_any_parameter(client):
+    r = client.get("/courses/course_v?title=anything", headers=_h())
+    assert r.status_code == 400
+    assert r.json()["unknown"] == ["title"]
+    assert r.json()["supported"] == []
 
 
 def test_a_course_list_is_ordered_by_creation_the_way_orient_orders_it(client):
@@ -830,6 +870,20 @@ def test_leases_requires_its_own_capability(client, tmp_path, monkeypatch):
     assert r.status_code == 403 and "item.read" in r.json()["error"]
 
 
+def test_leases_refuses_an_unrecognised_parameter(client):
+    r = client.get("/leases?fences=true", headers=_h(WIDE))
+    assert r.status_code == 400
+    assert r.json()["unknown"] == ["fences"]
+    assert r.json()["supported"] == ["holder", "limit", "offset", "state"]
+
+
+def test_leases_ordinary_request_still_succeeds(client):
+    _seed_leases()
+    r = client.get("/leases?state=all&holder=holder-vivy&limit=5&offset=0",
+                   headers=_h(WIDE))
+    assert r.status_code == 200
+
+
 # --- the librarian's metrics ----------------------------------------------------
 
 
@@ -896,6 +950,14 @@ def test_librarian_metrics_reads_lease_refusals_scoped_by_product(client):
                        headers=_h(WIDE)).json()
     assert other["lease_refusals"]["refusals"] == 0, (
         "a refusal filed under vivy leaked into another product's count")
+
+
+def test_librarian_metrics_refuses_an_unrecognised_parameter(client):
+    r = client.get("/metrics/librarian?product=vivy&since=2026-01-01",
+                   headers=_h())
+    assert r.status_code == 400
+    assert r.json()["unknown"] == ["since"]
+    assert r.json()["supported"] == ["product", "window_days"]
 
 
 def test_librarian_metrics_window_fixtures_survive_a_year_of_clock_drift(
@@ -979,6 +1041,13 @@ def test_the_privacy_class_travels_with_the_body(client):
     than having to infer the class from the content."""
     body = client.get("/signals/sig_v1", headers=_h()).json()
     assert body["privacy_class"] == "internal"
+
+
+def test_signal_get_refuses_any_parameter(client):
+    r = client.get("/signals/sig_v1?reveal=true", headers=_h())
+    assert r.status_code == 400
+    assert r.json()["unknown"] == ["reveal"]
+    assert r.json()["supported"] == []
 
 
 # --- signal filters: repeatable kind/source, and the order whitelist -----------
@@ -1079,6 +1148,80 @@ def test_a_customer_walled_stream_row_is_neither_listed_nor_counted(client):
     with_cap = client.get("/signals?stream=kb-audit", headers=_h(SYSTEM)).json()
     assert {s["id"] for s in with_cap["signals"]} == {
         "sig_audit1", "sig_audit_cust"}
+
+
+def _seed_changelog():
+    """Changelog rows either side of 2026-10-11 13:00 UTC, in both stored
+    `produced_at` shapes, plus one with none, for the `since` filter."""
+    conn = _conn()
+    conn.executemany(
+        "INSERT INTO signals (id, product, source, kind, body, privacy_class, "
+        "produced_at, ingested_at) VALUES (?,?,?,?,?,?,?,?)",
+        [("sig_old", "vivy", "github", "changelog", "an old merge", "internal",
+          "2026-10-11 12:59:59", "2026-10-11 13:00:05.000000"),
+         ("sig_edge", "vivy", "github", "changelog", "a merge on the bound",
+          "internal", "2026-10-11 13:00:00", "2026-10-11 13:00:06.000000"),
+         ("sig_new", "vivy", "github", "changelog", "a new merge", "internal",
+          "2026-10-11 13:00:00.250000", "2026-10-11 13:00:07.000000"),
+         ("sig_entry", "vivy", "co", "changelog", "an entry", "internal",
+          "2026-10-12 09:00:00", "2026-10-12 09:00:01.000000"),
+         ("sig_undated", "vivy", "github", "changelog", "no produced_at",
+          "internal", None, "2026-10-12 10:00:00.000000")])
+    conn.commit()
+    conn.close()
+
+
+def test_signals_since_is_an_inclusive_lower_bound_on_produced_at(client):
+    """`bin/changelog-drain` sends `since` on every run; before this route read
+    it, each pass got the whole changelog history (issue_01M1MTCTH3PW0DWDEXAZA5KFET)."""
+    _seed_changelog()
+    body = client.get("/signals?kind=changelog&source=github"
+                      "&since=2026-10-11T13:00:00Z", headers=_h()).json()
+    assert {s["id"] for s in body["signals"]} == {"sig_edge", "sig_new"}
+    assert body["total"] == 2
+
+
+def test_signals_since_converts_its_zone_to_utc(client):
+    _seed_changelog()
+    body = client.get("/signals?kind=changelog&source=github"
+                      "&since=2026-10-11T06:00:00.100000-07:00",
+                      headers=_h()).json()
+    assert {s["id"] for s in body["signals"]} == {"sig_new"}
+
+
+def test_signals_answers_the_changelog_drains_exact_request(client):
+    """The drain's two reads, parameter for parameter (agent-platform
+    bin/changelog-drain `_pending`)."""
+    _seed_changelog()
+    for source, expected in (("github", {"sig_edge", "sig_new"}),
+                             ("co", {"sig_entry"})):
+        r = client.get(f"/signals?kind=changelog&source={source}"
+                       "&since=2026-10-11T13:00:00Z", headers=_h())
+        assert r.status_code == 200
+        assert {s["id"] for s in r.json()["signals"]} == expected
+
+
+@pytest.mark.parametrize("since", ["2026-10-11T13:00:00", "yesterday", ""])
+def test_signals_refuses_a_since_that_is_not_a_zoned_timestamp(client, since):
+    r = client.get(f"/signals?since={since}", headers=_h())
+    assert r.status_code == 400
+    assert r.json()["since"] == since
+
+
+def test_signal_facets_applies_since(client):
+    _seed_changelog()
+    body = client.get("/signals/facets?kind=changelog&since=2026-10-12T00:00:00Z",
+                      headers=_h()).json()
+    assert body["total"] == 1
+
+
+def test_signals_refuses_an_unrecognised_parameter(client):
+    r = client.get("/signals?stream=kb-audit&strem=kb-audit", headers=_h())
+    assert r.status_code == 400
+    assert r.json()["unknown"] == ["strem"]
+    assert r.json()["supported"] == sorted(
+        ["cursor", "kind", "limit", "offset", "order", "product", "repo",
+         "since", "source", "stream", "unreferenced_by"])
 
 
 def test_signals_default_order_is_ingested_at_descending(client):
@@ -1339,6 +1482,21 @@ def test_signal_facets_requires_signal_read(client, tmp_path, monkeypatch):
     assert r.status_code == 403 and "signal.read" in r.json()["error"]
 
 
+def test_signal_facets_refuses_an_unrecognised_parameter(client):
+    r = client.get("/signals/facets?order=kind", headers=_h())
+    assert r.status_code == 400
+    assert r.json()["unknown"] == ["order"]
+    assert r.json()["supported"] == sorted(
+        ["kind", "product", "repo", "since", "source", "stream",
+         "unreferenced_by"])
+
+
+def test_signal_facets_ordinary_request_still_succeeds(client):
+    r = client.get("/signals/facets?kind=note&source=test&stream=kb-audit",
+                   headers=_h())
+    assert r.status_code == 200
+
+
 # --- repo filter: meta.repo, scoped, repeatable like kind/source ---------------
 
 
@@ -1515,6 +1673,14 @@ def test_pr_state_closed_within_days_rejects_out_of_range(client):
     r = client.get(f"/signals/pr-state?closed_within_days={libapp.MAX_PR_STATE_WINDOW_DAYS}",
                    headers=_h())
     assert r.status_code == 200
+
+
+def test_pr_state_refuses_an_unrecognised_parameter(client):
+    r = client.get("/signals/pr-state?state=open", headers=_h())
+    assert r.status_code == 400
+    assert r.json()["unknown"] == ["state"]
+    assert r.json()["supported"] == sorted(
+        ["closed_within_days", "limit", "offset", "product", "repo"])
 
 
 def test_pr_state_closed_within_days_moves_the_window(client):
@@ -2043,6 +2209,13 @@ def test_ci_capture_missing_status_file_is_absent_and_every_last_fetch_is_null(
     assert all(t["last_fetch"] is None for t in body["tracked"])
 
 
+def test_ci_capture_refuses_any_parameter(ci_capture):
+    resp = ci_capture.get("/signals/ci-capture?repo=convivy/vivy", headers=_h())
+    assert resp.status_code == 400
+    assert resp.json()["unknown"] == ["repo"]
+    assert resp.json()["supported"] == []
+
+
 def test_ci_capture_unparseable_status_file_is_also_absent_not_a_500(ci_capture):
     libapp.ci_result_fetch.STATUS_FILE.write_text("{not json")
     resp = ci_capture.get("/signals/ci-capture", headers=_h())
@@ -2522,12 +2695,27 @@ def test_reference_search_requires_a_query(client, kb):
     assert r.status_code == 400 and "q is required" in r.json()["error"]
 
 
+def test_reference_search_refuses_an_unrecognised_parameter(client, kb):
+    r = client.get("/reference/search?q=library&sort=newest", headers=_h())
+    assert r.status_code == 400
+    assert r.json()["unknown"] == ["sort"]
+    assert r.json()["supported"] == sorted(
+        ["audience", "kind", "limit", "offset", "project", "q", "status"])
+
+
 def test_topics_carry_their_document_counts(client, kb):
     """A topic on one document and a topic on ninety are different facts."""
     body = client.get("/reference/topics", headers=_h()).json()
     topics = {t["topic"]: t["documents"] for t in body["topics"]}
     assert topics["library"] == 1, "archived documents leaked into the vocabulary"
     assert "automations" in topics
+
+
+def test_reference_topics_refuses_any_parameter(client, kb):
+    r = client.get("/reference/topics?sort=newest", headers=_h())
+    assert r.status_code == 400
+    assert r.json()["unknown"] == ["sort"]
+    assert r.json()["supported"] == []
 
 
 def test_the_reference_routes_need_their_own_capability(client, kb, tmp_path, monkeypatch):
@@ -2833,6 +3021,14 @@ def test_the_route_the_kind_refusal_names_actually_filters_by_kind(vec):
     body = vec.get("/signals?kind=build", headers=_h()).json()
     assert [s["id"] for s in body["signals"]] == ["sig_ci2"]
     assert body["total"] == 1
+
+
+def test_semantic_search_refuses_an_unrecognised_parameter(vec):
+    r = vec.get("/signals/search?q=anything&stream=kb-audit", headers=_h())
+    assert r.status_code == 400
+    assert r.json()["unknown"] == ["stream"]
+    assert r.json()["supported"] == sorted(
+        ["kind", "limit", "offset", "product", "q", "source"])
 
 
 def test_semantic_search_reports_no_total_and_that_is_deliberate(vec):
@@ -3334,3 +3530,32 @@ def test_search_accepts_the_status_all_sentinel(kb, client):
     assert r.status_code == 200
     assert "platform/decisions/0009-retired" in [
         d["id"] for d in r.json()["documents"]]
+
+
+@pytest.mark.parametrize("path", [
+    "/signals", "/signals/facets", "/signals/pr-state", "/signals/ci-capture"])
+def test_a_slow_signals_read_runs_off_the_event_loop(client, monkeypatch, path):
+    """Each of these reads scans the whole signal set, 60 to 400ms on the
+    live vault on 2026-10-12, and on the event loop one in-flight call raised
+    the median of twenty concurrent `/health` calls from 28ms to 494ms (CQ·76,
+    issue_01M10P3QVQEVDZAJGTNHMM8KKM). So each must open its connection inside
+    `run_in_threadpool`, where no event loop is running.
+
+    Asserted on the thread rather than by timing a concurrent request, which
+    would pass or fail with the machine's load."""
+    opened_on_loop = []
+    real_connect = store.connect
+
+    def recording_connect(*args, **kwargs):
+        try:
+            asyncio.get_running_loop()
+            opened_on_loop.append(True)
+        except RuntimeError:
+            opened_on_loop.append(False)
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(store, "connect", recording_connect)
+    r = client.get(path, headers=_h(SYSTEM))
+    assert r.status_code == 200, r.text
+    assert opened_on_loop, "the route opened no connection through store.connect"
+    assert not any(opened_on_loop), f"{path} opened a connection on the event loop"

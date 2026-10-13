@@ -188,6 +188,15 @@ def test_a_missing_signal_id_is_not_found(client):
     assert r.status_code == 404
 
 
+def test_the_blob_route_refuses_any_parameter(client):
+    created = client.post(
+        "/signals", json=_body(content="line one"), headers=_h()).json()
+    r = client.get(f"/signals/{created['id']}/blob?raw=true", headers=_h())
+    assert r.status_code == 400
+    assert r.json()["unknown"] == ["raw"]
+    assert r.json()["supported"] == []
+
+
 def test_the_blob_route_respects_product_scope(client):
     """The read authorizes on the ROW, so a caller out of the row's product
     scope is refused even though the blob file itself exists and is

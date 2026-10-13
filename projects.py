@@ -250,6 +250,33 @@ class _Snapshot:
         return frozenset(out)
 
     @functools.cached_property
+    def created_by(self) -> dict[str, list[str]] | None:
+        """{person id: sorted project slugs}, grouping every registered
+        project by its registry entry's `created_by` field — the per-person
+        visibility default (issue_01M2RSFKJBEHD5Y76X0B6XAYZG).
+
+        `None` when this snapshot has no USABLE projects, keyed on
+        `available` rather than on `self.raw` being falsy. The dangerous
+        middle `available`'s own docstring describes applies here exactly
+        as it does to validation: a registry holding only `{"_meta": {...}}`
+        must not read as "nobody created anything" any more than it should
+        resolve every product — both would silently serve a default
+        computed from no registry at all.
+        """
+        if not self.available:
+            return None
+        out: dict[str, list[str]] = {}
+        for slug, entry in self.projects.items():
+            if not isinstance(entry, dict):
+                continue
+            creator = entry.get("created_by")
+            if isinstance(creator, str) and creator:
+                out.setdefault(creator, []).append(slug)
+        for slugs in out.values():
+            slugs.sort()
+        return out
+
+    @functools.cached_property
     def private_crew_names(self) -> frozenset[str] | None:
         """Every casefolded name a private crew (`private` exactly `True`)
         answers to: the slug, `display`, `crew`, every entry of `aliases` and
@@ -439,3 +466,14 @@ def private_crew_names() -> frozenset[str] | None:
     """Every casefolded name a private crew answers to. `None` when the
     registry could not be read — see `_Snapshot.private_crew_names`."""
     return _snapshot().private_crew_names
+
+
+def slugs_created_by(person_id: str) -> list[str] | None:
+    """Sorted project slugs whose registry entry names `person_id` as
+    `created_by` — a person's default project set
+    (issue_01M2RSFKJBEHD5Y76X0B6XAYZG). `None` when the registry has no
+    usable projects, distinguishable from a person who created none: a
+    caller computing a default must refuse rather than serve a set derived
+    from no registry at all — see `_Snapshot.created_by`."""
+    created = _snapshot().created_by
+    return None if created is None else created.get(person_id, [])

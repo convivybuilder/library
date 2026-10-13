@@ -87,17 +87,25 @@ def _insert_lease(db_path, *, id, root_id, taken_for, holder="someone",
 
 
 def _insert_course(db_path, *, id, product, entries, status=store.COURSE_LIVE,
-                   title="the plan"):
+                   title="the plan", waypoints=None):
     conn = sqlite3.connect(db_path)
     try:
         conn.execute(
-            "INSERT INTO courses (id, product, title, entries, status, "
-            "version, created_by, created_at) VALUES (?,?,?,?,?,1,?,?)",
-            (id, product, title, json.dumps(entries), status, "seed",
-             _ts(days=1)))
+            "INSERT INTO courses (id, product, title, entries, waypoints, "
+            "status, version, created_by, created_at) "
+            "VALUES (?,?,?,?,?,?,1,?,?)",
+            (id, product, title, json.dumps(entries),
+             json.dumps(waypoints if waypoints is not None else []),
+             status, "seed", _ts(days=1)))
         conn.commit()
     finally:
         conn.close()
+
+
+def _waypoint(id, *members):
+    """One synthetic waypoint, in `courses.waypoints`' own stored shape —
+    the same `{"id", "members"}` `POST /courses/{id}/waypoints` writes."""
+    return {"id": id, "members": list(members)}
 
 
 @pytest.fixture
@@ -247,9 +255,115 @@ def test_position_carries_no_next_current_or_up_next_key(client, db_path):
     r = client.get("/courses/course1", headers=_h())
     assert r.status_code == 200, r.text
     position = r.json()["position"]
+    # `synthetic_waypoints` is the one addition
+    # (issue_01M12NE0VHY8828VJPFX8ARZ24) — everything else here is the shape
+    # this test has always pinned, unchanged in count or in meaning.
     assert set(position.keys()) == {
         "entries", "reached", "reached_ids", "in_flight", "in_flight_ids",
-        "remaining", "remaining_ids", "missing"}
+        "remaining", "remaining_ids", "missing", "synthetic_waypoints"}
+    assert set(position["synthetic_waypoints"].keys()) == {
+        "total", "reached", "reached_ids", "in_flight", "in_flight_ids",
+        "remaining", "remaining_ids"}
+
+
+# --- a synthetic waypoint (issue_01M12NE0VHY8828VJPFX8ARZ24) -------------------
+
+
+def test_a_synthetic_waypoint_is_reached_only_when_every_member_is_terminal(
+        client, db_path):
+    _insert_item(db_path, id="w1", product="vivy", title="one", state="fixed")
+    _insert_item(db_path, id="w2", product="vivy", title="two", state="open")
+    _insert_course(db_path, id="course1", product="vivy", entries=[],
+                   waypoints=[_waypoint("wp1", "w1", "w2")])
+
+    r = client.get("/courses/course1", headers=_h())
+    assert r.status_code == 200, r.text
+    detail = r.json()["waypoint_progress"][0]
+    assert detail["id"] == "wp1"
+    assert detail["reached"] is False
+    assert detail["total"] == 2
+    assert detail["terminal"] == 1
+
+    # NOW RESOLVE THE SECOND MEMBER TOO.
+    _insert_item(db_path, id="w3", product="vivy", title="three",
+                state="wontfix")
+    # A DIFFERENT PRODUCT, so this second Course does not collide with
+    # `course1` on the one-live-Course-per-product index — the member items
+    # it names are read by id, not filtered by the Course's own product.
+    _insert_course(db_path, id="course2", product="constance", entries=[],
+                   waypoints=[_waypoint("wp2", "w1", "w3")])
+    r = client.get("/courses/course2", headers=_h())
+    detail = r.json()["waypoint_progress"][0]
+    assert detail["reached"] is True
+    assert detail["percent_terminal"] == 1.0
+
+
+def test_a_mixed_course_reports_position_across_both_kinds(client, db_path):
+    _insert_item(db_path, id="e_reached", product="vivy", title="reached",
+                type="epic", state="fixed")
+    _insert_item(db_path, id="e_open", product="vivy", title="open",
+                type="epic", state="open")
+    _insert_item(db_path, id="w_done", product="vivy", title="done",
+                state="fixed")
+    _insert_item(db_path, id="w_claimed", product="vivy", title="claimed",
+                state="claimed", claimed_by="someone", claimed_at=_ts(minutes=1))
+    _insert_item(db_path, id="w_untouched", product="vivy", title="untouched",
+                state="open")
+    _insert_course(
+        db_path, id="course1", product="vivy",
+        entries=["e_reached", "e_open"],
+        waypoints=[
+            _waypoint("wp_reached", "w_done"),
+            _waypoint("wp_in_flight", "w_claimed", "w_untouched"),
+            _waypoint("wp_remaining", "w_untouched")])
+
+    r = client.get("/courses/course1", headers=_h())
+    assert r.status_code == 200, r.text
+    position = r.json()["position"]
+    # THE EPIC-ENTRY FIELDS ARE EXACTLY AS BEFORE — unaffected by the mix.
+    assert position["reached_ids"] == ["e_reached"]
+    assert position["remaining_ids"] == ["e_open"]
+    synth = position["synthetic_waypoints"]
+    assert synth["total"] == 3
+    assert synth["reached_ids"] == ["wp_reached"]
+    assert synth["in_flight_ids"] == ["wp_in_flight"]
+    assert synth["remaining_ids"] == ["wp_remaining"]
+
+
+def test_a_missing_member_is_reported_not_dropped(client, db_path):
+    _insert_item(db_path, id="w_here", product="vivy", title="here",
+                state="open")
+    _insert_course(db_path, id="course1", product="vivy", entries=[],
+                   waypoints=[_waypoint("wp1", "w_here", "w_gone")])
+
+    r = client.get("/courses/course1", headers=_h())
+    assert r.status_code == 200, r.text
+    detail = r.json()["waypoint_progress"][0]
+    assert detail["total"] == 2
+    assert detail["missing"] == 1
+    assert {"id": "w_gone", "missing": True} in detail["members"]
+    assert detail["reached"] is False
+    # A missing member is not "untouched" either — it never lands remaining.
+    assert r.json()["position"]["synthetic_waypoints"]["in_flight_ids"] == ["wp1"]
+
+
+def test_an_old_shape_read_sees_entries_unchanged(client, db_path):
+    """A Course that also holds a synthetic waypoint still answers `entries`
+    with nothing but epic ids — the field a client predating this feature
+    reads is exactly what it always was."""
+    _insert_item(db_path, id="e_open", product="vivy", title="open",
+                type="epic", state="open")
+    _insert_item(db_path, id="w1", product="vivy", title="member",
+                state="open")
+    _insert_course(db_path, id="course1", product="vivy", entries=["e_open"],
+                   waypoints=[_waypoint("wp1", "w1")])
+
+    r = client.get("/courses/course1", headers=_h())
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["entries"] == ["e_open"]
+    assert body["count"] == 1
+    assert all(isinstance(e, str) for e in body["entries"])
 
 
 # --- the measurement script -----------------------------------------------------

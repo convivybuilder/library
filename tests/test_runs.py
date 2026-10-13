@@ -190,6 +190,13 @@ def test_it_serves_what_the_register_reports(client, sock_dir):
         reg.close()
 
 
+def test_refuses_any_parameter(client):
+    r = client.get("/runs?product=vivy", headers=_headers())
+    assert r.status_code == 400
+    assert r.json()["unknown"] == ["product"]
+    assert r.json()["supported"] == []
+
+
 def test_the_freshness_bound_is_stated_rather_than_left_implicit(client, sock_dir):
     """The Bosun's read is uncached, so the Library's bound IS the freshness a
     client sees. A client left to guess how old this is will guess wrong."""

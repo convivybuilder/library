@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import sqlite3
 
+import black_box_tables
 import pytest
 from fastapi.testclient import TestClient
 
@@ -38,6 +39,11 @@ def client(tmp_path, monkeypatch):
             id INTEGER PRIMARY KEY, actor TEXT NOT NULL, agent TEXT NOT NULL,
             crew TEXT NOT NULL, model TEXT NOT NULL, target TEXT NOT NULL,
             decision TEXT NOT NULL, at TEXT NOT NULL);
+        CREATE TABLE black_box_registrations (
+            id INTEGER PRIMARY KEY, crew TEXT NOT NULL UNIQUE,
+            model TEXT NOT NULL, gateway TEXT NOT NULL,
+            created_at TEXT NOT NULL, created_by TEXT NOT NULL,
+            updated_at TEXT NOT NULL, updated_by TEXT NOT NULL);
     """)
     conn.commit()
     conn.close()
@@ -56,6 +62,7 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(identity, "TOKENS", tokens)
     monkeypatch.setattr(identity, "CLIENT_TOKENS", client_tokens)
     monkeypatch.setattr(store, "WRITES_ENABLED", True)
+    black_box_tables.use_registry(tmp_path, monkeypatch)
     return TestClient(libapp.app)
 
 
@@ -117,6 +124,23 @@ def test_resolve_required_fields(client):
                    headers=_h(AGENT))
     assert r.status_code == 400
     assert "model" in r.json()["error"]
+
+
+def test_resolve_refuses_an_unrecognised_parameter(client):
+    r = client.get("/policy/resolve",
+                   params={"agent": "scout", "crew": "cfo", "model": "sonnet",
+                            "target": "WebFetch"},
+                   headers=_h(AGENT))
+    assert r.status_code == 400
+    assert r.json()["unknown"] == ["target"]
+    assert r.json()["supported"] == ["agent", "crew", "model"]
+
+
+def test_version_refuses_any_parameter(client):
+    r = client.get("/policy/version?target=WebFetch", headers=_h(AGENT))
+    assert r.status_code == 400
+    assert r.json()["unknown"] == ["target"]
+    assert r.json()["supported"] == []
 
 
 # --- write: capability -------------------------------------------------------
@@ -344,3 +368,131 @@ def test_every_exfiltration_builtin_defaults_denied(target):
 @pytest.mark.parametrize("target", ["Read", "Bash", "kb", "ops", "Monitor"])
 def test_everything_else_defaults_allowed(target):
     assert store.policy_class_default(target) == store.POLICY_ALLOW
+
+
+# --- removal and listing (CQ·134) --------------------------------------------
+
+
+def _remove(client, token=CLIENT, **over):
+    body = {"agent": "scout", "crew": "cfo", "model": "sonnet",
+            "target": "WebFetch", "acting_human": "operator"}
+    body.update(over)
+    return client.request("DELETE", "/policy", json=body, headers=_h(token))
+
+
+def _explicit(client):
+    return client.get("/policy/resolve", params={
+        "agent": "scout", "crew": "cfo", "model": "sonnet"},
+        headers=_h(AGENT)).json()["explicit"]
+
+
+def test_a_removed_denial_falls_back_to_no_entry_on_file(client):
+    """The tool-policy specification's "removing one": setting `allow` was the
+    only escape, and it left a row indistinguishable from a deliberate grant."""
+    _grant(client, decision="deny")
+    assert _explicit(client) == {"WebFetch": "deny"}
+    r = _remove(client)
+    assert r.status_code == 200, r.text
+    assert r.json()["removed_decision"] == "deny"
+    assert r.json()["acting_human"] == "operator"
+    assert _explicit(client) == {}
+
+
+def test_a_removal_is_recorded_and_moves_the_version(client):
+    _grant(client, decision="deny")
+    before = client.get("/policy/version", headers=_h(AGENT)).json()["version"]
+    _remove(client)
+    events = _events()
+    assert [e["decision"] for e in events] == ["deny", store.POLICY_REMOVED]
+    assert events[-1]["actor"] == "operator"
+    after = client.get("/policy/version", headers=_h(AGENT)).json()["version"]
+    assert after > before
+
+
+def test_removing_a_row_not_on_file_is_404_and_writes_no_event(client):
+    r = _remove(client)
+    assert r.status_code == 404
+    assert _events() == []
+
+
+@pytest.mark.parametrize("token", [AGENT, SYSTEM])
+def test_agent_and_system_cannot_remove(client, token):
+    _grant(client, decision="deny")
+    assert _remove(client, token=token).status_code == 403
+    assert _explicit(client) == {"WebFetch": "deny"}
+
+
+def test_removal_without_acting_human_is_refused(client):
+    _grant(client, decision="deny")
+    r = client.request("DELETE", "/policy", json={
+        "agent": "scout", "crew": "cfo", "model": "sonnet",
+        "target": "WebFetch"}, headers=_h(CLIENT))
+    assert r.status_code == 403
+    assert _explicit(client) == {"WebFetch": "deny"}
+
+
+def test_removal_names_the_row_the_way_a_write_does(client):
+    """Whitespace is stripped by the same helper, so the row a write stored
+    is the row a removal names."""
+    _grant(client, decision="deny")
+    assert _remove(client, agent=" scout ").status_code == 200
+    assert _remove(client, target=12345).status_code == 400
+
+
+def test_a_black_box_crews_row_cannot_be_removed(client):
+    """The roster withholds a black-box crew's agents by reading these rows
+    (`crew_registry.withheld`), so removing one would publish an agent name
+    the crew's prefix does not give away."""
+    conn = sqlite3.connect(store.DB_PATH)
+    conn.execute(
+        "INSERT INTO black_box_registrations (crew, model, gateway, "
+        "created_at, created_by, updated_at, updated_by) "
+        "VALUES ('Sel', 'sonnet', 'none', 'now', 'x', 'now', 'x')")
+    conn.commit()
+    conn.close()
+    _grant(client, crew="sel", agent="picker", decision="allow")
+    r = _remove(client, crew="sel", agent="picker")
+    assert r.status_code == 409
+    assert _events()[-1]["decision"] == "allow"
+
+
+def test_a_private_crews_row_cannot_be_removed(client, tmp_path, monkeypatch):
+    black_box_tables.use_registry(tmp_path, monkeypatch, {
+        **black_box_tables.ORDINARY_REGISTRY,
+        "cfo": {"repos": [], "private": True}})
+    _grant(client, decision="deny")
+    assert _remove(client).status_code == 409
+
+
+def test_an_unreadable_registry_refuses_removal_closed(client, tmp_path, monkeypatch):
+    black_box_tables.use_registry(tmp_path, monkeypatch, {})
+    _grant(client, crew="vivy", decision="deny")
+    assert _remove(client, crew="vivy").status_code == 503
+
+
+def test_the_listing_enumerates_every_row_and_narrows_by_field(client):
+    _grant(client, decision="deny")
+    _grant(client, target="Glob", decision="allow")
+    _grant(client, agent="coder", target="Glob", decision="deny")
+    body = client.get("/policy", headers=_h(CLIENT)).json()
+    assert body["total"] == 3
+    assert [(r["agent"], r["target"]) for r in body["rows"]] == [
+        ("coder", "Glob"), ("scout", "Glob"), ("scout", "WebFetch")]
+    narrowed = client.get("/policy", params={"target": "Glob"},
+                          headers=_h(CLIENT)).json()
+    assert narrowed["total"] == 2
+    paged = client.get("/policy", params={"limit": 1, "offset": 1},
+                       headers=_h(CLIENT)).json()
+    assert paged["count"] == 1 and paged["truncated"] is True
+
+
+@pytest.mark.parametrize("token", [AGENT, SYSTEM])
+def test_only_the_writing_client_may_list(client, token):
+    """The rows name every agent a black-box crew registered, which the
+    roster withholds, so the listing is gated like a write."""
+    assert client.get("/policy", headers=_h(token)).status_code == 403
+
+
+def test_the_listing_refuses_an_unrecognised_parameter(client):
+    r = client.get("/policy", params={"decision": "deny"}, headers=_h(CLIENT))
+    assert r.status_code == 400

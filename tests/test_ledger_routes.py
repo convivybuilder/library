@@ -16,6 +16,7 @@ from fastapi.testclient import TestClient
 
 import app as libapp
 import identity
+import projects
 import store
 
 REPO = Path(__file__).resolve().parent.parent
@@ -68,6 +69,15 @@ def client(tmp_path, monkeypatch, vector_index):
     monkeypatch.setattr(identity, "TOKENS", tokens)
     monkeypatch.setattr(identity, "CLIENT_TOKENS", client_tokens)
     monkeypatch.setattr(store, "WRITES_ENABLED", True)
+    # `POST /ledger-entries` books spend only to a registered, non-private
+    # project and fails closed when the registry cannot be read; CI has no
+    # real one, so every product these tests report under is listed here.
+    registry = tmp_path / "projects.json"
+    registry.write_text(json.dumps({
+        "_meta": {}, "library": {"repos": []}, "vivy": {"repos": []},
+        "keel": {"repos": []}}))
+    monkeypatch.setattr(projects, "REGISTRY_PATH", registry)
+    projects.reload()
     return TestClient(libapp.app)
 
 
@@ -431,6 +441,27 @@ def test_entries_carry_their_lane_and_no_read_blends_the_two(client):
     assert row["lanes"]["subscription"] == 7
     # NEVER SUMMED: the one number this test exists to rule out.
     assert row["total_usd"] != gateway["usd"] + subscription["usd"] + unset["usd"]
+
+
+def test_ledgers_refuses_an_unrecognised_parameter(client):
+    r = client.get("/ledgers?product=library", headers=_agent())
+    assert r.status_code == 400
+    assert r.json()["unknown"] == ["product"]
+    assert r.json()["supported"] == ["limit", "offset", "scope_id"]
+
+
+def test_ledgers_ordinary_request_still_succeeds(client):
+    r = client.get("/ledgers?scope_id=library&limit=5&offset=0", headers=_agent())
+    assert r.status_code == 200
+
+
+def test_ledger_entries_refuses_an_unrecognised_parameter(client):
+    r = client.get("/ledger-entries?scope_id=library", headers=_agent())
+    assert r.status_code == 400
+    assert r.json()["unknown"] == ["scope_id"]
+    assert r.json()["supported"] == sorted(
+        ["day", "epic_id", "from", "item_id", "limit", "offset", "product",
+         "run_id", "source", "to"])
 
 
 def test_subscription_spend_never_crosses_a_threshold_or_refuses_checkout(client):
@@ -1068,15 +1099,37 @@ def test_spend_against_a_sub_item_carries_its_parents_epic(client):
     assert entries(client).json()["entries"][0]["epic_id"] == "issue_epic"
 
 
-def test_spend_against_a_parentless_non_epic_item_is_filed_under_corrections(client):
-    """`issue_1`, the fixture's own item, has no parent and is not an epic —
-    `store.py`'s other branch of "a work item is either an epic's sub-item or
-    a correction"."""
+def test_spend_against_a_non_epic_with_no_queue_parent_has_no_epic(client):
+    """`issue_1`, the fixture's own item, is inserted directly rather than
+    through `insert_item` and so has no parent at all — the shape `GET
+    /items?home=invalid` surfaces now that every ordinary write path gives a
+    non-epic row its product's corrections queue
+    (`library/specs/one-home-per-work-item`, PR 2). A dangling reference
+    derives nothing, the same answer a missing `item_id` gets."""
     set_caps(client, soft_cap_usd=160)
     r = report(client, 1, item_id="issue_1")
     assert r.status_code == 200, r.text
-    assert r.json()["epic_id"] == "corrections"
-    assert entries(client).json()["entries"][0]["epic_id"] == "corrections"
+    assert r.json()["epic_id"] is None
+    assert entries(client).json()["entries"][0]["epic_id"] is None
+
+
+def test_spend_against_a_correction_records_its_queue_as_the_epic(client):
+    """The ordinary shape once a non-epic's `parent_id` names its product's
+    corrections queue — `epic_id` carries that queue id, the same way it
+    carries a sub-item's epic."""
+    conn = store.connect_rw()
+    conn.execute(
+        "INSERT INTO corrections_queues (id, product, created_at) "
+        "VALUES ('cq_library', 'library', '2026-08-23 00:00:00')")
+    conn.execute(
+        "UPDATE issue_items SET parent_id = 'cq_library' WHERE id = 'issue_1'")
+    conn.commit()
+    conn.close()
+    set_caps(client, soft_cap_usd=160)
+    r = report(client, 1, item_id="issue_1")
+    assert r.status_code == 200, r.text
+    assert r.json()["epic_id"] == "cq_library"
+    assert entries(client).json()["entries"][0]["epic_id"] == "cq_library"
 
 
 def test_spend_against_an_item_this_vault_does_not_hold_has_no_epic(client):
@@ -1129,21 +1182,29 @@ def test_the_epic_id_filter_narrows(client):
     insert_item("issue_sub", item_type="task", parent_id="issue_epic")
     set_caps(client, soft_cap_usd=160)
     report(client, 1, item_id="issue_sub")
-    report(client, 2, item_id="issue_1")             # files under "corrections"
+    report(client, 2, item_id="issue_1")             # has no epic at all
     r = entries(client, epic_id="issue_epic")
     assert r.json()["total"] == 1
     assert r.json()["entries"][0]["epic_id"] == "issue_epic"
 
 
-def test_the_epic_id_filter_narrows_to_corrections(client):
+def test_the_epic_id_filter_narrows_to_a_corrections_queue(client):
+    conn = store.connect_rw()
+    conn.execute(
+        "INSERT INTO corrections_queues (id, product, created_at) "
+        "VALUES ('cq_library', 'library', '2026-08-23 00:00:00')")
+    conn.execute(
+        "UPDATE issue_items SET parent_id = 'cq_library' WHERE id = 'issue_1'")
+    conn.commit()
+    conn.close()
     insert_item("issue_epic", item_type="epic")
     insert_item("issue_sub", item_type="task", parent_id="issue_epic")
     set_caps(client, soft_cap_usd=160)
     report(client, 1, item_id="issue_sub")
-    report(client, 2, item_id="issue_1")             # files under "corrections"
-    r = entries(client, epic_id="corrections")
+    report(client, 2, item_id="issue_1")             # files under its queue
+    r = entries(client, epic_id="cq_library")
     assert r.json()["total"] == 1
-    assert r.json()["entries"][0]["epic_id"] == "corrections"
+    assert r.json()["entries"][0]["epic_id"] == "cq_library"
 
 
 def test_a_caller_supplied_epic_id_is_refused_as_an_unrecognised_key(client):
@@ -1400,11 +1461,19 @@ def test_the_epic_id_migration_backfills_every_branch_of_the_rule(tmp_path):
     conn.row_factory = sqlite3.Row
     rows = {r["id"]: r["epic_id"] for r in conn.execute(
         "SELECT id, epic_id FROM ledger_entries")}
+    # **"head" NOW ALSO CARRIES `e18a2c4f9b06`** (PR 2 of `library/specs/
+    # one-home-per-work-item`), which runs after `d12fde7d50e9` backfilled
+    # `lde_corr` to the literal `'corrections'` here and turns that literal
+    # into `library`'s own corrections queue id — the same queue `i_corr`
+    # itself is backfilled to.
+    queue_id = conn.execute(
+        "SELECT id FROM corrections_queues WHERE product = 'library'"
+    ).fetchone()[0]
     conn.close()
     assert rows["lde_none"] is None
     assert rows["lde_epic"] == "i_epic"
     assert rows["lde_sub"] == "i_epic"
-    assert rows["lde_corr"] == "corrections"
+    assert rows["lde_corr"] == queue_id
     assert rows["lde_dangling"] is None
     assert rows["lde_cross_product"] is None
 

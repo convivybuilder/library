@@ -79,6 +79,7 @@ representative.
 from __future__ import annotations
 
 import datetime as _dt
+import json
 
 from store import new_ulid
 
@@ -111,7 +112,8 @@ def _parse(value):
     return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
 
 
-def mint(conn, *, item_id: str, product: str, claim_owner_label: str, now=None) -> str:
+def mint(conn, *, item_id: str, product: str, claim_owner_label: str, now=None,
+         grant: dict | None = None) -> str:
     """Insert a new call slip for `item_id` and return its id.
 
     `expires_at` is computed and written HERE, once. Unlike `lease.expires_at`,
@@ -120,16 +122,33 @@ def mint(conn, *, item_id: str, product: str, claim_owner_label: str, now=None) 
     re-deriving it later against a policy that had since moved would let a
     slip's lifetime change after it was handed out, which is exactly the
     extension this module exists to refuse.
+
+    **`grant` is stored the same way, for the same reason**
+    (issue_01M3VN8WV1K891BT866K82ZBPX): it is the grant checkout serves with
+    this slip, every field but `slip_id`, and `POST /tokens/redeem` returns it
+    as issued. Re-building it at redemption would read a profile, a ledger
+    and an index that may all have moved since. `None` stores no grant.
     """
     now = now or _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None)
     slip_id = f"slip_{new_ulid()}"
     expires_at = now + _dt.timedelta(seconds=TTL_SECONDS)
     conn.execute(
         "INSERT INTO call_slips (id, item_id, product, claim_owner_label, "
-        "issued_at, expires_at) VALUES (?,?,?,?,?,?)",
+        "issued_at, expires_at, grant_json) VALUES (?,?,?,?,?,?,?)",
         (slip_id, item_id, product, claim_owner_label, now.isoformat(" "),
-         expires_at.isoformat(" ")))
+         expires_at.isoformat(" "),
+         json.dumps(grant) if grant is not None else None))
     return slip_id
+
+
+def grant_of(row) -> dict | None:
+    """The grant `row` was minted with, with its `slip_id`, or `None` when it
+    was minted with none: a slip minted in the `TTL_SECONDS` before
+    `962c9c87df11` added the column and redeemed after it. `mint` is the only
+    writer, and it writes `json.dumps` of a dict."""
+    if row["grant_json"] is None:
+        return None
+    return {"slip_id": row["id"], **json.loads(row["grant_json"])}
 
 
 def get(conn, slip_id: str):

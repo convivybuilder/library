@@ -118,7 +118,7 @@ def base_client(tmp_path, monkeypatch):
         CREATE TABLE call_slips (
             id TEXT PRIMARY KEY, item_id TEXT, product TEXT,
             claim_owner_label TEXT, issued_at TEXT, expires_at TEXT,
-            redeemed_at TEXT);
+            redeemed_at TEXT, grant_json TEXT);
         CREATE TABLE library_cards (
             id TEXT PRIMARY KEY, actor TEXT, product TEXT, item_id TEXT,
             slip_id TEXT UNIQUE, protocol_version INTEGER, state TEXT,
@@ -191,10 +191,11 @@ def _db():
     return conn
 
 
-def _mint_slip(*, now=None, item_id="task_a", product="vivy"):
+def _mint_slip(*, now=None, item_id="task_a", product="vivy", grant=None):
     conn = _db()
     slip_id = call_slips.mint(conn, item_id=item_id, product=product,
-                              claim_owner_label="checkout-owner", now=now)
+                              claim_owner_label="checkout-owner", now=now,
+                              grant=grant)
     conn.commit()
     conn.close()
     return slip_id
@@ -227,6 +228,42 @@ def test_redeeming_a_slip_issues_a_card_and_consumes_it(client):
     assert body["state"] == "active"
     assert _slip_row(slip_id)["redeemed_at"] is not None
     assert len(_cards()) == 1
+
+
+# --- the grant, returned as issued (issue_01M3VN8WV1K891BT866K82ZBPX) -------
+
+# The shape `app._call_slip_grant_body` builds, with a document named by id
+# and hash the way a resolved profile names one.
+GRANT = {
+    "persona_md": "# coder\n\nWrites the change.",
+    "docs": [{"id": "platform/agents/coder", "body_sha256": "ab" * 32}],
+    "bundle": {"profile": "vivy/daytime", "available": True},
+    "model": "model-resolution-not-implemented",
+    "budget": {"cap_usd": 2.5},
+    "limits": {},
+}
+
+
+def test_redemption_returns_the_grant_the_slip_was_issued_with(client):
+    """Everything an Individuator needs to render the agent arrives on the
+    redemption alone: the persona, the documents by id and hash, the model,
+    the budget and the limits, exactly as minted, with the card's own fields
+    unchanged beside them."""
+    slip_id = _mint_slip(grant=GRANT)
+    r = _redeem(client, slip_id)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["grant"] == {"slip_id": slip_id, **GRANT}
+    assert {"card_id", "actor", "product", "item_id", "protocol_version",
+            "state", "issued_at"} <= body.keys()
+
+
+def test_a_slip_minted_without_a_grant_redeems_with_grant_null(client):
+    """A slip minted in the TTL before the column existed has no grant, and
+    redemption says so rather than inventing one."""
+    r = _redeem(client, _mint_slip())
+    assert r.status_code == 200
+    assert r.json()["grant"] is None
 
 
 # --- mechanic 1: single-use, enforced against a race -----------------------

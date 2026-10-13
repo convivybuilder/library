@@ -64,6 +64,7 @@ def db_path(tmp_path):
             PRIMARY KEY (scope_kind, scope_id));
         CREATE TABLE courses (
             id TEXT PRIMARY KEY, product TEXT, title TEXT, entries TEXT,
+            waypoints TEXT DEFAULT '[]',
             status TEXT, version INTEGER, created_by TEXT, created_at TEXT,
             updated_by TEXT, updated_at TEXT);
         -- **THE PARTIAL UNIQUE INDEX IS PART OF THE FIXTURE**, matching the live
@@ -74,7 +75,7 @@ def db_path(tmp_path):
             ON courses (product) WHERE status = 'live';
         CREATE TABLE course_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT, course_id TEXT, actor TEXT,
-            action TEXT, entries TEXT, note TEXT, at TEXT);
+            action TEXT, entries TEXT, waypoints TEXT, note TEXT, at TEXT);
         -- THE ARCHIVES, because one Course write reports into them. Retiring a
         -- Course whose status was neither `live` nor `superseded` records the
         -- anomaly here, and a fixture without the table would let that write
@@ -500,8 +501,9 @@ def test_an_unknown_entry_is_refused_and_every_bad_id_is_named(client):
 
 
 def test_a_course_contains_only_epics(client):
-    """The operator, 2026-08-05. The Course is the planned lane and the issue queue is the
-    interrupt lane; accepting an issue here would merge the two."""
+    """The operator, 2026-08-05. The Course is the planned lane and the
+    corrections queue is the interrupt lane; accepting a work item that is not
+    an epic here would merge the two."""
     r = client.post("/courses", json=_body(entries=["issue_task_v"]),
                     headers=_h())
     assert r.status_code == 400
@@ -1183,6 +1185,8 @@ def test_every_course_write_route_needs_both_capabilities(client, monkeypatch,
         client.put(f"/courses/{course['id']}/order",
                    json={"version": 1, "entries": []}, headers=_h()),
         client.post(f"/courses/{course['id']}/supersede", json={}, headers=_h()),
+        client.post(f"/courses/{course['id']}/waypoints",
+                   json={"members": ["issue_epic_v"]}, headers=_h()),
     ]
     for r in calls:
         assert r.status_code == 403, r.text
@@ -1780,3 +1784,157 @@ def test_the_successor_is_not_created_if_the_predecessor_write_fails(
         a._mark_predecessor_superseded = real
     assert _courses(db_path)[0]["status"] == store.COURSE_LIVE
     assert len(_courses(db_path)) == 1, "a successor was created regardless"
+
+
+# --- naming a synthetic waypoint (issue_01M12NE0VHY8828VJPFX8ARZ24) ------------
+#
+# A synthetic waypoint names several items that must all complete before it is
+# reached, and no single row represents it — it lives in its own column,
+# additive to `entries` rather than inside it, because `entries` is pinned by
+# the protocol to epic id strings (platform/contracts/library-protocol §6.1).
+
+
+def _waypoint(client, course, members, token=AGENT):
+    return client.post(f"/courses/{course['id']}/waypoints",
+                       json={"members": members}, headers=_h(token))
+
+
+def test_a_waypoint_comes_back_in_protocol_shape(client, db_path):
+    course = _make(client, entries=["issue_epic_v"])
+    r = _waypoint(client, course, ["issue_epic_v2", "issue_task_v"])
+    assert r.status_code == 201, r.text
+    out = r.json()
+    assert len(out["waypoints"]) == 1
+    waypoint = out["waypoints"][0]
+    assert waypoint["id"].startswith("waypoint_")
+    assert waypoint["members"] == ["issue_epic_v2", "issue_task_v"]
+    # `entries` IS UNTOUCHED — a synthetic waypoint lives beside it, not in it.
+    assert out["entries"] == ["issue_epic_v"]
+    assert _courses(db_path)[0]["version"] == 1, (
+        "adding a waypoint must not bump the entries' own concurrency token")
+
+
+def test_a_member_may_be_a_work_item_rather_than_an_epic(client):
+    """The one rule `_validate_entries` has that does not carry over: a
+    synthetic waypoint's member may be any item in the Course's product, the
+    work item's own words ("an item id — epic or work item")."""
+    course = _make(client)
+    r = _waypoint(client, course, ["issue_task_v"])
+    assert r.status_code == 201, r.text
+    assert r.json()["waypoints"][0]["members"] == ["issue_task_v"]
+
+
+def test_adding_a_waypoint_is_recorded_as_an_event(client, db_path):
+    course = _make(client)
+    r = _waypoint(client, course, ["issue_epic_v"])
+    events = _events(db_path, course["id"])
+    assert [e["action"] for e in events] == [
+        store.COURSE_ACTION_CREATED, store.COURSE_ACTION_WAYPOINT_ADDED]
+    added = events[-1]
+    assert added["actor"] == "vivy-agent"
+    assert added["entries"] is None, "this action never touches entries"
+    assert json.loads(added["waypoints"]) == r.json()["waypoints"]
+
+
+def test_members_must_be_an_array(client):
+    course = _make(client)
+    r = _waypoint(client, course, "issue_epic_v")
+    assert r.status_code == 400
+    assert "array" in r.json()["error"]
+
+
+def test_an_empty_member_set_is_refused(client):
+    course = _make(client)
+    r = _waypoint(client, course, [])
+    assert r.status_code == 400
+    assert r.json()["error"] == (
+        "a synthetic waypoint must name at least one member")
+
+
+def test_a_member_set_over_the_cap_is_refused(client):
+    course = _make(client)
+    r = _waypoint(client, course,
+                 [f"issue_{n}" for n in range(store.MAX_WAYPOINT_MEMBERS + 1)])
+    assert r.status_code == 400
+    assert str(store.MAX_WAYPOINT_MEMBERS) in r.json()["error"]
+
+
+def test_a_repeated_member_is_refused_and_the_duplicates_are_named(client):
+    course = _make(client)
+    r = _waypoint(client, course, ["issue_epic_v", "issue_task_v", "issue_epic_v"])
+    assert r.status_code == 400
+    assert r.json()["duplicates"] == ["issue_epic_v"]
+
+
+def test_an_unknown_member_is_refused_and_named(client):
+    course = _make(client)
+    r = _waypoint(client, course, ["issue_nope"])
+    assert r.status_code == 400
+    assert r.json()["unknown"] == ["issue_nope"]
+
+
+def test_a_member_from_another_product_is_refused(client):
+    course = _make(client)
+    r = _waypoint(client, course, ["issue_epic_c"], token=WIDE)
+    assert r.status_code == 400
+    assert r.json()["wrong_product"] == ["issue_epic_c"]
+
+
+def test_a_member_outside_the_callers_scope_reads_as_unknown(client):
+    """Matching `_validate_entries`'s own divergence from Orient: an id this
+    caller cannot see is indistinguishable from one that was never issued."""
+    course = _make(client)
+    r = _waypoint(client, course, ["issue_epic_c"])
+    assert r.status_code == 400
+    assert r.json()["unknown"] == ["issue_epic_c"]
+
+
+def test_a_superseded_course_cannot_take_a_new_waypoint(client):
+    course = _make(client)
+    _supersede(client, course)
+    r = _waypoint(client, course, ["issue_epic_v"])
+    assert r.status_code == 409
+
+
+def test_an_out_of_scope_course_is_404_and_matches_an_absent_one(client):
+    other = _make(client, product="constance")
+    real = _waypoint(client, other, ["issue_epic_v"], token=AGENT)
+    invented = client.post("/courses/course_never_minted/waypoints",
+                           json={"members": ["issue_epic_v"]}, headers=_h())
+    assert real.status_code == invented.status_code == 404
+    assert real.json() == invented.json()
+
+
+def test_a_waypoint_needs_a_credential(client):
+    course = _make(client)
+    r = client.post(f"/courses/{course['id']}/waypoints", json={},
+                    headers={protocol.HEADER: str(protocol.CURRENT)})
+    assert r.status_code == 401
+
+
+def test_a_second_waypoint_gets_its_own_id_and_both_are_kept(client):
+    course = _make(client)
+    _waypoint(client, course, ["issue_epic_v"])
+    r = _waypoint(client, course, ["issue_epic_v2"])
+    assert r.status_code == 201, r.text
+    ids = [w["id"] for w in r.json()["waypoints"]]
+    assert len(ids) == 2
+    assert len(set(ids)) == 2, "each synthetic waypoint gets a distinct id"
+    assert [w["members"] for w in r.json()["waypoints"]] == [
+        ["issue_epic_v"], ["issue_epic_v2"]]
+
+
+def test_a_course_full_of_waypoints_refuses_one_more(client, monkeypatch):
+    monkeypatch.setattr(store, "MAX_COURSE_WAYPOINTS", 1)
+    course = _make(client)
+    assert _waypoint(client, course, ["issue_epic_v"]).status_code == 201
+    r = _waypoint(client, course, ["issue_epic_v2"])
+    assert r.status_code == 400
+    assert "synthetic waypoints" in r.json()["error"]
+
+
+def test_a_waypoint_route_refuses_while_writes_are_disabled(client, monkeypatch):
+    course = _make(client)
+    monkeypatch.setattr(store, "WRITES_ENABLED", False)
+    r = _waypoint(client, course, ["issue_epic_v"])
+    assert r.status_code == 503

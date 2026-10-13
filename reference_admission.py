@@ -98,9 +98,16 @@ checkout exists.
 **Structural errors only — the ones `knowledge/scripts/validate.py` calls
 ERRORS** (unparseable structure, missing required fields, an invalid
 kind/project/status/visibility, a malformed id or date, a list field holding
-something else). Its WARNINGS (roster drift on `audience`, an unresolved
-`depends_on`) are drift-prone rather than structural and are not part of an
-admission decision — they don't stop the document from indexing.
+something else). `validate.py`'s own WARNINGS are mostly drift-prone rather
+than structural and stay outside admission's scope: an unresolved
+`depends_on` doesn't stop a document from indexing, and this route doesn't
+check it either. Roster drift on `audience` and `binds_agents` is the
+deliberate exception (`issue_01M34SYVH2M48K2S0FQK3K6REY`, the operator's
+ruling, 2026-10-11): when a caller passes a `roster`, `validate_frontmatter` refuses a
+value either field names that is not on it, which is stricter than
+`validate.py`, where `audience` drift against the roster is only a warning.
+The knowledge repo's own roster copy is deleted in a later change, once this
+route is the one every write goes through.
 
 **This module never parses YAML.** `agentctl` already parses the document's
 frontmatter locally — it has to, to build the push in the first place — and
@@ -126,6 +133,10 @@ ALLOWED_KINDS = frozenset({
     # knowledge#527 (2026-09-16). This port previously refused every
     # instruction block that Orient's writing surface sent here.
     "instruction-block",
+    # issue_01M2TWRWHJMA6MF9NKZ9Z05KXN (2026-10-12): the build plan, minted
+    # in knowledge's validate.py by knowledge#876. Added here in step so this
+    # port does not refuse it the way it once refused instruction blocks.
+    "build-plan",
 })
 
 # Kept as one flat set rather than reproducing `validate.py`'s per-entry
@@ -337,15 +348,44 @@ def catalogue_for_frontmatter(fm) -> ProjectCatalogue:
         KNOWLEDGE_ROOT, pending=pending if isinstance(pending, str) else None)
 
 
-def validate_frontmatter(fm, catalogue: ProjectCatalogue | None = None) -> list[str]:
+def validate_frontmatter(fm, catalogue: ProjectCatalogue | None = None,
+                         roster: frozenset[str] | None = None,
+                         operator_marker: str | None = None) -> list[str]:
     """Structural errors only — empty list means the frontmatter validates.
 
     `catalogue` is the project set of the knowledge tree the document lives in
     (`project_catalogue`/`catalogue_for_frontmatter`); without one, the
     baseline `ALLOWED_PROJECTS`/`ID_PATTERN` apply.
 
+    `roster` is the names `GET /roster` currently serves. Without one —
+    `None`, not an empty set — an `audience` or `binds_agents` value is left
+    unchecked, matching a call with no live roster to offer;
+    `frontmatter_needs_roster` is the same gate a caller uses to decide
+    whether reading one at all is worth a database round trip. Given a
+    roster, every string either field names must be on it, refused by name;
+    an EMPTY roster — the table exists and reads clean, with zero rows —
+    refuses outright, naming the cause instead of checking any value. A
+    roster that cannot be read at all is a database fault, not an empty
+    roster: it never reaches this function as one, because its caller's
+    existing database-fault handling turns it into the service's ordinary
+    error response first, the same path any other such fault takes.
+
+    `operator_marker` is the operator's own roster name, read by the caller
+    (`operator_marker.read_marker`) rather than by this function — this
+    module takes it as a value, the same way it takes `roster` as one,
+    rather than importing the config reader itself. A `binds_agents` value
+    equal to it, or in `NON_AGENT_GROUPS`, is refused with the person wording
+    before roster membership is even checked, since `binds_agents` names what
+    obeys a document and a person or a group is an audience rather than an
+    agent, even though the roster carries all of them alongside the real
+    agents (`load_crew_registry.py` seeds it from the same superset
+    `validate.py`'s own `ALLOWED_AUDIENCE` is). `audience` is unaffected: a
+    document may still address a person or a group. `binds_agents_needs_
+    operator_marker` is the gate a caller uses to decide whether reading the
+    marker at all is worth it.
+
     Ported from `knowledge/scripts/validate.py`'s function of the same name,
-    with three differences the network-facing route this feeds requires and
+    with five differences the network-facing route this feeds requires and
     the source function doesn't:
 
     - `last_reviewed` is checked as a string here rather than also accepting
@@ -368,6 +408,18 @@ def validate_frontmatter(fm, catalogue: ProjectCatalogue | None = None) -> list[
       and where a real id contains `/` and therefore always parses as a
       string. It is not harmless on a route that takes JSON directly, and the
       checkout clause cannot look a document up by a value that is not an id.
+    - `audience` and `binds_agents` are checked against a ROSTER PASSED IN
+      rather than a module-level set: the source reads its own
+      `ALLOWED_AUDIENCE`/`NON_AGENT_AUDIENCE` literals, and this route reads
+      the Library's own `roster_agents` table instead, because that table is
+      the one a `PUT /roster/{name}` write can change without either side
+      redeploying (`issue_01M34SYVH2M48K2S0FQK3K6REY`).
+    - `NON_AGENT_AUDIENCE` splits in two here: `NON_AGENT_GROUPS` holds the
+      names this module can carry as a literal, since this repository
+      carries no personal names (library#228), and the operator's own
+      marker is passed in separately as `operator_marker`, read from the
+      operator config the same way `load_crew_registry.py`'s roster load
+      already reads it.
     """
     if not isinstance(fm, dict):
         return ["frontmatter is not a JSON object"]
@@ -414,7 +466,90 @@ def validate_frontmatter(fm, catalogue: ProjectCatalogue | None = None) -> list[
     lr = fm.get("last_reviewed")
     if lr is not None and not (isinstance(lr, str) and ISO_DATE.match(lr)):
         errs.append(f"last_reviewed must be YYYY-MM-DD: {lr!r}")
+    # Roster membership — only when a roster was actually given, so a caller
+    # validating structure alone (`frontmatter_needs_roster` said no database
+    # round trip was needed) still gets a plain structural answer rather than
+    # an empty-roster refusal it never asked for.
+    if roster is not None:
+        for field, wording in ROSTERED_FIELDS:
+            values = fm.get(field)
+            if not (isinstance(values, list)
+                    and any(isinstance(v, str) for v in values)):
+                continue
+            if not roster:
+                errs.append(f"{field}: the roster could not be read or is "
+                            f"empty")
+                continue
+            for v in values:
+                if not isinstance(v, str):
+                    continue
+                # Checked before roster membership, so a person or a group
+                # named in `binds_agents` gets the person wording rather
+                # than passing membership on the strength of being on the
+                # roster too — the roster carries `NON_AGENT_GROUPS` and
+                # the operator marker alongside the real agents.
+                if field == "binds_agents" and (
+                        v in NON_AGENT_GROUPS or v == operator_marker):
+                    errs.append(
+                        f"binds_agents names a person or a group, not an "
+                        f"agent: {v}")
+                    continue
+                if v not in roster:
+                    errs.append(f"{wording}: {v}")
     return errs
+
+
+# The roster names denoting a group rather than a dispatchable agent — ported
+# from `knowledge/scripts/validate.py`'s `NON_AGENT_AUDIENCE`
+# (`issue_01M34SYVH2M48K2S0FQK3K6REY`), minus the operator's own marker,
+# which this repository holds as data (`operator_marker.read_marker`) rather
+# than as a literal (library#228). `audience` may still name any of these;
+# `binds_agents` names what obeys a document, and a group is an audience
+# rather than an agent. The roster carries all of them alongside the real
+# agents (`load_crew_registry.py` seeds it from the same superset
+# `validate.py`'s own `ALLOWED_AUDIENCE` is), so a plain membership test
+# would pass them into `binds_agents` unrefused.
+NON_AGENT_GROUPS = frozenset({"consultant", "team", "contractor"})
+
+# Shared by `validate_frontmatter`'s roster clause and
+# `frontmatter_needs_roster` below, so the two agree on what "checking a
+# field against the roster" means without saying so twice. The wording for
+# `audience` is the indexer's own (`agent-platform/lib/knowledge/knowledge.py`,
+# `audience value not in roster: {value}`); `binds_agents` takes the same
+# shape as the indexer's own refusal for a name the roster does not carry,
+# `binds_agents names an unknown agent: {value}`.
+ROSTERED_FIELDS = (
+    ("audience", "audience value not in roster"),
+    ("binds_agents", "binds_agents names an unknown agent"),
+)
+
+
+def frontmatter_needs_roster(fm) -> bool:
+    """Whether `validate_frontmatter(fm, roster=...)` would actually check a
+    roster — true when `audience` or `binds_agents` is a list carrying at
+    least one string. A caller uses this to decide whether reading the
+    roster at all is worth a database round trip: a frontmatter naming
+    neither field validates the same whether `roster` is given or not."""
+    if not isinstance(fm, dict):
+        return False
+    return any(
+        isinstance(fm.get(field), list)
+        and any(isinstance(v, str) for v in fm[field])
+        for field, _ in ROSTERED_FIELDS)
+
+
+def binds_agents_needs_operator_marker(fm) -> bool:
+    """Whether `validate_frontmatter(fm, operator_marker=...)` would
+    actually compare `binds_agents` against the marker — true when
+    `binds_agents` is a list carrying at least one string. A caller uses
+    this to decide whether reading the marker at all is worth it:
+    `audience` never needs it, since a document may still address the
+    operator."""
+    if not isinstance(fm, dict):
+        return False
+    values = fm.get("binds_agents")
+    return isinstance(values, list) and any(isinstance(v, str) for v in values)
+
 
 # The checkout clause. `validate_frontmatter` answers the first of the two
 # questions this route asks; this answers the second.

@@ -28,6 +28,7 @@ from fastapi.testclient import TestClient
 
 import app as libapp
 import identity
+import projects
 import protocol
 import store
 
@@ -106,6 +107,14 @@ def test_a_persons_project_set_survives_an_alembic_upgrade_and_a_restart(
         "head below would not exercise a real migration over existing rows")
 
     _seed_people_and_administrator(db)
+    # A synthetic registry naming no creator, so every default is empty and
+    # this test keeps asserting on explicit grants alone. Without one the
+    # routes fail closed with 503 wherever no agent-platform checkout exists,
+    # which is CI.
+    registry = tmp_path / "projects.json"
+    registry.write_text(json.dumps({"vivy": {}, "hollis": {}}))
+    monkeypatch.setattr(projects, "REGISTRY_PATH", registry)
+    projects.reload()
     writer = _app_instance(db, tmp_path, monkeypatch)
 
     grant = writer.post(f"/people/{WITH_PROJECTS}/projects",
@@ -131,3 +140,4 @@ def test_a_persons_project_set_survives_an_alembic_upgrade_and_a_restart(
     after = {WITH_PROJECTS: _read(reader, WITH_PROJECTS),
              WITH_NOTHING: _read(reader, WITH_NOTHING)}
     assert after == written
+    projects.reload()

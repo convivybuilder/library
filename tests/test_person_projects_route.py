@@ -23,6 +23,7 @@ from fastapi.testclient import TestClient
 
 import app as libapp
 import identity
+import projects
 import protocol
 import store
 
@@ -47,6 +48,11 @@ def client(tmp_path, monkeypatch):
         CREATE TABLE person_products (
             person_id TEXT NOT NULL, product TEXT NOT NULL,
             granted_at TEXT NOT NULL, granted_by TEXT NOT NULL,
+            PRIMARY KEY (person_id, product)
+        );
+        CREATE TABLE person_product_removals (
+            person_id TEXT NOT NULL, product TEXT NOT NULL,
+            removed_at TEXT NOT NULL, removed_by TEXT NOT NULL,
             PRIMARY KEY (person_id, product)
         );
     """)
@@ -79,7 +85,16 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(store, "DB_PATH", db)
     monkeypatch.setattr(identity, "CLIENT_TOKENS", tokens)
     monkeypatch.setattr(identity, "TOKENS", agent_tokens)
-    return TestClient(libapp.app)
+    # A synthetic registry naming no creator, so every default is empty and
+    # these tests keep asserting on explicit grants alone. Without one the
+    # routes fail closed with 503 wherever no agent-platform checkout exists,
+    # which is CI.
+    registry = tmp_path / "projects.json"
+    registry.write_text(json.dumps({"vivy": {}, "constance": {}, "hollis": {}}))
+    monkeypatch.setattr(projects, "REGISTRY_PATH", registry)
+    projects.reload()
+    yield TestClient(libapp.app)
+    projects.reload()
 
 
 def _h(token):
@@ -169,13 +184,16 @@ def test_the_route_never_discloses_a_display_name(client):
 # --- design point 1: acting_human is never read on this route --------------
 
 
-def test_acting_human_has_no_effect_on_the_response(client):
-    without = client.get("/people/person_multi/projects", headers=_h(SCOPED))
-    with_real_name = client.get(
+def test_acting_human_is_refused_rather_than_silently_ignored(client):
+    """`acting_human` is never read on this route at all (the docstring's own
+    words) — so passing it is now a 400, naming it, rather than a parameter
+    that silently had no effect (issue_01M1MTCTH3PW0DWDEXAZA5KFET)."""
+    r = client.get(
         "/people/person_multi/projects?acting_human=a-scoped-client",
         headers=_h(SCOPED))
-    assert without.json() == with_real_name.json()
-    assert without.status_code == with_real_name.status_code == 200
+    assert r.status_code == 400
+    assert r.json()["unknown"] == ["acting_human"]
+    assert r.json()["supported"] == []
 
 
 # --- capability gating -------------------------------------------------------

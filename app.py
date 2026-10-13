@@ -67,6 +67,7 @@ import library_cards
 import machine_identity
 import machine_registry
 import mtls
+import operator_marker
 import projects
 import profile_sync
 import protocol
@@ -1038,6 +1039,36 @@ def _page(request: Request) -> tuple[int, int, JSONResponse | None]:
     return min(limit, MAX_PAGE), offset, None
 
 
+def _reject_unknown_params(request: Request, allowed: set[str]) -> JSONResponse | None:
+    """400 when the query string carries a name this route does not read,
+    naming it and listing what the route DOES read — the unknown-NAME
+    counterpart to `order`'s own unknown-VALUE refusal below
+    (issue_01M1MTCTH3PW0DWDEXAZA5KFET). A parameter nobody reads is a filter
+    that silently never ran, which hands back MORE than the caller asked
+    for rather than an empty or malformed result — the wrong direction for
+    a route that promises to narrow.
+
+    **This reverses the contract's §3.2 rule that an unrecognised name is
+    dropped silently**, a tightening §1 places in version 2. It ships under
+    version 1 the way library#201, #247 and #251 did, on a survey of every
+    client that found none sending a name its route does not read; the one
+    it found, `bin/changelog-drain`'s `since`, became a filter that
+    `GET /signals` reads (`_since_clause`).
+
+    `allowed` is each route's own exact set, named at the call site rather
+    than inferred, so this cannot drift onto a column it does not actually
+    read the way a shared whitelist could.
+    """
+    unknown = sorted(set(request.query_params.keys()) - allowed)
+    if not unknown:
+        return None
+    return refusals.refuse(
+        400, f"unrecognised query parameter: {', '.join(unknown)}",
+        hint="a parameter this route does not read is refused rather than "
+             "ignored, so a dropped filter cannot silently widen the result",
+        unknown=unknown, supported=sorted(allowed))
+
+
 # The one order a cursor can resume, named once because MINTING a cursor and
 # CONSUMING one both have to agree about it. They did not: `next_cursor` was
 # minted for every listing while the consumption side refused only an EXPLICIT
@@ -1306,6 +1337,37 @@ def _scope_predicate(ident: identity.Identity):
     return lambda product: identity.in_scope(ident, product)
 
 
+def _since_clause(request: Request):
+    """`(clause, params, None)` for `since`, the ISO-8601 lower bound on
+    `produced_at` that `GET /signals` and `GET /signals/facets` both take, or
+    `(None, None, refusal)` for a value that is not a timestamp with a zone.
+
+    `bin/changelog-drain` (agent-platform) sent `since` on every run before
+    any route read it, so each pass read the whole changelog history instead
+    of its window (issue_01M1MTCTH3PW0DWDEXAZA5KFET). The bound is inclusive.
+
+    **The zone is required** because `produced_at` is stored as naive UTC,
+    so a naive bound would silently mean whatever zone its sender assumed.
+    It is converted to UTC and written in the stored shape, with
+    microseconds only when it has them, which compares correctly as text
+    against both stored shapes. A row with no `produced_at` never matches.
+    """
+    raw = request.query_params.get("since")
+    if raw is None:
+        return "", [], None
+    try:
+        bound = _dt.datetime.fromisoformat(raw.strip())
+    except ValueError:
+        bound = None
+    if bound is None or bound.tzinfo is None:
+        return None, None, refusals.refuse(
+            400, "since must be an ISO-8601 timestamp with a zone",
+            hint="for example 2026-10-11T13:00:00Z", since=raw)
+    bound = bound.astimezone(_dt.timezone.utc).replace(tzinfo=None)
+    shape = "%Y-%m-%d %H:%M:%S.%f" if bound.microsecond else "%Y-%m-%d %H:%M:%S"
+    return " AND produced_at >= ?", [bound.strftime(shape)], None
+
+
 def _signal_filters(request: Request, where: str, params: list,
                     ident: identity.Identity) -> tuple[str, list]:
     """The `kind`, `source`, `stream`, `product`, `repo` and `unreferenced_by`
@@ -1557,7 +1619,7 @@ def _semantic_search_readiness() -> tuple[bool, str]:
 
 
 @app.get("/health")
-async def health():
+async def health(request: Request):
     """Liveness, the protocol versions this build serves, and whether semantic
     search can actually serve right now. Deliberately unauthenticated and exempt
     from negotiation — it answers "is this process up and what does it speak",
@@ -1607,6 +1669,8 @@ async def health():
     the reason goes to the log, and `_semantic_search_readiness` prints it there
     when a recheck finds the service not ready.
     """
+    if (err := _reject_unknown_params(request, set())):
+        return err
     hit = _readiness_cache_hit()
     if hit is not None:
         ready, _ = hit
@@ -1757,6 +1821,10 @@ async def list_items(request: Request):
         return err
     if not identity.authorized(ident, "item.read"):
         return refusals.forbidden("item.read")
+    if (err := _reject_unknown_params(request, {
+            "limit", "offset", "state", "product", "type", "needs",
+            "parent_id", "found_during", "home", "topics", "sort"})):
+        return err
     limit, offset, err = _page(request)
     if err:
         return err
@@ -1842,6 +1910,33 @@ async def list_items(request: Request):
     if (found_during := request.query_params.get("found_during")):
         where += " AND found_during = ?"
         params.append(found_during)
+    if (home := request.query_params.get("home")) is not None:
+        if home != "invalid":
+            return refusals.refuse(
+                400, f"home must be 'invalid' when present, not {home!r}",
+                hint="the only recognised value surfaces a non-epic row "
+                     "whose parent names neither an epic nor a corrections "
+                     "queue in its own product")
+        # **A NON-EPIC ROW WITH NO VALID HOME** (`library/specs/one-home-
+        # per-work-item`, PR 2). `create_item`, `insert_item` and `/correct`
+        # all guarantee a non-epic's `parent_id` names an epic or a
+        # corrections queue in its own product, and PR 2's migration
+        # backfilled every row filed before they did — so this is the net
+        # for what slips past all of that: a NULL parent, or one naming
+        # neither table here, which only a direct insert outside those
+        # paths can still leave (`replay_stranded.py`, `migrate.py`;
+        # `library/decisions/0003`).
+        where += " AND (type IS NULL OR type != ?)"
+        params.append(store.ITEM_TYPE_EPIC)
+        where += (
+            " AND (parent_id IS NULL OR ("
+            "NOT EXISTS (SELECT 1 FROM issue_items AS p WHERE p.id = "
+            "issue_items.parent_id AND p.type = ? AND p.product = "
+            "issue_items.product) "
+            "AND NOT EXISTS (SELECT 1 FROM corrections_queues AS q WHERE "
+            "q.id = issue_items.parent_id AND q.product = "
+            "issue_items.product)))")
+        params.append(store.ITEM_TYPE_EPIC)
     # **`topics` WAS THE THIRD FILTER THIS ROUTE DROPPED ON THE FLOOR**, and it
     # failed the way the `needs` note above calls the worse one: `?topics=DESIGN`
     # returned all 145 open vivy items rather than none, so a caller reading a
@@ -1991,6 +2086,8 @@ async def get_item(item_id: str, request: Request):
         return err
     if not identity.authorized(ident, "item.read"):
         return refusals.forbidden("item.read")
+    if (err := _reject_unknown_params(request, set())):
+        return err
     conn = store.connect()
     try:
         row = conn.execute(
@@ -2057,6 +2154,8 @@ async def list_corrections_queues(request: Request):
         return err
     if not identity.authorized(ident, "item.read"):
         return refusals.forbidden("item.read")
+    if (err := _reject_unknown_params(request, {"product"})):
+        return err
     where, params = "WHERE 1 = 1", []
     scope, scope_params = _scope_clause(ident)
     where += scope
@@ -2087,6 +2186,8 @@ async def get_corrections_queue(queue_id: str, request: Request):
         return err
     if not identity.authorized(ident, "item.read"):
         return refusals.forbidden("item.read")
+    if (err := _reject_unknown_params(request, set())):
+        return err
     conn = store.connect()
     try:
         row = store.get_corrections_queue(conn, queue_id)
@@ -2129,6 +2230,9 @@ async def list_leases(request: Request):
         return err
     if not identity.authorized(ident, "item.read"):
         return refusals.forbidden("item.read")
+    if (err := _reject_unknown_params(
+            request, {"state", "limit", "offset", "holder"})):
+        return err
     state = request.query_params.get("state") or "live"
     if state not in {"live", "all"}:
         return refusals.refuse(400, "state must be live | all")
@@ -2198,6 +2302,10 @@ async def list_lease_refusals(request: Request):
         return err
     if not identity.authorized(ident, "item.read"):
         return refusals.forbidden("item.read")
+    if (err := _reject_unknown_params(request, {
+            "limit", "offset", "product", "requester", "blocks_by",
+            "blocking_holder"})):
+        return err
     limit, offset, err = _page(request)
     if err:
         return err
@@ -2302,6 +2410,8 @@ async def librarian_metrics_route(request: Request):
         return err
     if not identity.authorized(ident, "item.read"):
         return refusals.forbidden("item.read")
+    if (err := _reject_unknown_params(request, {"window_days", "product"})):
+        return err
     try:
         window = int(request.query_params.get(
             "window_days", librarian_metrics.DEFAULT_WINDOW_DAYS))
@@ -2335,6 +2445,9 @@ async def list_courses(request: Request):
         return err
     if not identity.authorized(ident, "course.read"):
         return refusals.forbidden("course.read")
+    if (err := _reject_unknown_params(
+            request, {"limit", "offset", "status", "product"})):
+        return err
     # PAGINATED LIKE EVERY OTHER LIST, and it was not (reviewer, PR #1). The
     # contract says every list response carries `count`, `total`, `truncated` and
     # `offset`, and a client reads a MISSING `total` as "this page may be
@@ -2455,12 +2568,25 @@ async def get_course(course_id: str, request: Request):
     names a next entry or ranks what can start — no `next`, `current`,
     `up_next` or `eta` — because nothing here decides that a Course entry
     can start only once the one before it is reached.
+
+    **`waypoint_progress` AND `position["synthetic_waypoints"]` ARE THE
+    SAME PAIR, FOR THE COURSE'S SYNTHETIC WAYPOINTS** (`courses.waypoints` —
+    "epic" and "waypoint" are defined once, in `lease.py`'s module
+    docstring). `waypoint_progress` is the detail, one entry per synthetic
+    waypoint with its members' own ids and states — the counterpart to
+    `items` above. `position["synthetic_waypoints"]` places each synthetic
+    waypoint into reached, in flight or remaining, the counterpart to
+    `position`'s own epic-entry fields, which stay exactly as they were:
+    neither key existed before this, and nothing above them changed shape
+    or meaning to make room for them.
     """
     ident, err = _identify(request)
     if err:
         return err
     if not identity.authorized(ident, "course.read"):
         return refusals.forbidden("course.read")
+    if (err := _reject_unknown_params(request, set())):
+        return err
     conn = store.connect()
     try:
         row = conn.execute(
@@ -2469,6 +2595,7 @@ async def get_course(course_id: str, request: Request):
             return refusals.not_found()
         course = store.course_dict(row)
         entries = course["entries"]
+        waypoints = course["waypoints"]
         items = {}
         if entries:
             # SCOPED LIKE EVERY OTHER FETCH, and it was not (reviewer, PR #1).
@@ -2501,6 +2628,22 @@ async def get_course(course_id: str, request: Request):
         # `position` exists to catch is exactly the one where the epic's own row
         # stays `open` while a lease still fences it.
         entry_leases = lease.live_lease_rows(conn, entries) if entries else {}
+        # A SEPARATE SCOPED QUERY, over the union of every synthetic waypoint's
+        # own named members — a member set is not the entries list, and it may
+        # name a work item `_validate_entries` would refuse, so `items` above
+        # cannot be reused for it. No lease lookup here: `waypoint_course_
+        # position`'s own docstring says why a member's own state is all it
+        # looks at.
+        member_ids = sorted({mid for wp in waypoints for mid in wp["members"]})
+        waypoint_items = {}
+        if member_ids:
+            placeholders = ",".join("?" * len(member_ids))
+            scope, scope_params = _scope_clause(ident)
+            for r in conn.execute(
+                    f"SELECT {store.ITEM_COLUMNS} FROM issue_items "
+                    f"WHERE id IN ({placeholders}){scope}",
+                    [*member_ids, *scope_params]):
+                waypoint_items[r["id"]] = r
         events, elided = _course_history(conn, course_id)
     finally:
         conn.close()
@@ -2514,7 +2657,14 @@ async def get_course(course_id: str, request: Request):
         for eid in entries]
     course["events"] = events
     course["events_elided"] = elided
+    waypoint_progress = [
+        {"id": wp["id"],
+         **store.waypoint_progress(wp["members"], waypoint_items)}
+        for wp in waypoints]
+    course["waypoint_progress"] = waypoint_progress
     course["position"] = lease.course_position(entries, items, entry_leases)
+    course["position"]["synthetic_waypoints"] = (
+        lease.waypoint_course_position(waypoint_progress))
     return course
 
 
@@ -2526,10 +2676,10 @@ def _validate_entries(conn, ident, product: str, raw):
     create but not on reorder is a rule the second write quietly undoes.
 
     **A COURSE CONTAINS ONLY EPICS** (the operator, 2026-08-05), and the reason reaches
-    past storage. Issues are a break FROM Course work and are drained by
-    autonomous crews, so the Course is the planned lane and the issue queue is
-    the interrupt lane; accepting an issue here would merge the two without
-    anybody deciding to.
+    past storage. A correction is a break FROM Course work and is drained by
+    autonomous crews, so the Course is the planned lane and the corrections
+    queue is the interrupt lane; accepting a work item that is not an epic here
+    would merge the two without anybody deciding to.
 
     Everything else it checks is a way the order could stop meaning anything: an
     id naming nothing, an epic belonging to another project, or the same epic
@@ -2593,8 +2743,9 @@ def _validate_entries(conn, ident, product: str, raw):
         return None, (400, {
             "error": "a Course contains only epics",
             "not_epics": not_epics,
-            "hint": "issues are the interrupt lane, worked outside the plan; "
-                    "nest the issue under an epic and put the epic on the Course"})
+            "hint": "a work item that is not an epic belongs under an epic or "
+                    "in its product's corrections queue; put the work item "
+                    "under an epic and put the epic on the Course"})
     foreign = sorted(e for e in entries if rows[e]["product"] != product)
     if foreign:
         return None, (400, {
@@ -3485,6 +3636,157 @@ def _do_supersede_course(ident, course_id: str, note, successor):
         if new_course is not None:
             body["successor"] = new_course
         return 200, body, anomaly
+    finally:
+        conn.close()
+
+
+def _validate_waypoint_members(conn, ident, product: str, raw):
+    """A synthetic waypoint's `members` against the membership rules, or a
+    `(status, body)` refusal — `_validate_entries`'s own rules, carried over
+    where they still apply.
+
+    **A MEMBER MAY BE ANY ITEM, EPIC OR WORK ITEM**, unlike a Course entry.
+    The work item that specifies this is explicit: "a member of a synthetic
+    waypoint is an item id (epic or work item) in the Course's product." So
+    there is no `not_epics` check here — `_validate_entries`'s one rule that
+    does not carry over.
+
+    **DUPLICATES ARE REFUSED, for a different reason than on `entries`.**
+    There, a repeated epic has no defined position in an ordered list. A
+    member set has no position to lose — the reason here is that
+    `store.waypoint_progress` counts every member once toward `total`, so a
+    repeated id would be counted twice toward both `total` and, once
+    terminal, `terminal`, skewing `percent_terminal` for an id that names
+    one thing.
+
+    Every refusal names ALL the offending ids rather than the first, matching
+    `_validate_entries`.
+    """
+    if not isinstance(raw, list):
+        return None, (400, {"error": "members must be an array of item ids"})
+    if not raw:
+        return None, (400, {
+            "error": "a synthetic waypoint must name at least one member"})
+    if len(raw) > store.MAX_WAYPOINT_MEMBERS:
+        return None, (400, {
+            "error": f"members may hold at most "
+                     f"{store.MAX_WAYPOINT_MEMBERS} items"})
+    members = []
+    for m in raw:
+        if not isinstance(m, str) or not m.strip():
+            return None, (400, {
+                "error": "every member must be a non-empty item id"})
+        members.append(m.strip())
+    dupes = sorted({m for m in members if members.count(m) > 1})
+    if dupes:
+        return None, (400, {
+            "error": "an item may appear in a synthetic waypoint only once",
+            "duplicates": dupes})
+    scope, scope_params = _scope_clause(ident)
+    rows = {r["id"]: r for r in conn.execute(
+        f"SELECT id, product FROM issue_items "
+        f"WHERE id IN ({','.join('?' * len(members))}){scope}",
+        [*members, *scope_params])}
+    unknown = sorted(m for m in members if m not in rows)
+    if unknown:
+        return None, (400, {
+            "error": "no such work item, or none this identity may see",
+            "unknown": unknown})
+    foreign = sorted(m for m in members if rows[m]["product"] != product)
+    if foreign:
+        return None, (400, {
+            "error": f"every member must belong to product {product!r}",
+            "wrong_product": foreign})
+    return members, None
+
+
+@app.post("/courses/{course_id}/waypoints")
+async def add_course_waypoint(request: Request, course_id: str):
+    """Name a synthetic waypoint: a set of items, epics or work items, that
+    must all complete before this point on the Course is reached.
+
+    **ADDITIVE, AND DELIBERATELY NOT PART OF `entries`.** `entries` is
+    protocol-pinned to epic id strings (§6.1); this is the new, separate
+    place a synthetic waypoint lives, so an old client reading `entries`
+    sees exactly what it always has. `GET /courses/{id}` reports each one's
+    members and their states under `waypoint_progress`, and places it in
+    `position["synthetic_waypoints"]` — "epic" and "waypoint" are defined
+    once, in `lease.py`'s module docstring.
+
+    **`version` IS NOT TOUCHED, for the reason `retitle_course` gives for the
+    same choice.** It is the optimistic-concurrency token for `entries`
+    alone; this writes a different column, so bumping it would 409 a
+    reorder that never conflicted with this write.
+    """
+    ident, err = _course_writer(request)
+    if err:
+        return err
+    try:
+        payload = await request.json()
+    except (ValueError, TypeError):
+        return refusals.refuse(400, "body must be a JSON object")
+    if not isinstance(payload, dict):
+        return refusals.refuse(400, "body must be a JSON object")
+    try:
+        status, body = await run_in_threadpool(
+            _do_add_course_waypoint, ident, course_id, payload.get("members"))
+    except store.WritesDisabled as e:
+        return refusals.refuse(503, "the Library is not the write path yet",
+                               hint=str(e))
+    return JSONResponse(status_code=status, content=body)
+
+
+def _do_add_course_waypoint(ident, course_id: str, raw_members):
+    conn = store.connect_rw()
+    try:
+        # THE WRITE LOCK BEFORE THE READ, the same reason every other Course
+        # write takes it: reading the current `waypoints` array and appending
+        # to it is a check-then-act, and a SELECT takes no lock.
+        conn.execute("BEGIN IMMEDIATE")
+        course = _load_course(conn, ident, course_id)
+        if course is None:
+            return _course_not_found()
+        frozen = _frozen_course(course)
+        if frozen:
+            return frozen
+        members, err = _validate_waypoint_members(
+            conn, ident, course["product"], raw_members)
+        if err:
+            return err
+        existing = store.course_dict(course)["waypoints"]
+        if len(existing) >= store.MAX_COURSE_WAYPOINTS:
+            return 400, {
+                "error": f"a Course may hold at most "
+                         f"{store.MAX_COURSE_WAYPOINTS} synthetic waypoints"}
+        waypoint_id = f"waypoint_{store.new_ulid()}"
+        updated = existing + [{"id": waypoint_id, "members": members}]
+        now = _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None)
+        # CONDITIONAL ON THE STATUS IT READ, matching `_do_retitle_course`'s
+        # CAS — the lock above makes the sequence safe, this makes it safe
+        # without depending on the lock.
+        cur = conn.execute(
+            "UPDATE courses SET waypoints = ?, updated_by = ?, updated_at = ? "
+            "WHERE id = ? AND status IS ?",
+            (json.dumps(updated), ident.actor, now.isoformat(" "), course_id,
+             course["status"]))
+        if cur.rowcount != 1:
+            conn.rollback()
+            # Re-read through `_load_course`, so the scope check is not
+            # skipped on the way out, matching every other write here.
+            fresh = _load_course(conn, ident, course_id)
+            if fresh is None:
+                return _course_not_found()
+            return _frozen_course(fresh) or (409, {
+                "error": "this Course changed since it was read",
+                "hint": "re-read it and retry"})
+        conn.execute(
+            "INSERT INTO course_events (course_id, actor, action, waypoints, "
+            "at) VALUES (?,?,?,?,?)",
+            (course_id, ident.actor, store.COURSE_ACTION_WAYPOINT_ADDED,
+             json.dumps(updated), now.isoformat(" ")))
+        conn.commit()
+        fresh = _load_course(conn, ident, course_id)
+        return 201, store.course_dict(fresh)
     finally:
         conn.close()
 
@@ -4819,8 +5121,14 @@ async def correct_item(request: Request, item_id: str):
     `parent_id` is here for a different reason from the other fields. Those
     correct a MISFILING; this one records a fact that legitimately becomes known
     long after filing — an epic usually does not exist when the work under it is
-    first captured. It accepts an explicit `null` to reverse, back to top level,
-    since a wrong nesting that could not be undone would be a one-way door.
+    first captured. On a work item, an explicit `null` or `""` reverses the
+    nesting into the item's product's corrections queue
+    (`library/specs/one-home-per-work-item`), since a wrong nesting that could
+    not be undone would be a one-way door; on an epic, `null` clears the parent
+    to top level, as it always has. **A move changes `parent_id` alone** (the
+    operator's ruling, Slate a-v5j93k, 2026-10-09): it writes no note, no
+    comment and no event, whether the caller asked for it directly or a retype
+    carried it along — unlike every other field this route corrects.
 
     **`found_during` records which epic's work turned this item up, without
     the lane change `parent_id` carries.** It must name an existing epic in
@@ -4862,9 +5170,10 @@ async def correct_item(request: Request, item_id: str):
 
     # PRESENCE, NOT TRUTHINESS, for the fields an explicit `null` means
     # something on. `payload.get()` cannot tell a null from an absent key, and
-    # null is how a caller resets maturity to "not yet assessed", detaches an
-    # item to top level, clears which epic's work found it, or clears a
-    # specification that turned out to be wrong.
+    # null is how a caller resets maturity to "not yet assessed", moves a work
+    # item to its product's corrections queue (or an epic to top level),
+    # clears which epic's work found it, or clears a specification that
+    # turned out to be wrong.
     # `type` joins the presence-tracked fields here: `null` is now a real
     # target (untyped), not a no-op, so "was `type` sent at all" has to be
     # asked rather than "is the value non-null".
@@ -5165,6 +5474,29 @@ def _do_correct(ident, item_id: str, payload: dict, new: dict, fields: dict,
                 "error": "an epic's parent must be an epic or nothing",
                 "hint": "this item's parent is a corrections queue; send "
                         "parent_id null or an epic id with the retype"}
+        # **A WORK ITEM'S PARENT IS NEVER NULL** (`library/specs/one-home-per-
+        # work-item`, PR 2). This covers both ways a non-epic can end up here
+        # with no parent: an explicit `null`/`""` from the caller
+        # (`fields["parent_id"]`), already resolved to `None` by
+        # `_validate_parent` above, and a parentless epic retyped down to a
+        # work item with no `parent_id` in the request at all — caught on
+        # `item["type"]` still reading `epic` here, since `new_parent` is
+        # left at its untouched starting value of `item["parent_id"]` in
+        # that case. **Gated on one of those two, not on `new_parent is
+        # None` alone** — a correction that touches neither, on a non-epic
+        # row a NULL parent reached some other way (a direct insert outside
+        # `insert_item`; see `GET /items?home=invalid`), must not mint a
+        # queue assignment nobody asked this request for. Creating the queue
+        # here, inside `_hold_for_write`'s own `BEGIN IMMEDIATE`, matches
+        # `insert_item`'s reasoning for doing the same at create. A non-epic
+        # whose inherited parent already names an epic (a sub-epic retyped
+        # to a work item) is untouched: that parent is already a valid home
+        # for a work item.
+        if (effective_type != store.ITEM_TYPE_EPIC and new_parent is None
+                and (fields["parent_id"]
+                     or item["type"] == store.ITEM_TYPE_EPIC)):
+            new_parent = store.get_or_create_corrections_queue(
+                conn, item["product"])
         if fields["parent_id"] and new_parent != item["parent_id"]:
             # MOVING AN EDGE UNDER SOMEONE ELSE'S LIVE LEASE CHANGES WHAT THAT
             # FENCE HOLDS WITHOUT ITS HOLDER KNOWING. Moving an item out shrinks
@@ -5288,6 +5620,19 @@ def _do_correct(ident, item_id: str, payload: dict, new: dict, fields: dict,
                 return prereq_err[0], prereq_err[1]
 
         changes, columns = [], {}
+        # **`parent_id` GATES THE WRITE BUT NEVER JOINS THE NOTE** (the
+        # operator's ruling, Slate a-v5j93k, 2026-10-09). Every other field
+        # below feeds both `columns`, which decides whether the UPDATE runs,
+        # and `changes`, which decides whether a "Field correction" note is
+        # written — the two were one list until this PR. A re-parent is the
+        # one correction with no note, no comment and no event, so it is
+        # split out here rather than folded into the loop just below: it
+        # still has to reach `columns` so a parent-only request is not
+        # silently dropped at the `if not columns` gate further down, and
+        # `new_parent` already reflects both an explicit move and a retype
+        # that carried one along (see the block above that resolves it).
+        if new_parent != item["parent_id"]:
+            columns["parent_id"] = new_parent
         if new["severity"] is not None and new["severity"] != item["severity"]:
             changes.append(("severity", item["severity"], new["severity"]))
             columns["severity"] = new["severity"]
@@ -5298,7 +5643,6 @@ def _do_correct(ident, item_id: str, payload: dict, new: dict, fields: dict,
         # real target rather than an omitted field.
         for name, value in (("type", new_type),
                             ("maturity", new["maturity"]),
-                            ("parent_id", new_parent),
                             ("found_during", new_found_during),
                             ("specification", new["specification"]),
                             ("definition_of_done", new["definition_of_done"])):
@@ -5373,7 +5717,11 @@ def _do_correct(ident, item_id: str, payload: dict, new: dict, fields: dict,
             changes.append(("maturity", item["maturity"],
                             store.ITEM_MATURITY_PROPOSED))
             columns["maturity"] = store.ITEM_MATURITY_PROPOSED
-        if not changes:
+        # **GATED ON `columns`, NOT `changes`** — the two diverge now that a
+        # re-parent can populate `columns` alone. A request that changed only
+        # `parent_id` must still run the UPDATE below; gating on `changes`
+        # would read it as a no-op and silently drop the move.
+        if not columns:
             return 200, store.item_dict(
                 item, claim=lease.claim_status(conn, item),
                 prerequisites=store.prerequisite_status(
@@ -5476,13 +5824,20 @@ def _do_correct(ident, item_id: str, payload: dict, new: dict, fields: dict,
                 f"not change the desired end state, so the approval it already "
                 f"carried still stands (the operator, 2026-08-27). Nothing verifies that "
                 f"claim; the diff above is what it was made about.")
-        now = _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None)
-        conn.execute(
-            "INSERT INTO issue_comments (item_id, actor, kind, body, run_id, at) "
-            "VALUES (?,?,?,?,?,?)",
-            (item_id, ident.actor, "note",
-             store.clip("\n".join(lines), store.MAX_ITEM_TEXT), None,
-             now.isoformat(" ")))
+        # **NO NOTE, NO COMMENT AND NO EVENT WHEN `parent_id` IS THE ONLY
+        # THING THAT CHANGED** (the operator's ruling, Slate a-v5j93k,
+        # 2026-10-09). `changes` excludes `parent_id` by construction (see
+        # where `columns["parent_id"]` is set above), so it is empty exactly
+        # when a move was the whole request — a retype that also moved the
+        # item still has its own entry in `changes` and still gets a note.
+        if changes:
+            now = _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None)
+            conn.execute(
+                "INSERT INTO issue_comments (item_id, actor, kind, body, run_id, at) "
+                "VALUES (?,?,?,?,?,?)",
+                (item_id, ident.actor, "note",
+                 store.clip("\n".join(lines), store.MAX_ITEM_TEXT), None,
+                 now.isoformat(" ")))
         conn.commit()
         fresh = conn.execute("SELECT * FROM issue_items WHERE id = ?",
                              (item_id,)).fetchone()
@@ -6550,8 +6905,8 @@ async def checkout_item(request: Request, item_id: str):
 
     This is the protocol a run begins with. The lease is on the item's EPIC, so a
     second worker reaching for a sibling is refused with a reason naming the
-    holder and the expiry. An item with no parent leases only itself, which is
-    what every row predating the epic model does.
+    holder and the expiry. A correction, whose parent is its product's
+    corrections queue, leases only itself: no lease is ever rooted on a queue.
 
     Returns `{item, lease, policy, adjacency}`. `policy` carries the grace in
     force, so a caller sees the terms it is held to rather than inferring them
@@ -6577,7 +6932,10 @@ async def checkout_item(request: Request, item_id: str):
     field existed. `slip_id` names a real, persisted credential with its own
     TTL independent of this checkout's lease — see `call_slips` for its
     lifetime and `_call_slip_grant` for what the rest of the grant's fields
-    are still a placeholder for and why.
+    are still a placeholder for and why. `model` is resolved from the item's
+    own model choice or `persona`'s agent definition, falling back to that
+    same placeholder when neither names one (issue_01M12NE12WF9V0721WSHH34A2W,
+    `_call_slip_grant_body`).
 
     **An optional `profile`, as `"<project>/<variant>"`, is what fills
     `docs`** (issue_01M21B12X6BYZ76W04JK2QWPQF). The caller names it because
@@ -6646,8 +7004,9 @@ async def _checkout(request: Request, item_id: str, *, with_lease_body: bool):
     # OPTIONAL, AND ADDITIVE (contract §1): checkout took no persona argument
     # before this field existed, and an absent one means exactly what checkout
     # already meant. There is no persona registry yet (issue
-    # 01M12NE120JVQT4DV85N8MB7TP) — this only names which kind of agent the
-    # caller wants, for `_call_slip_grant` to echo back.
+    # 01M12NE120JVQT4DV85N8MB7TP) — this names which kind of agent the caller
+    # wants, for `_call_slip_grant` to echo back into `persona_md` and, since
+    # issue_01M12NE12WF9V0721WSHH34A2W, to resolve `model` against.
     #
     # **VALIDATED ONLY ON THE `/checkout` PATH.** `/claim` never read `persona`
     # before this field existed, so a payload with a malformed one succeeded
@@ -6889,9 +7248,12 @@ def _refuse_on_capped_ledger(conn, product: str):
     }
 
 
-# The placeholder `model` value checkout serves until issue_01M12NE12WF9V0721WSHH34A2W
-# resolves `(persona, work item, project)` to a real one. Named so a reader who
-# sees it in a run knows immediately that nothing chose it.
+# THE FALLBACK `model` VALUE, SERVED WHEN NOTHING RESOLVES ONE
+# (issue_01M12NE12WF9V0721WSHH34A2W): no model choice on the work item, no
+# persona named or none that resolves, an ambiguous persona name, or a
+# reference index that cannot be read. Named so a reader who sees it in a
+# run knows immediately that nothing chose it — a client that predates
+# resolution sees exactly this value, unchanged.
 _MODEL_NOT_RESOLVED = "model-resolution-not-implemented"
 
 
@@ -6909,19 +7271,62 @@ def _persona_md(persona: str | None) -> str:
             "shape ahead of it.")
 
 
+def _persona_model(persona: str) -> str | None:
+    """The `model` frontmatter pin of the agent definition `persona` names, or
+    `None` when nothing resolves one.
+
+    **Same id-suffix match and the same agent-platform preference `agentctl`'s
+    `_library_agent` uses** (ARCH-426): every `kind: agent` document is read
+    and matched on its id ending `/agents/<persona>`; several projects holding
+    the name resolve to agent-platform's copy, and otherwise, or when nothing
+    matches, the name is unresolved rather than refused. The two have to agree
+    on one persona, because a caller that reads this grant's `model` and the
+    `agentctl spawn --issue` dispatch that later runs the same persona must
+    not be told two different models.
+
+    **A FAILURE HERE MUST NOT COST THE CALLER ITS CHECKOUT**, the same
+    contract `_slip_docs` holds for a profile bundle: this returns `None`
+    rather than raising, and the caller falls back to `_MODEL_NOT_RESOLVED`.
+    """
+    try:
+        conn = reference.connect()
+    except reference.ReferenceIndexUnavailable as e:
+        print(f"library: agent model lookup unavailable for {persona!r} — {e}",
+              file=sys.stderr)
+        return None
+    try:
+        rows = conn.execute("SELECT * FROM docs WHERE kind = 'agent'").fetchall()
+    except sqlite3.Error as e:
+        print(f"library: agent model lookup unavailable for {persona!r} — {e}",
+              file=sys.stderr)
+        return None
+    finally:
+        conn.close()
+    suffix = f"/agents/{persona}"
+    matches = [r for r in rows if str(r["id"]).endswith(suffix)]
+    if len(matches) > 1:
+        matches = [r for r in matches if r["project"] == "agent-platform"]
+    if len(matches) != 1:
+        return None
+    model = reference.doc_dict(matches[0], body=False).get("model")
+    return model if isinstance(model, str) and model.strip() else None
+
+
 def _call_slip_grant(persona: str | None, slip_id: str,
                      profile_row: dict | None = None,
-                     per_run_cap_usd: float | None = None) -> dict:
+                     per_run_cap_usd: float | None = None,
+                     model_choice: str | None = None) -> dict:
     """`{slip_id, persona_md, docs, model, budget, limits}` — the grant a call
     slip carries (ADR-0062), added to `POST /items/{id}/checkout`'s response
     alongside the unchanged `item`, `lease`, `policy` and `adjacency`. This is
     additive within protocol version 1 (contract §1): every field below is
     new, and nothing already returned changed shape or meaning.
 
-    **Most of this still pins a SHAPE rather than a resolved value**
-    (issue_01M12NE120JVQT4DV85N8MB7TP) — a client can be built against
-    `persona_md`, `docs`, `model` and `limits` before the Library resolves
-    any of them for real.
+    **`persona_md`, `docs` and `limits` still pin a SHAPE rather than a
+    resolved value** (issue_01M12NE120JVQT4DV85N8MB7TP) — a client can be
+    built against them before the Library resolves any of them for real.
+    **`model` is resolved** (issue_01M12NE12WF9V0721WSHH34A2W): see
+    `_call_slip_grant_body`'s docstring for the order it is resolved in.
 
     **`slip_id` is the one field that is real.** `_do_checkout` mints and
     persists a row in `call_slips` before calling this, and that id is what
@@ -6975,9 +7380,38 @@ def _call_slip_grant(persona: str | None, slip_id: str,
     constraints, a different axis nothing here restates, and none of those
     constraints are decided yet.
     """
+    return {"slip_id": slip_id,
+            **_call_slip_grant_body(persona, profile_row, per_run_cap_usd,
+                                    model_choice)}
+
+
+def _call_slip_grant_body(persona: str | None, profile_row: dict | None,
+                          per_run_cap_usd: float | None,
+                          model_choice: str | None = None) -> dict:
+    """Every field of `_call_slip_grant` but `slip_id`: what checkout stores
+    on the slip at mint and what `POST /tokens/redeem` returns as `grant`.
+    Built before the slip exists, so it cannot name the slip's own id.
+
+    **`model` is resolved in this order** (issue_01M12NE12WF9V0721WSHH34A2W):
+    `model_choice` — the work item's own `model_choice.model`, read by the
+    caller off `issue_items` before this is called, since that table is not
+    this function's to query — wins when set; otherwise `persona`'s agent
+    definition's `model` pin, when `persona` names one that resolves
+    (`_persona_model`); otherwise `_MODEL_NOT_RESOLVED`, exactly what every
+    caller saw before either source existed.
+
+    **`_do_checkout`, this function's one caller, passes `model_choice=None`
+    here and applies that half of the order itself, after the call, from
+    `locked["model_choice"]`** — the row under the write lock, not the
+    unlocked `item` this function would otherwise have no way to tell apart
+    from a real absence of a choice. Passing the unlocked value in would
+    resolve `model` before the lock is even taken, the same race the write
+    lock exists to close."""
     docs, available = _slip_docs(profile_row)
+    model = (model_choice
+             or (persona and _persona_model(persona))
+             or _MODEL_NOT_RESOLVED)
     return {
-        "slip_id": slip_id,
         "persona_md": _persona_md(persona),
         "docs": docs,
         "bundle": {
@@ -6985,23 +7419,37 @@ def _call_slip_grant(persona: str | None, slip_id: str,
                         if profile_row else None),
             "available": available,
         },
-        "model": _MODEL_NOT_RESOLVED,
+        "model": model,
         "budget": {"cap_usd": per_run_cap_usd},
         "limits": {},
     }
+
+
+def _per_run_cap_usd(conn, product: str) -> float | None:
+    """The project's per-run cap in dollars, for `budget.cap_usd`. Same scope
+    `_refuse_on_capped_ledger` checks, read separately because that call
+    answers a refusal, not a row to carry forward. `None` when the project has
+    no ledger row, which is the ordinary case for a project no human has
+    capped, or when its row sets no per-run cap."""
+    ledger = store.live_ledger(conn, "project", product)
+    if ledger is None or ledger["per_run_cap_usd_micro"] is None:
+        return None
+    return ledger["per_run_cap_usd_micro"] / 1_000_000
 
 
 def _slip_docs(profile_row: dict | None) -> tuple[list[dict], bool]:
     """`(docs, available)` for a grant — the profile resolved to `id` plus
     `body_sha256` per document.
 
-    **A FAILURE HERE MUST NOT COST THE CALLER ITS LOCK.** By the time this
-    runs the claim and the lease have committed, so letting a failure
-    propagate would return 500 or 503 to a caller that already holds the lease
-    and does not know it — a stranded hold, which is strictly worse than a
-    missing bundle. This is the same trade `_briefing` makes for adjacency and
-    for the same reason, and `available: false` is how the caller learns the
-    difference rather than reading an empty list as an answer.
+    **A FAILURE HERE MUST NOT COST THE CALLER ITS CHECKOUT.** This runs before
+    the lease is taken (`_do_checkout` builds the grant ahead of its first
+    write, so the slip can store it), so a failure that propagated would no
+    longer strand a hold; it would refuse every checkout naming a profile for
+    as long as the reference index is being rebuilt, and the queue would stop
+    on advice it can do without. This is the same trade `_briefing` makes for
+    adjacency, and `available: false` is how the caller learns the difference
+    rather than reading an empty list as an answer. The same `available` is
+    stored with the slip, so redemption reports it unchanged.
 
     **THE GUARD SPANS THE QUERY AND NOT ONLY THE OPEN, because the index can
     fail in both windows and only one of them raises
@@ -7181,6 +7629,27 @@ def _do_checkout(ident, item_id: str, owner: str, run_id, with_lease_body: bool,
         elif item["state"] != store.ITEM_STATE_OPEN:
             return 409, {"error": f"already {item['state']}"}
 
+        # **THE GRANT IS BUILT HERE, BEFORE THE FIRST WRITE, AND STORED WITH THE
+        # SLIP** (issue_01M3VN8WV1K891BT866K82ZBPX). `POST /tokens/redeem`
+        # returns the grant a slip was issued with, and the persona and profile
+        # it is built from are named on this request and stored nowhere, so the
+        # slip row has to carry it. Built before `lease.take` because this
+        # transaction is deferred: no write lock is held yet, so resolving the
+        # profile against the reference index holds up no other writer. The
+        # checkout response serves this same dict, so what checkout told the
+        # Bosun and what redemption tells the Individuator cannot differ.
+        # `budget.cap_usd` is left for the mint below, which reads it under the
+        # write lock, and so is `model`'s `model_choice` half: `model_choice`
+        # is left `None` here so this call falls back to the persona's pin or
+        # the placeholder, and the mint below overwrites `grant["model"]` from
+        # `locked["model_choice"]` the same way it overwrites `cap_usd`
+        # (security-reviewer, convivy/library#249). The persona lookup still
+        # happens here, unlocked, because it is a reference-index read and
+        # holds up no other writer either.
+        grant = None
+        if with_lease_body:
+            grant = _call_slip_grant_body(persona, profile_row, None, None)
+
         # THE LEASE IS TAKEN BEFORE THE CLAIM IS WRITTEN, so a refused checkout
         # leaves the item exactly as it found it. The other way round, a caller
         # blocked by a live lease would still have flipped the item to `claimed`
@@ -7348,10 +7817,31 @@ def _do_checkout(ident, item_id: str, owner: str, run_id, with_lease_body: bool,
             # is what lets `_checkout` answer with a named, retry-safe refusal
             # instead of an unhandled 500 (reviewer, PR #86).
             product = item["product"]
+            # **THE PER-RUN CAP IS READ HERE, UNDER THE WRITE LOCK**
+            # (reviewer, convivy/library#244). `agentctl` enforces it,
+            # including the kill, and the slip keeps it for redemption, so it
+            # is read where no `PUT /ledgers` can commit between the read and
+            # the mint. The reads before `lease.take()` are autocommit, each
+            # its own snapshot, so reading it there could store a cap a human
+            # had already changed.
+            grant["budget"]["cap_usd"] = _per_run_cap_usd(conn, product)
+            # **`model_choice` IS RE-READ HERE TOO, OFF `locked`, UNDER THE
+            # SAME WRITE LOCK** (security-reviewer, convivy/library#249).
+            # `locked` is the row `lease.take()` already holds the lock on
+            # (read above for the blocked-item check), so a `PUT
+            # /items/{id}/model` landing in the window before `lease.take()`
+            # is not missed the way the unlocked `item["model_choice"]` read
+            # before the grant was first built would miss it. An unset
+            # `model_choice` on `locked` leaves `grant["model"]` exactly as
+            # `_call_slip_grant_body` resolved it above, from the persona's
+            # pin or the placeholder.
+            if locked["model_choice"]:
+                grant["model"] = locked["model_choice"]
             try:
                 slip_id = call_slips.mint(conn, item_id=item_id,
                                           product=product,
-                                          claim_owner_label=owner)
+                                          claim_owner_label=owner,
+                                          grant=grant)
             except Exception as e:
                 raise call_slips.MintFailed(str(e)) from e
         conn.commit()
@@ -7368,16 +7858,6 @@ def _do_checkout(ident, item_id: str, owner: str, run_id, with_lease_body: bool,
                     conn, fresh, in_scope=_scope_predicate(ident)))
         held = conn.execute("SELECT * FROM issue_leases WHERE id = ?",
                             (held["id"],)).fetchone()
-        # THE PROJECT'S LEDGER, READ FRESH AFTER THE COMMIT — same scope
-        # `_refuse_on_capped_ledger` already checked above, read again here
-        # because that call answers a refusal, not a row to carry forward.
-        # `None` when the project has no ledger row at all, which is the
-        # ordinary case for a project no human has capped.
-        ledger = store.live_ledger(conn, "project", item["product"])
-        per_run_cap_usd = (
-            ledger["per_run_cap_usd_micro"] / 1_000_000
-            if ledger is not None and ledger["per_run_cap_usd_micro"] is not None
-            else None)
         # AFTER THE COMMIT. The lock is already the caller's, so the briefing is
         # reading rather than deciding, and it holds no write lock while it runs.
         return 200, {"item": store.item_dict(
@@ -7389,8 +7869,7 @@ def _do_checkout(ident, item_id: str, owner: str, run_id, with_lease_body: bool,
                      "claimed": True,
                      "adjacency": _briefing(conn, fresh, ident,
                                             vectors_unavailable=vectors_reason),
-                     **_call_slip_grant(persona, slip_id, profile_row,
-                                       per_run_cap_usd)}
+                     "slip_id": slip_id, **grant}
     finally:
         conn.close()
 
@@ -7499,7 +7978,13 @@ def _do_redeem(ident, slip_id: str, protocol_version: int):
             raise library_cards.CardIssueFailed(str(e)) from e
         conn.commit()
         card = library_cards.get(conn, card_id)
-        return 200, library_cards.card_dict(card)
+        # **THE GRANT THE SLIP WAS ISSUED WITH, beside the card**
+        # (issue_01M3VN8WV1K891BT866K82ZBPX): persona, documents by id and
+        # hash, model, budget and limits, so the Individuator renders the agent
+        # from this answer alone. Additive within protocol version 1: the
+        # card's fields are unchanged and `grant` is new.
+        return 200, {**library_cards.card_dict(card),
+                     "grant": call_slips.grant_of(redeemed)}
     finally:
         conn.close()
 
@@ -7639,11 +8124,8 @@ def _do_issue_bundle(ident, agent: str, item_id, repo, variant: str):
                      "profile project is the item's product, or the "
                      "repository named",
                 project=project, variant=variant)
-        index_conn = reference.connect()
-        try:
+        with reference.reading() as index_conn:
             rows = bundles.resolve_bundle(profile, agent, index_conn)
-        finally:
-            index_conn.close()
         token_id, expires_at = bundles.mint(
             conn, agent=agent, project=project, variant=variant,
             scope_kind=scope_kind, item_id=item_id, repo=repo,
@@ -7726,11 +8208,8 @@ def _do_redeem_bundle(ident, token_id: str):
         if bundles.is_expired(row):
             return 409, {"error": "this bundle token has expired",
                          "hint": "ask POST /bundles for a new one"}
-        index_conn = reference.connect()
-        try:
+        with reference.reading() as index_conn:
             rows = bundles.read_named(index_conn, json.loads(row["documents"]))
-        finally:
-            index_conn.close()
         if not bundles.consume(conn, token_id, redeemed_by=ident.actor):
             conn.rollback()
             return 409, {"error": "this bundle token has already been redeemed",
@@ -8189,10 +8668,8 @@ async def create_item(request: Request):
     and must not be admitted for writing something that merely looks like its
     product.
 
-    **A work item carries no type.** `type` may be omitted, `null`, or `epic`;
-    `bug`, `nit`, `improvement` and `task` are accepted and silently dropped,
-    with the response naming the dropped value in `type_ignored` — a transitional
-    allowance for a caller that still sends one, not a live type. Any other value,
+    **A work item carries no type.** `type` may be omitted, `null`, or `epic`.
+    Any other value, the retired `bug`, `nit`, `improvement` and `task` and
     `feature` included, is refused with a 400 naming it.
     """
     ident, err = _identify(request)
@@ -8252,23 +8729,14 @@ async def create_item(request: Request):
     # default: an item filed with none stores `type = NULL`, same as one
     # filed with `type: null` explicitly.
     #
-    # **`bug`, `nit`, `improvement` and `task` ARE ACCEPTED AND DROPPED, NOT YET
-    # REFUSED — protocol version 1, additive.** agent-platform's `bin/mcp-ops-
-    # server` sends `"type"` on every create and defaults it to `"bug"`
-    # (issue_01M3VN8RZN8D3NT19KG744FQG7, comment 5133), so refusing these now
-    # would break every filing until the Bosun's tools stop sending one. The
-    # value is dropped and `type_ignored` on the response says so; a client
-    # reading only fields it already knows sees an item with no `type`, which
-    # is this version's addition and not a removal — the later flip to refusal
-    # is a separate change, made once nothing sends the field. `feature` and
-    # any other unrecognised value are refused as before.
+    # **`bug`, `nit`, `improvement` AND `task` ARE REFUSED like any other
+    # unknown value** (issue_01M4J3E6BDF2G6JFGHR1KS9N4J), as `/correct`
+    # refuses them. They were accepted and dropped, with `type_ignored` naming
+    # the value, while agent-platform's `bin/mcp-ops-server` and Orient's "Log
+    # an issue" form still sent one; both now send `type` only for an epic.
     raw_type = payload.get("type")
-    type_ignored = None
     if raw_type is None:
         item_type = None
-    elif raw_type in store.ITEM_TYPES_ACCEPTED_AND_DROPPED:
-        item_type = None
-        type_ignored = raw_type
     elif raw_type in store.ITEM_TYPES:
         item_type = raw_type
     else:
@@ -8363,12 +8831,6 @@ async def create_item(request: Request):
     # item; a 409 created nothing at all.
     if status == 201:
         await _embed_after_commit(vectors.VAULT_CHART_HOUSE, out["id"])
-    # **NAMED ON A 409 TOO, NOT ONLY 200/201.** A once_key collision still
-    # answers with a row — this call's own or an earlier one's — and the
-    # caller sent a dropped type either way; the field says the value named in
-    # THIS request was not stored, which holds whether or not the row is new.
-    if type_ignored is not None:
-        out = {**out, "type_ignored": type_ignored}
     return JSONResponse(status_code=status, content=out)
 
 
@@ -8588,8 +9050,8 @@ async def create_signal(request: Request):
     # `[]`, `{}` — into `""` before the `isinstance` check below ever sees it,
     # so those four JSON types were still stored as a silent empty capture
     # with a 201: the exact bug this block exists to close. `prose` on the
-    # review-record route has the identical `or ""` shape and the identical
-    # bug (outside this route, untouched here). `stream` a few lines below
+    # review-record route had the identical `or ""` shape and the identical
+    # bug, since fixed the same way. `stream` a few lines below
     # already gets this right — `payload.get("stream")` with no fallback,
     # then an explicit `is not None` — so `body` follows the same shape: only
     # an absent key or a JSON `null` defaults to `""`, and anything else that
@@ -8740,6 +9202,74 @@ async def create_signal(request: Request):
         meta = {}
     elif not isinstance(meta, dict):
         return refusals.refuse(400, "meta must be an object when present")
+
+    # **FOR `pr_state`, `product` MUST AGREE WITH WHAT THE REGISTRY DERIVES
+    # FROM `meta.repo`, NEVER A GUESS THE CALLER SUPPLIES**
+    # (issue_01M2NZG7VT7M80GKSMZ04R5KC7). `GET /signals/pr-state` ranks a
+    # PR's rows before it applies scope, correct only while every `pr_state`
+    # row for one PR carries the same product — that route's own docstring
+    # names this dependency. `_review_record_product` and `_merge_repo_scope`
+    # derive a product from a repo the same way (`projects.resolve` on the
+    # bare name, the segment after the last `/`); this is the write-time
+    # half for the kind whose drift library#124/#125 had to backfill, after
+    # a Slack-channel heuristic mis-picked the product for 2,017 rows.
+    #
+    # **`model_resolution` GETS THE SAME CHECK, BUT ONLY WHEN `meta.repo` IS
+    # PRESENT.** agent-platform#603 now sends it on new rows; a row with none
+    # (every row written before that change, and a run whose own repository
+    # could not be determined) is left exactly as it was, rather than
+    # refused for a field its writer never sent.
+    #
+    # **FAILS CLOSED ON AN UNREADABLE REGISTRY** (503), the same trade the
+    # black-box and handoff checks above make: `projects.resolve()` fails
+    # OPEN on its own (returns the input unchanged when the registry can't be
+    # read), so `projects.available()` is checked first rather than trusting
+    # a bare `resolve()` call to notice.
+    #
+    # **GATED ON `store.WRITES_ENABLED`**, matching the two checks above: while
+    # the shadow is running, the write ends in `WritesDisabled` regardless, so
+    # there is nothing yet to protect.
+    #
+    # **A MISMATCH NAMES THE DERIVED PRODUCT ONLY WHEN IT IS NEITHER PRIVATE
+    # NOR A BLACK BOX, AND THE CALLER IS IN SCOPE FOR IT.** Every live client
+    # token is scoped `"*"`, so the scope test alone filters nothing, and a
+    # 400 naming the product would map any private repository to its product
+    # for any holder of `signal.create` (security-reviewer, PR #262 round 1).
+    # A private or black-box product gets the same 404 the checks above
+    # answer with, tested against the same union they use: `private` and
+    # `crew_names` are theirs, read under the same `WRITES_ENABLED` gate.
+    #
+    # **THE ROW STORES THE DERIVED SLUG, NEVER THE CALLER'S SPELLING**, the
+    # way `_review_record_product` does (reviewer, PR #262 round 1). A
+    # caller may pass a project's alias, which resolves to the same product
+    # and so passes the comparison; storing it as spelled would put one PR's
+    # rows under two literal products, the drift this check exists to stop.
+    # The caller must be in scope for the slug it is stored under.
+    if kind in ("pr_state", "model_resolution") and store.WRITES_ENABLED:
+        repo = meta.get("repo")
+        if kind == "pr_state" or repo is not None:
+            if not projects.available():
+                return refusals.refuse(
+                    503, "the project registry could not be read, so "
+                         "meta.repo cannot be resolved to a product, and "
+                         "nothing is captured",
+                    hint="retry once the registry at the configured path is "
+                         "readable again")
+            derived = (projects.resolve(repo.strip().rsplit("/", 1)[-1])
+                       if isinstance(repo, str) and repo.strip() else None)
+            if derived is None:
+                return refusals.not_found()
+            hidden = (derived.strip().casefold() in (private | crew_names)
+                      or derived.strip().casefold() in await run_in_threadpool(
+                          store.black_box_registration_crews))
+            if hidden or not identity.in_scope(ident, derived):
+                return refusals.not_found()
+            if projects.resolve(product) != derived:
+                return refusals.refuse(
+                    400, "product does not match the product the "
+                         "registry derives from meta.repo",
+                    product=derived)
+            product = derived
 
     # **`meta.blob_ref` IS SERVER-ASSIGNED, NEVER CALLER-SET, and refusing it
     # here is a security boundary rather than a validation nicety.** `GET
@@ -9000,6 +9530,13 @@ async def list_signals(request: Request):
         return err
     if not identity.authorized(ident, "signal.read"):
         return refusals.forbidden("signal.read")
+    if (err := _reject_unknown_params(request, {
+            "kind", "source", "stream", "product", "repo", "unreferenced_by",
+            "since", "limit", "offset", "order", "cursor"})):
+        return err
+    since_clause, since_params, err = _since_clause(request)
+    if err:
+        return err
     limit, offset, err = _page(request)
     if err:
         return err
@@ -9030,6 +9567,8 @@ async def list_signals(request: Request):
     where += handoff_wall
     params += handoff_params
     where, params = _signal_filters(request, where, params, ident)
+    where += since_clause
+    params += since_params
     # **A CURSOR AND AN OFFSET ARE TWO ANSWERS TO ONE QUESTION**, so taking both
     # would mean silently honouring one. Refusing says which the caller has to
     # choose, and an offset that arrived as the default zero is not a choice.
@@ -9046,26 +9585,37 @@ async def list_signals(request: Request):
             return err
         where += clause
         params += cursor_params
-    conn = store.connect()
-    try:
-        # **TWO-TIER SOURCE, ALWAYS** (archives-cold-tier.md §1 row 4) — this
-        # route pages and counts across the whole set, so cold must be
-        # attached and read unconditionally, not only once a hot miss is
-        # found. Attaching here, before `cold` is first referenced, is what
-        # the `unreferenced_by` clause `_signal_filters` may have already
-        # embedded into `where` depends on.
-        reason = store.attach_cold_or_reason(conn, readonly=True)
-        if reason:
-            return refusals.refuse(503, f"the archive tier is unavailable: {reason}")
-        source = store.signals_source()
-        total = conn.execute(
-            f"SELECT COUNT(*) FROM {source} AS signals {where}",
-            params).fetchone()[0]
-        rows = conn.execute(
-            f"SELECT * FROM {source} AS signals {where} ORDER BY {order_clause} "
-            f"LIMIT ? OFFSET ?", [*params, limit, 0 if cursor else offset]).fetchall()
-    finally:
-        conn.close()
+
+    # **OFF THE EVENT LOOP** (CQ·76), for the reason `signal_facets` gives:
+    # the count spans the whole signal set, about 65ms per call on
+    # 2026-10-12 and 1.4s on a cold page cache.
+    def _read():
+        conn = store.connect()
+        try:
+            # **TWO-TIER SOURCE, ALWAYS** (archives-cold-tier.md §1 row 4) — this
+            # route pages and counts across the whole set, so cold must be
+            # attached and read unconditionally, not only once a hot miss is
+            # found. Attaching here, before `cold` is first referenced, is what
+            # the `unreferenced_by` clause `_signal_filters` may have already
+            # embedded into `where` depends on.
+            reason = store.attach_cold_or_reason(conn, readonly=True)
+            if reason:
+                return None, None, refusals.refuse(
+                    503, f"the archive tier is unavailable: {reason}")
+            source = store.signals_source()
+            total = conn.execute(
+                f"SELECT COUNT(*) FROM {source} AS signals {where}",
+                params).fetchone()[0]
+            rows = conn.execute(
+                f"SELECT * FROM {source} AS signals {where} ORDER BY {order_clause} "
+                f"LIMIT ? OFFSET ?", [*params, limit, 0 if cursor else offset]).fetchall()
+        finally:
+            conn.close()
+        return total, rows, None
+
+    total, rows, refusal = await run_in_threadpool(_read)
+    if refusal:
+        return refusal
     # `total` counts what REMAINS on a cursor page, because the cursor clause is
     # part of the filter. That is the honest number for a walk — a caller
     # resuming has no use for a count of rows it has already read — and it is why
@@ -9124,6 +9674,9 @@ async def search_signals(request: Request):
         return err
     if not identity.authorized(ident, "signal.read"):
         return refusals.forbidden("signal.read")
+    if (err := _reject_unknown_params(request, {
+            "q", "kind", "limit", "offset", "source", "product"})):
+        return err
     q = (request.query_params.get("q") or "").strip()
     if not q:
         return refusals.refuse(400, "q is required",
@@ -9415,6 +9968,13 @@ async def signal_facets(request: Request):
         return err
     if not identity.authorized(ident, "signal.read"):
         return refusals.forbidden("signal.read")
+    if (err := _reject_unknown_params(request, {
+            "kind", "source", "stream", "product", "repo",
+            "unreferenced_by", "since"})):
+        return err
+    since_clause, since_params, err = _since_clause(request)
+    if err:
+        return err
     where, params = "WHERE 1 = 1", []
     scope, scope_params = _scope_clause(ident)
     where += scope
@@ -9426,30 +9986,46 @@ async def signal_facets(request: Request):
     where += handoff_wall
     params += handoff_params
     where, params = _signal_filters(request, where, params, ident)
-    conn = store.connect()
-    try:
-        # Two-tier source, always (archives-cold-tier.md §1 row 6) — these
-        # are aggregates over the whole set `GET /signals` would page.
-        reason = store.attach_cold_or_reason(conn, readonly=True)
-        if reason:
-            return refusals.refuse(503, f"the archive tier is unavailable: {reason}")
-        source = store.signals_source()
-        total = conn.execute(
-            f"SELECT COUNT(*) FROM {source} AS signals {where}",
-            params).fetchone()[0]
-        embedded = conn.execute(
-            f"SELECT COUNT(*) FROM {source} AS signals {where} "
-            f"AND embedded_at IS NOT NULL", params).fetchone()[0]
-        by_source = _signal_facet_counts(conn, source, "source", where, params)
-        by_kind = _signal_facet_counts(conn, source, "kind", where, params)
-        products = conn.execute(
-            f"SELECT DISTINCT product FROM {source} AS signals {where} "
-            f"ORDER BY product", params).fetchall()
-    finally:
-        conn.close()
-    return {"total": total, "embedded": embedded,
-            "by_source": by_source, "by_kind": by_kind,
-            "products": [r["product"] for r in products]}
+    where += since_clause
+    params += since_params
+
+    # **OFF THE EVENT LOOP** (CQ·76). These aggregates scan the whole signal
+    # set, about 390ms at 92,549 rows on 2026-10-12 and growing with the
+    # table, and while they ran on the loop one in-flight call raised the
+    # median of twenty concurrent `/health` calls from 28ms to 494ms. The
+    # connection opens inside the callable because a SQLite connection cannot
+    # cross threads.
+    def _build():
+        conn = store.connect()
+        try:
+            # Two-tier source, always (archives-cold-tier.md §1 row 6) — these
+            # are aggregates over the whole set `GET /signals` would page.
+            reason = store.attach_cold_or_reason(conn, readonly=True)
+            if reason:
+                return None, refusals.refuse(
+                    503, f"the archive tier is unavailable: {reason}")
+            source = store.signals_source()
+            total = conn.execute(
+                f"SELECT COUNT(*) FROM {source} AS signals {where}",
+                params).fetchone()[0]
+            embedded = conn.execute(
+                f"SELECT COUNT(*) FROM {source} AS signals {where} "
+                f"AND embedded_at IS NOT NULL", params).fetchone()[0]
+            by_source = _signal_facet_counts(conn, source, "source", where, params)
+            by_kind = _signal_facet_counts(conn, source, "kind", where, params)
+            products = conn.execute(
+                f"SELECT DISTINCT product FROM {source} AS signals {where} "
+                f"ORDER BY product", params).fetchall()
+        finally:
+            conn.close()
+        return {"total": total, "embedded": embedded,
+                "by_source": by_source, "by_kind": by_kind,
+                "products": [r["product"] for r in products]}, None
+
+    result, refusal = await run_in_threadpool(_build)
+    if refusal:
+        return refusal
+    return result
 
 
 @app.get("/signals/acks")
@@ -9485,6 +10061,9 @@ async def signal_acks(request: Request):
         return err
     if not identity.authorized(ident, "signal.ack"):
         return refusals.forbidden("signal.ack")
+    if (err := _reject_unknown_params(
+            request, {"acting_human", "signal_id"})):
+        return err
     payload = {"acting_human": request.query_params.get("acting_human")}
     human, attest_err = identity.attested_human(ident, payload)
     if attest_err:
@@ -9781,6 +10360,9 @@ async def pr_state_latest(request: Request):
         return err
     if not identity.authorized(ident, "signal.read"):
         return refusals.forbidden("signal.read")
+    if (err := _reject_unknown_params(request, {
+            "limit", "offset", "closed_within_days", "repo", "product"})):
+        return err
     limit, offset, err = _page(request)
     if err:
         return err
@@ -9843,22 +10425,34 @@ async def pr_state_latest(request: Request):
     )
     params = ["pr_state", "pr_state", *rank_params, *scope_params,
              *wall_params, since]
-    conn = store.connect()
-    try:
-        reason = store.attach_cold_or_reason(conn, readonly=True)
-        if reason:
-            return refusals.refuse(503, f"the archive tier is unavailable: {reason}")
-        total = conn.execute(
-            f"{cte} SELECT COUNT(*) FROM latest", params).fetchone()[0]
-        rows = conn.execute(
-            f"{cte} SELECT * FROM latest ORDER BY "
-            "json_extract(meta, '$.repo') ASC, "
-            "json_extract(meta, '$.number') DESC "
-            "LIMIT ? OFFSET ?", [*params, limit, offset]).fetchall()
-        ci_by_sha, captured = _pr_ci_for_page(
-            conn, rows, scope, scope_params, wall, wall_params)
-    finally:
-        conn.close()
+
+    # **OFF THE EVENT LOOP** (CQ·76), for the reason `signal_facets` gives:
+    # the window function ranks every `pr_state` row, about 90ms per call on
+    # 2026-10-12.
+    def _read():
+        conn = store.connect()
+        try:
+            reason = store.attach_cold_or_reason(conn, readonly=True)
+            if reason:
+                return None, refusals.refuse(
+                    503, f"the archive tier is unavailable: {reason}")
+            total = conn.execute(
+                f"{cte} SELECT COUNT(*) FROM latest", params).fetchone()[0]
+            rows = conn.execute(
+                f"{cte} SELECT * FROM latest ORDER BY "
+                "json_extract(meta, '$.repo') ASC, "
+                "json_extract(meta, '$.number') DESC "
+                "LIMIT ? OFFSET ?", [*params, limit, offset]).fetchall()
+            ci_by_sha, captured = _pr_ci_for_page(
+                conn, rows, scope, scope_params, wall, wall_params)
+        finally:
+            conn.close()
+        return (total, rows, ci_by_sha, captured), None
+
+    read, refusal = await run_in_threadpool(_read)
+    if refusal:
+        return refusal
+    total, rows, ci_by_sha, captured = read
     prs = []
     for r in rows:
         meta = store._json_or(r["meta"], {})
@@ -9979,6 +10573,8 @@ async def ci_capture_report(request: Request):
         return err
     if not identity.authorized(ident, "signal.read"):
         return refusals.forbidden("signal.read")
+    if (err := _reject_unknown_params(request, set())):
+        return err
 
     scope, scope_params = _scope_clause(ident)
     wall, wall_params = _customer_wall(ident)
@@ -9986,32 +10582,41 @@ async def ci_capture_report(request: Request):
     status = ci_result_fetch.load_status()
     last_fetch_by_key = (status or {}).get("pairs", {})
 
-    conn = store.connect()
-    try:
-        reason = store.attach_cold_or_reason(conn, readonly=True)
-        if reason:
-            return refusals.refuse(503, f"the archive tier is unavailable: {reason}")
+    # **OFF THE EVENT LOOP** (CQ·76), for the reason `signal_facets` gives:
+    # one aggregate per `TRACKED` pair, about 95ms per call on 2026-10-12.
+    def _read():
+        conn = store.connect()
+        try:
+            reason = store.attach_cold_or_reason(conn, readonly=True)
+            if reason:
+                return None, refusals.refuse(
+                    503, f"the archive tier is unavailable: {reason}")
 
-        tracked = []
-        for entry in ci_result_fetch.TRACKED:
-            repo, workflow_file, product = (
-                entry["repo"], entry["workflow_file"], entry["product"])
-            if not identity.in_scope(ident, product):
-                continue
-            count, last_at = _ci_capture_stats(
-                conn, product, repo, workflow_file, scope, scope_params,
-                wall, wall_params)
-            tracked.append({
-                "repo": repo,
-                "workflow_file": workflow_file,
-                "product": product,
-                "test_result_count": count,
-                "last_test_result_at": store._iso(last_at),
-                "last_fetch": last_fetch_by_key.get(
-                    f"{repo}#{workflow_file}"),
-            })
-    finally:
-        conn.close()
+            tracked = []
+            for entry in ci_result_fetch.TRACKED:
+                repo, workflow_file, product = (
+                    entry["repo"], entry["workflow_file"], entry["product"])
+                if not identity.in_scope(ident, product):
+                    continue
+                count, last_at = _ci_capture_stats(
+                    conn, product, repo, workflow_file, scope, scope_params,
+                    wall, wall_params)
+                tracked.append({
+                    "repo": repo,
+                    "workflow_file": workflow_file,
+                    "product": product,
+                    "test_result_count": count,
+                    "last_test_result_at": store._iso(last_at),
+                    "last_fetch": last_fetch_by_key.get(
+                        f"{repo}#{workflow_file}"),
+                })
+        finally:
+            conn.close()
+        return tracked, None
+
+    tracked, refusal = await run_in_threadpool(_read)
+    if refusal:
+        return refusal
 
     never_captured = [t for t in tracked if t["test_result_count"] == 0]
     quiet_this_run = [
@@ -10245,6 +10850,9 @@ async def signal_storage(request: Request):
         return err
     if not identity.authorized(ident, "signal.read"):
         return refusals.forbidden("signal.read")
+    if (err := _reject_unknown_params(request, {
+            "window_days", *_STORAGE_THRESHOLD_PARAMS})):
+        return err
     raw_window = request.query_params.get(
         "window_days", str(storage_report.DEFAULT_GROWTH_WINDOW_DAYS))
     try:
@@ -10348,6 +10956,8 @@ async def get_signal(signal_id: str, request: Request):
     ident, err = _identify(request)
     if err:
         return err
+    if (err := _reject_unknown_params(request, set())):
+        return err
     row, err = _readable_signal(ident, signal_id)
     if err:
         return err
@@ -10368,6 +10978,8 @@ async def get_signal_blob(signal_id: str, request: Request):
     """
     ident, err = _identify(request)
     if err:
+        return err
+    if (err := _reject_unknown_params(request, set())):
         return err
     row, err = _readable_signal(ident, signal_id)
     if err:
@@ -10573,6 +11185,10 @@ async def search_reference(request: Request):
         return err
     if not identity.authorized(ident, "reference.read"):
         return refusals.forbidden("reference.read")
+    if (err := _reject_unknown_params(request, {
+            "q", "limit", "offset", "kind", "project", "status",
+            "audience"})):
+        return err
     q = (request.query_params.get("q") or "").strip()
     if not q:
         return refusals.refuse(400, "q is required",
@@ -10618,8 +11234,7 @@ async def search_reference(request: Request):
         where.append(_audience_clause())
         params.append(audience)
     clause = (" AND " + " AND ".join(where)) if where else ""
-    conn = reference.connect()
-    try:
+    with reference.reading() as conn:
         total = conn.execute(
             "SELECT COUNT(*) FROM docs_fts JOIN docs d ON d.rowid = docs_fts.rowid "
             f"WHERE docs_fts MATCH ?{clause}", params).fetchone()[0]
@@ -10636,8 +11251,6 @@ async def search_reference(request: Request):
             f"WHERE docs_fts MATCH ?{clause} "
             f"ORDER BY bm25(docs_fts, {reference.BM25_WEIGHTS}), d.id LIMIT ? OFFSET ?",
             [*params, limit, offset]).fetchall()
-    finally:
-        conn.close()
     return {"documents": [reference.doc_dict(r, body=False, snippet=r["snip"],
                                              score=reference.score_of(r["rank_raw"]))
                           for r in rows],
@@ -10881,6 +11494,9 @@ async def search_all(request: Request):
     ident, err = _identify(request)
     if err:
         return err
+    if (err := _reject_unknown_params(
+            request, {"q", "limit", "offset", "vault", "product", "kind"})):
+        return err
     limit, offset, err = _page(request)
     if err:
         return err
@@ -10941,8 +11557,7 @@ async def search_all(request: Request):
                 where.append(f"d.status IN ({placeholders})")
                 params.extend(reference.DEFAULT_STATUSES)
                 clause = " AND " + " AND ".join(where)
-                conn = reference.connect()
-                try:
+                with reference.reading() as conn:
                     rows = conn.execute(
                         f"SELECT d.*, {reference.SNIPPET_SQL} AS snip, "
                         f"bm25(docs_fts, {reference.BM25_WEIGHTS}) AS rank_raw "
@@ -10951,8 +11566,6 @@ async def search_all(request: Request):
                         f"ORDER BY bm25(docs_fts, {reference.BM25_WEIGHTS}), "
                         "d.id LIMIT ?",
                         [*params, candidate_n]).fetchall()
-                finally:
-                    conn.close()
             searched.append("reference")
             per_vault_rows["reference"] = [
                 {"vault": "reference", "type": r["kind"], "id": r["id"],
@@ -11188,8 +11801,9 @@ async def reference_topics(request: Request):
         return err
     if not identity.authorized(ident, "reference.read"):
         return refusals.forbidden("reference.read")
-    conn = reference.connect()
-    try:
+    if (err := _reject_unknown_params(request, set())):
+        return err
+    with reference.reading() as conn:
         # **`json_valid` GUARDS THE JOIN, for the same reason the audience
         # filter below carries one** (security-reviewer, PR #47). A single row
         # whose `topics` column is non-NULL and unparseable makes `json_each`
@@ -11217,8 +11831,6 @@ async def reference_topics(request: Request):
             "d, json_each(d.topics) je "
             "GROUP BY je.value ORDER BY n DESC, topic",
             list(reference.DEFAULT_STATUSES)).fetchall()
-    finally:
-        conn.close()
     return {"topics": [{"topic": r["topic"], "documents": r["n"]} for r in rows],
             "count": len(rows)}
 
@@ -11280,6 +11892,10 @@ async def list_reference_documents(request: Request):
         return err
     if not identity.authorized(ident, "reference.read"):
         return refusals.forbidden("reference.read")
+    if (err := _reject_unknown_params(request, {
+            "limit", "offset", "kind", "project", "status", "audience",
+            *SELECTOR_FIELDS})):
+        return err
     limit, offset, err = _page(request)
     if err:
         return err
@@ -11302,8 +11918,7 @@ async def list_reference_documents(request: Request):
     if (audience := request.query_params.get("audience")):
         where.append(_audience_clause())
         params.append(audience)
-    conn = reference.connect()
-    try:
+    with reference.reading() as conn:
         # THE COLUMN IS CHECKED BEFORE THE CLAUSE IS BUILT, because naming a
         # column the table lacks is a PARSE error: an index predating
         # agent-platform#517 has no `frontmatter_extra`, and
@@ -11333,8 +11948,6 @@ async def list_reference_documents(request: Request):
         rows = conn.execute(
             f"SELECT d.* FROM docs d{clause} ORDER BY d.id LIMIT ? OFFSET ?",
             [*params, limit, offset]).fetchall()
-    finally:
-        conn.close()
     return {"documents": [reference.doc_dict(r, body=False, summary=True)
                           for r in rows],
             "count": len(rows), "total": total, "offset": offset,
@@ -11370,13 +11983,12 @@ async def reference_checkout_status(doc_id: str, request: Request):
         return err
     if not identity.authorized(ident, "reference.read"):
         return refusals.forbidden("reference.read")
+    if (err := _reject_unknown_params(request, set())):
+        return err
     doc_id = store.clip(doc_id, store.MAX_DOC_ID)
-    conn = reference.connect()
-    try:
+    with reference.reading() as conn:
         found = conn.execute("SELECT id FROM docs WHERE id = ?",
                              [doc_id]).fetchone()
-    finally:
-        conn.close()
     # 404 ON AN UNINDEXED ID, matching `get_reference_document` and the checkout
     # POST. Answering `checkout: null` for a document that does not exist would
     # report "free" for something nobody can ever take.
@@ -11404,11 +12016,10 @@ async def get_reference_document(doc_id: str, request: Request):
         return err
     if not identity.authorized(ident, "reference.read"):
         return refusals.forbidden("reference.read")
-    conn = reference.connect()
-    try:
+    if (err := _reject_unknown_params(request, set())):
+        return err
+    with reference.reading() as conn:
         row = conn.execute("SELECT * FROM docs WHERE id = ?", [doc_id]).fetchone()
-    finally:
-        conn.close()
     # 404 rather than 403, matching every other read on this service: a 403 would
     # confirm the document exists to an identity that may not know it does.
     if row is None:
@@ -11446,6 +12057,21 @@ async def check_reference_admission(request: Request):
     scoped the way the Chart House and Archives are, and an admission check
     over a document that will itself be unscoped on read should not gain a
     boundary the read side does not have.
+
+    **`audience` and `binds_agents` are checked against the roster
+    `GET /roster` currently serves** (`issue_01M34SYVH2M48K2S0FQK3K6REY`,
+    the operator's ruling, 2026-10-11), read fresh here rather than cached, so a name
+    `PUT /roster/{name}` just added is admitted on the very next request with
+    nothing restarted. `_roster_names` only runs the query when
+    `frontmatter_needs_roster` says either field is actually present, so a
+    document naming neither costs no round trip.
+
+    **`binds_agents` additionally refuses a group or the operator's own
+    marker**, read fresh from the operator config by `_operator_marker_for`
+    only when `binds_agents` names at least one string
+    (`reference_admission.binds_agents_needs_operator_marker`); a config
+    that cannot be read refuses `binds_agents` outright, naming the cause,
+    the same fail-closed shape an empty roster gets.
     """
     ident, err = _identify(request)
     if err:
@@ -11461,7 +12087,12 @@ async def check_reference_admission(request: Request):
     if "frontmatter" not in payload:
         return refusals.refuse(400, "frontmatter is required")
     catalogue = reference_admission.catalogue_for_frontmatter(payload["frontmatter"])
-    errors = reference_admission.validate_frontmatter(payload["frontmatter"], catalogue)
+    roster = (_roster_names()
+              if reference_admission.frontmatter_needs_roster(payload["frontmatter"])
+              else None)
+    marker, marker_errors = _operator_marker_for(payload["frontmatter"])
+    errors = reference_admission.validate_frontmatter(
+        payload["frontmatter"], catalogue, roster, marker) + marker_errors
     checked = [reference_admission.CLAUSE_FRONTMATTER]
     refused = [reference_admission.CLAUSE_FRONTMATTER] if errors else []
 
@@ -11575,6 +12206,11 @@ async def promote_reference_document(request: Request):
     Room checkout to hold on a document that is not there yet. Admission's
     checkout clause is for editing a document that already exists; this route
     says so rather than silently omitting it.
+
+    **`audience`/`binds_agents` run against the live roster, the same as
+    `POST /reference/admission`** — see that route's docstring; an agent
+    definition promoted with an unrostered value in either field is refused
+    on the frontmatter clause exactly as a pull request would be.
     """
     ident, err = _identify(request)
     if err:
@@ -11603,7 +12239,11 @@ async def promote_reference_document(request: Request):
 
     fm = payload["frontmatter"]
     catalogue = reference_admission.catalogue_for_frontmatter(fm)
-    errors = reference_admission.validate_frontmatter(fm, catalogue)
+    roster = (_roster_names()
+              if reference_admission.frontmatter_needs_roster(fm) else None)
+    marker, marker_errors = _operator_marker_for(fm)
+    errors = reference_admission.validate_frontmatter(
+        fm, catalogue, roster, marker) + marker_errors
     checked = [reference_admission.CLAUSE_FRONTMATTER]
     refused = [reference_admission.CLAUSE_FRONTMATTER] if errors else []
     # RUN EVEN WHEN THE FRONTMATTER ALREADY FAILED, so a caller sees both
@@ -11619,6 +12259,36 @@ async def promote_reference_document(request: Request):
     return {"may_land": not errors, "errors": errors,
             "clauses_checked": checked, "clauses_refused": refused,
             "acting_human": human, "attested_by": ident.actor}
+
+
+def _roster_names() -> frozenset[str]:
+    """The names `GET /roster` would answer right now, read fresh rather than
+    cached — a name `PUT /roster/{name}` just added must be admitted on the
+    very next request with nothing restarted, the same freshness that route
+    itself has by reading the table on every call."""
+    conn = store.connect()
+    try:
+        return frozenset(row["name"] for row in crew_profiles.roster(conn))
+    finally:
+        conn.close()
+
+
+def _operator_marker_for(fm) -> tuple[str | None, list[str]]:
+    """The operator marker to pass into `validate_frontmatter`, read fresh
+    only when `binds_agents` would actually be compared against it
+    (`reference_admission.binds_agents_needs_operator_marker`) — an
+    `audience`-only document costs no read, matching `_roster_names`'s own
+    gating.
+
+    Fails closed the same shape an empty roster does: when the config
+    cannot be read, `binds_agents` is refused outright, naming the cause,
+    rather than validated against a marker this request never had."""
+    if not reference_admission.binds_agents_needs_operator_marker(fm):
+        return None, []
+    try:
+        return operator_marker.read_marker(), []
+    except operator_marker.OperatorMarkerUnavailable:
+        return None, ["binds_agents: the operator marker could not be read"]
 
 
 def _live_checkout_holder(doc_id: str) -> str | None:
@@ -11699,12 +12369,9 @@ async def checkout_reference_document(doc_id: str, request: Request):
                  "service issues no human identity until the Library mints "
                  "its own tokens")
     doc_id = store.clip(doc_id, store.MAX_DOC_ID)
-    conn = reference.connect()
-    try:
+    with reference.reading() as conn:
         found = conn.execute("SELECT id FROM docs WHERE id = ?",
                              [doc_id]).fetchone()
-    finally:
-        conn.close()
     # 404 rather than 403, matching `get_reference_document`: a 403 would
     # confirm the document exists to an identity that may not know it does.
     if found is None:
@@ -11915,6 +12582,8 @@ async def list_roster(request: Request):
         return err
     if not identity.authorized(ident, "roster.read"):
         return refusals.forbidden("roster.read")
+    if (err := _reject_unknown_params(request, set())):
+        return err
     conn = store.connect()
     try:
         agents = crew_profiles.roster(conn)
@@ -11944,6 +12613,15 @@ async def add_roster_name(name: str, request: Request):
         return refusals.forbidden("roster.write")
     except crew_registry.InvalidRosterRow as e:
         return refusals.refuse(400, str(e))
+    except crew_registry.RosterNameWithheld:
+        # The same 404 a missing name gets elsewhere on this service, so the
+        # roster is no oracle for which names belong to black-box crews.
+        return refusals.not_found()
+    except crew_registry.RegistryUnreadable as e:
+        return refusals.refuse(
+            503, str(e),
+            hint="retry once the registry at the configured path is "
+                 "readable again")
     except store.WritesDisabled as e:
         return refusals.refuse(503, "the Library is not the write path yet",
                                hint=str(e))
@@ -11995,6 +12673,8 @@ async def list_profiles(request: Request):
         return err
     if not identity.authorized(ident, "roster.read"):
         return refusals.forbidden("roster.read")
+    if (err := _reject_unknown_params(request, set())):
+        return err
     await run_in_threadpool(profile_sync.refresh)
     conn = store.connect()
     try:
@@ -12052,6 +12732,8 @@ async def resolve_profile(project: str, variant: str, request: Request):
         return err
     if not identity.authorized(ident, "roster.read"):
         return refusals.forbidden("roster.read")
+    if (err := _reject_unknown_params(request, set())):
+        return err
     await run_in_threadpool(profile_sync.refresh)
     conn = store.connect()
     try:
@@ -12060,11 +12742,12 @@ async def resolve_profile(project: str, variant: str, request: Request):
         conn.close()
     if row is None:
         return refusals.not_found()
-    index_conn = reference.connect()
-    try:
+    # An index the watcher replaced between the open and this read raises
+    # in the read rather than in `connect()`; `reading()` raises it as the
+    # open's failure, so the registered handler answers the same 503
+    # (issue_01M229WQ78Y6AV9RPVM5JSSNJF).
+    with reference.reading() as index_conn:
         docs, counts = crew_profiles.resolve_counted(row, index_conn)
-    finally:
-        index_conn.close()
     return {
         "profile": {"project": row["project"], "variant": row["variant"],
                     "updated_at": row["updated_at"],
@@ -12076,29 +12759,79 @@ async def resolve_profile(project: str, variant: str, request: Request):
     }
 
 
+def _effective_projects(person_id: str, ident: identity.Identity):
+    """`({"projects": [...], "count": n}, None)` for `person_id`'s EFFECTIVE
+    set — the projects `person_id` created by the registry's own record,
+    plus an explicit grant, minus an explicit removal
+    (issue_01M2RSFKJBEHD5Y76X0B6XAYZG) — bounded by `ident`'s own scope; or
+    `(None, refusal)` when the project registry cannot be read. Shared by
+    `GET /people/{person_id}/projects` and `POST /people/by-email/projects`,
+    so the two answer the same question the same way.
+
+    **Answered out of `person_products`, `person_product_removals` and the
+    registry, with no lookup of `people` at all.** An unknown person and a
+    person with an empty effective set must return the same response, field
+    for field, including status code — the same argument `app.py`'s
+    existence-probe comments make elsewhere for products and for items.
+    Looking `people` up first would hand back a display name for one case
+    and nothing for the other, which is the leak this helper exists not to
+    have; an unknown person has no registry-recorded creations and no rows
+    in either table, so it reads as an empty effective set for the same
+    reason it always read as zero grants. A caller may pass a `person_id`
+    that matches no row at all — SQLite's `person_id = ?` never matches a
+    `NULL` parameter either, so passing `None` reads the same way.
+
+    **`_scope_clause` (`app.py:1056`) bounds the two tables; `identity.in_scope`
+    bounds the registry-derived default, since that half never reaches SQL.**
+    The whole security design here is that a project outside the caller's
+    own product scope is never read out of the database, and never added
+    from the registry, in the first place — filtering afterward is how a
+    total ends up counting a row the caller may not see, which is exactly
+    the failure mode `_scope_clause`'s own docstring names. This is also why
+    the answer is safe for a scoped `approved_client` credential and not
+    merely safe today because the sole caller so far, `orient`, holds
+    `products: ["*"]`.
+
+    **Fails CLOSED on an unreadable registry**, unlike `projects.resolve()`
+    on its own: `projects.slugs_created_by()` returns `None` rather than an
+    empty list when the registry cannot be read, and this refuses rather
+    than serving a default computed from no registry — the same distinction
+    `_merge_repo_scope` draws for `projects.available()`. An unreadable
+    registry must not read as "created nothing".
+    """
+    default_all = projects.slugs_created_by(person_id)
+    if default_all is None:
+        return None, refusals.refuse(503, "the project registry is unavailable")
+    default = {p for p in default_all if identity.in_scope(ident, p)}
+    scope, scope_params = _scope_clause(ident)
+    conn = store.connect()
+    try:
+        held = {r["product"] for r in conn.execute(
+            f"SELECT product FROM person_products WHERE person_id = ?{scope} "
+            f"ORDER BY product",
+            [person_id, *scope_params]).fetchall()}
+        # A removal only ever names a default project, so an empty `default`
+        # (after scoping) means nothing could be in `removed` either —
+        # queried only when `default` is non-empty, which also keeps this
+        # working for a person the registry names no creations for against a
+        # schema predating `person_product_removals` (`store.change_person_products`
+        # draws the same line).
+        removed = {r["product"] for r in conn.execute(
+            f"SELECT product FROM person_product_removals WHERE "
+            f"person_id = ?{scope} ORDER BY product",
+            [person_id, *scope_params]).fetchall()} if default else set()
+    finally:
+        conn.close()
+    effective = sorted((default - removed) | held)
+    return {"projects": effective, "count": len(effective)}, None
+
+
 @app.get("/people/{person_id}/projects")
 async def person_projects(person_id: str, request: Request):
     """Which projects `person_id` may see — the first slice of person
-    identity in the Library (issue_01M2RSE08WRRB1RJY1ZCSMD6EG).
-
-    **Answered entirely out of `person_products`, with no lookup of `people`
-    at all.** An unknown person and a person with nothing granted must
-    return the same response, field for field, including status code — the
-    same argument `app.py`'s existence-probe comments make elsewhere for
-    products and for items. Looking `people` up first would hand back a
-    display name for one case and nothing for the other, which is the leak
-    this route exists not to have; querying only the grant table gives both
-    cases the same zero rows for the same reason, by construction rather
-    than by a special case that compares the two afterward.
-
-    **`_scope_clause` (`app.py:1056`), not a filter on the rows this query
-    returns.** The whole security design of this route is that a project
-    outside the caller's own product scope is never read out of the
-    database in the first place — filtering afterward is how a total ends
-    up counting a row the caller may not see, which is exactly the failure
-    mode `_scope_clause`'s own docstring names. This is also why the answer
-    is safe for a scoped `approved_client` credential and not merely safe
-    today because the sole caller so far, `orient`, holds `products: ["*"]`.
+    identity in the Library (issue_01M2RSE08WRRB1RJY1ZCSMD6EG). The effective
+    set itself is `_effective_projects`, shared with `POST
+    /people/by-email/projects`.
 
     **`person_id` is its own path parameter, and `acting_human` is never
     read on this route at all.** `attested_human` exists to record who a
@@ -12115,17 +12848,12 @@ async def person_projects(person_id: str, request: Request):
         return err
     if not identity.authorized(ident, "person.read"):
         return refusals.forbidden("person.read")
-    scope, scope_params = _scope_clause(ident)
-    conn = store.connect()
-    try:
-        rows = conn.execute(
-            f"SELECT product FROM person_products WHERE person_id = ?{scope} "
-            f"ORDER BY product",
-            [person_id, *scope_params]).fetchall()
-    finally:
-        conn.close()
-    projects = [row["product"] for row in rows]
-    return {"projects": projects, "count": len(projects)}
+    if (err := _reject_unknown_params(request, set())):
+        return err
+    result, refusal = _effective_projects(person_id, ident)
+    if refusal:
+        return refusal
+    return result
 
 
 def _project_names(payload: dict, field: str):
@@ -12178,6 +12906,206 @@ def _project_names(payload: dict, field: str):
     return sorted(set(names)), None
 
 
+def _parse_email(raw) -> tuple["str | None", "JSONResponse | None"]:
+    """A plausible single email address, trimmed and lower-cased, or a 400.
+
+    **Exactly the three checks the item's spec names, no more**: one `"@"`,
+    no whitespace anywhere in it, and a bounded length
+    (`store.MAX_EMAIL`) — never an attempt at validating deliverability, a
+    domain shape, or anything RFC 5322 would additionally require. Trimmed
+    before the whitespace check runs, so a leading or trailing space is not
+    itself a refusal; one appearing anywhere else in the string is.
+    """
+    if not isinstance(raw, str):
+        return None, refusals.refuse(400, "email must be a string")
+    trimmed = raw.strip()
+    if not trimmed:
+        return None, refusals.refuse(400, "email must not be empty")
+    if any(c.isspace() for c in trimmed):
+        return None, refusals.refuse(400, "email must not contain whitespace")
+    if trimmed.count("@") != 1:
+        return None, refusals.refuse(
+            400, "email must contain exactly one '@'")
+    if len(trimmed) > store.MAX_EMAIL:
+        return None, refusals.refuse(
+            400, f"email is longer than {store.MAX_EMAIL} characters")
+    return trimmed.lower(), None
+
+
+@app.post("/people", status_code=201)
+async def create_person(request: Request):
+    """Create a person record. Body: `{"display_name": "<string>", "email":
+    "<address>"}`, `email` optional. Grant projects afterwards with `POST
+    /people/{person_id}/projects` and correct the email with `PUT
+    /people/{person_id}/email`.
+
+    **GATED EXACTLY AS `POST /people/{person_id}/projects` AND `PUT
+    /people/{person_id}/email` ARE, for the same reason**: `person.write`
+    (approved-client credentials only) and a row in `administrators` for
+    `ident.actor`. `acting_human` is never read here, for the reason those
+    two routes' own docstrings give in full.
+
+    **EVERY REFUSAL BEFORE THE BODY IS ONE RESPONSE, BYTE FOR BYTE, THE SAME
+    ONE THOSE TWO ROUTES GIVE A NON-ADMINISTRATOR.** No credential, an
+    unresolvable one, a credential lacking `person.write`, and a credential
+    that is not an administrator's all return `refusals.not_found()`. There
+    is no person named in the path for this route to 404 on finding
+    missing, so the fourth byte-identical case those two routes list
+    (an administrator naming a person who does not exist) has no
+    counterpart here.
+
+    **The body is read only after that gate**, so a malformed body or a
+    validation 400 is seen only by a verified administrator.
+
+    `display_name` must be a string, non-empty once stripped, and at most
+    `store.MAX_DISPLAY_NAME` characters — `people.display_name`'s own
+    column width (`76bfd9912739`), the same bound `bootstrap_library.py`
+    holds the first administrator's name to. `email`, when given, is
+    validated and normalised by the same `_parse_email` `PUT
+    /people/{person_id}/email` uses, and is unique-checked inside
+    `store.create_person`'s own write lock the way `set_person_email`
+    checks its own — a 409 on a held email never names the other holder,
+    for the reason that route's own docstring gives.
+
+    **The person row and the email write are one transaction**
+    (`store.create_person`), so a refused email leaves no person behind.
+
+    This never creates an administrator, mints no credential, and grants no
+    project: a new person starts with the default set alone (the projects
+    the registry records them as having created, which for a new id is
+    none).
+    """
+    ident, err = _identify(request)
+    refused = refusals.not_found()
+    if err or ident.kind != "approved_client" or not identity.authorized(
+            ident, "person.write"):
+        return refused
+    conn = store.connect()
+    try:
+        allowed = store.is_administrator(conn, ident.actor)
+    finally:
+        conn.close()
+    if not allowed:
+        return refused
+    try:
+        payload = await request.json()
+    except (ValueError, TypeError):
+        return refusals.refuse(400, "body must be a JSON object")
+    if not isinstance(payload, dict):
+        return refusals.refuse(400, "body must be a JSON object")
+    raw_name = payload.get("display_name")
+    if not isinstance(raw_name, str):
+        return refusals.refuse(400, "display_name must be a string")
+    display_name = raw_name.strip()
+    if not display_name:
+        return refusals.refuse(400, "display_name must not be empty")
+    if len(display_name) > store.MAX_DISPLAY_NAME:
+        return refusals.refuse(
+            400, f"display_name is longer than {store.MAX_DISPLAY_NAME} "
+                 f"characters")
+    email = None
+    if payload.get("email") is not None:
+        email, bad = _parse_email(payload["email"])
+        if bad:
+            return bad
+    try:
+        result = await run_in_threadpool(
+            store.create_person, ident.actor, display_name, email)
+    except store.WritesDisabled as e:
+        return refusals.refuse(503, "the Library is not the write path yet",
+                               hint=str(e))
+    if result is None:
+        # The administrator went away between the read above and the write
+        # lock, so this is the refusal the read would have given.
+        return refused
+    if result is store.EMAIL_TAKEN:
+        return refusals.refuse(409, "this email is already in use")
+    return {"person_id": result["person_id"],
+            "display_name": result["display_name"],
+            "sign_in_email": result["email"], "created_by": ident.actor}
+
+
+@app.post("/people/by-email/projects")
+async def person_projects_by_email(request: Request):
+    """Which projects a sign-in email's person may see — the sixth slice of
+    person identity in the Library (issue_01M4QQZ7VTANJ5ZGF630DCB0Y7). Body:
+    `{"email": "<address>"}`. Answers in exactly the shape `GET
+    /people/{person_id}/projects` does, bounded by the CALLER's own product
+    scope.
+
+    **REGISTERED AHEAD OF `POST /people/{person_id}/projects` ON PURPOSE.**
+    Both match the path shape `/people/{X}/projects` by HTTP method, and a
+    router tries routes in registration order — `by-email` would otherwise
+    be consumed as a `person_id` by the older, more general route and this
+    one would never be reached. A test sends a real request rather than
+    asserting on source order, since source order is the thing that could
+    silently stop mattering.
+
+    **The email goes in the body, never the path or the query string**, so
+    it stays out of access logs the way a path parameter or a query string
+    would not. `_parse_email` applies the same three checks writing one
+    does, and normalises the same way, so a caller that wrote an address in
+    any casing still matches the row `PUT /people/{person_id}/email` stored
+    lower-cased.
+
+    **For a person in `administrators`, the answer is every project the
+    CALLER's scope reaches, computed here rather than left to the client.**
+    The epic's own words are that a client must never branch on the role —
+    an administrator's answer is not "all projects" unqualified, it is
+    bounded by `identity.in_scope` exactly as an ordinary person's is, so a
+    scoped credential asking about an administrator sees only what it could
+    already see. Fails CLOSED with 503 on an unreadable registry, the same
+    distinction `_effective_projects` draws for an ordinary person's default,
+    because "every project this scope reaches" computed from no registry is
+    not an answer this route can stand behind.
+
+    **An email naming no person answers exactly like a person with an empty
+    set**, because it falls through to `_effective_projects` with no
+    `person_id` any row can match — the same `person_id = ?` comparison
+    against a NULL parameter that makes an unknown string `person_id` read
+    as empty on the sibling route, so this needs no extra case for it. A
+    person named in `administrators` is looked up by their resolved
+    `person_id` before that fallthrough, so an unknown email is never
+    mistaken for an administrator's.
+
+    **Gated exactly as `GET /people/{person_id}/projects` is**: `person.read`,
+    nothing more — the credential need not be an administrator's own, since
+    this is the read route Orient, Deck and the Bosun already hold, now
+    reachable by email instead of by id.
+    """
+    ident, err = _identify(request)
+    if err:
+        return err
+    if not identity.authorized(ident, "person.read"):
+        return refusals.forbidden("person.read")
+    try:
+        payload = await request.json()
+    except (ValueError, TypeError):
+        return refusals.refuse(400, "body must be a JSON object")
+    if not isinstance(payload, dict):
+        return refusals.refuse(400, "body must be a JSON object")
+    email, bad = _parse_email(payload.get("email"))
+    if bad:
+        return bad
+    conn = store.connect()
+    try:
+        person_id = store.person_id_by_email(conn, email)
+        is_admin = person_id is not None and store.is_administrator(
+            conn, person_id)
+    finally:
+        conn.close()
+    if is_admin:
+        if not projects.available():
+            return refusals.refuse(503, "the project registry is unavailable")
+        effective = sorted(p for p in projects.projects()
+                           if identity.in_scope(ident, p))
+        return {"projects": effective, "count": len(effective)}
+    result, refusal = _effective_projects(person_id, ident)
+    if refusal:
+        return refusal
+    return result
+
+
 @app.post("/people/{person_id}/projects")
 async def change_person_projects(person_id: str, request: Request):
     """Grant and revoke projects for `person_id` — the third slice of person
@@ -12213,13 +13141,22 @@ async def change_person_projects(person_id: str, request: Request):
 
     **The body is read only after all of that**, so a malformed body is never a
     second way to tell a refused caller from an administrator. A 400, a 403 for
-    scope, or a 503 is seen only by a verified administrator naming a real
-    person.
+    scope, or a 503 (write path disabled, or the project registry unreadable)
+    is seen only by a verified administrator naming a real person.
 
     **Each product named must be inside the caller's own product scope**
     (`identity.in_scope`), or the whole request is refused before anything is
     written. A scoped administrator credential could otherwise grant a product
     it cannot see, which the read route would then hide from it.
+
+    **A grant or revoke that touches a default project — one this person
+    created, by the registry's own record — reads and writes
+    `person_product_removals` rather than `person_products`**: see
+    `store.change_person_products`. This route resolves the default with
+    `projects.slugs_created_by()` and fails CLOSED, as `GET
+    /people/{person_id}/projects` does, when the registry cannot be read —
+    an unavailable registry must not read as "created nothing" and silently
+    treat every default project as an ordinary grant.
 
     Grants and revocations are recorded in `person_product_changes` with the
     administrator and the time (`0652cc6b2cee`); a request that changes nothing
@@ -12286,9 +13223,13 @@ async def change_person_projects(person_id: str, request: Request):
         return refusals.refuse(
             403, "this credential's product scope does not cover every "
                  "project named", projects=outside)
+    default = projects.slugs_created_by(person_id)
+    if default is None:
+        return refusals.refuse(503, "the project registry is unavailable")
     try:
         changed = await run_in_threadpool(
-            store.change_person_products, ident.actor, person_id, grant, revoke)
+            store.change_person_products, ident.actor, person_id, grant, revoke,
+            default)
     except store.WritesDisabled as e:
         return refusals.refuse(503, "the Library is not the write path yet",
                                hint=str(e))
@@ -12298,6 +13239,168 @@ async def change_person_projects(person_id: str, request: Request):
         return refused
     return {"person_id": person_id, "granted": changed["granted"],
             "revoked": changed["revoked"], "changed_by": ident.actor}
+
+
+@app.put("/people/{person_id}/email")
+async def set_person_email(person_id: str, request: Request):
+    """Set or clear `person_id`'s sign-in email — the fifth slice of person
+    identity in the Library (issue_01M4QQZ7VTANJ5ZGF630DCB0Y7). Body:
+    `{"email": "<address>"}` sets it, `{"email": null}` clears it. Read it
+    back with `POST /people/by-email/projects`.
+
+    **GATED EXACTLY AS `POST /people/{person_id}/projects` IS, for the same
+    reason**: `person.write` (approved-client credentials only) and a row in
+    `administrators` for `ident.actor`. `acting_human` is never read here,
+    and every refusal before the body is read is the same `refusals.not_found()`
+    — no credential, an unresolvable one, a non-administrator, and an
+    administrator naming a person who does not exist are byte-identical, for
+    the reasons that route's own docstring gives in full.
+
+    **The body is read only after all of that**, so a 400 for a malformed
+    email or a 409 for one another person holds is seen only by a verified
+    administrator naming a real person. `_parse_email` does the same three
+    checks — one `"@"`, no whitespace, a bounded length — whether this call
+    is setting an email or `POST /people/by-email/projects` is reading by
+    one, and stores it trimmed and lower-cased, so the unique index in
+    `ad6a0a903c09` compares the same value every write produces.
+
+    **A 409 on a held email never names the other person.** `email` is
+    looked up and compared to `person_id` inside `store.set_person_email`'s
+    own write lock, and the refusal says only that the address is taken —
+    the same discipline `change_person_products`'s own docstring explains
+    for a lease conflict, applied here because the other holder's identity
+    is not this caller's to learn.
+
+    **Every set or clear is recorded with its administrator and time**, in
+    `person_email_changes`, the way a change to the project set is recorded
+    in `person_product_changes` (`0652cc6b2cee`).
+    """
+    ident, err = _identify(request)
+    refused = refusals.not_found()
+    if err or ident.kind != "approved_client" or not identity.authorized(
+            ident, "person.write"):
+        return refused
+    conn = store.connect()
+    try:
+        allowed = (store.is_administrator(conn, ident.actor)
+                   and store.person_exists(conn, person_id))
+    finally:
+        conn.close()
+    if not allowed:
+        return refused
+    try:
+        payload = await request.json()
+    except (ValueError, TypeError):
+        return refusals.refuse(400, "body must be a JSON object")
+    if not isinstance(payload, dict) or "email" not in payload:
+        return refusals.refuse(
+            400, 'body must be a JSON object with an "email" field '
+                 '(a string, or null to clear)')
+    raw = payload["email"]
+    if raw is None:
+        email = None
+    else:
+        email, bad = _parse_email(raw)
+        if bad:
+            return bad
+    try:
+        result = await run_in_threadpool(
+            store.set_person_email, ident.actor, person_id, email)
+    except store.WritesDisabled as e:
+        return refusals.refuse(503, "the Library is not the write path yet",
+                               hint=str(e))
+    if result is None:
+        # The administrator or the person went away between the read above
+        # and the write lock, so this is the refusal the read would have
+        # given.
+        return refused
+    if result is store.EMAIL_TAKEN:
+        return refusals.refuse(409, "this email is already in use")
+    return {"person_id": person_id, "email": result["email"],
+            "changed_by": ident.actor}
+
+
+@app.get("/people/{person_id}/projects/report")
+async def person_projects_report(person_id: str, request: Request):
+    """The administrator's view of `person_id`'s projects — the fourth slice
+    of person identity in the Library (issue_01M2RSFKJBEHD5Y76X0B6XAYZG): the
+    effective set, the default it was derived from, and each grant or
+    removal that differs from the default.
+
+    **Gated exactly as `POST /people/{person_id}/projects` is, and for the
+    same reason**: `person.write` (not `person.read` — this is the
+    administrator's own view, not the three-caller read route above) plus a
+    row in `administrators` for `ident.actor`. A non-administrator's refusal
+    is the same `refusals.not_found()` a missing person gets, byte for byte,
+    so this route discloses nothing a probing caller could not already get
+    from the write route's own refusal.
+
+    **Fails CLOSED on an unreadable registry**, after the administrator gate
+    rather than before it — a malformed-body-shaped failure is seen only by a
+    verified administrator naming a real person, the same ordering the write
+    route uses for its own 503s.
+
+    **`default`, `projects` and `deviations` are each bounded by the caller's
+    own scope**: the two tables through `_scope_clause`, the registry-derived
+    default through `identity.in_scope`, for `GET /people/{person_id}/projects`'s
+    own reason — a scoped administrator must not see, or learn the shape of,
+    a project outside what its credential already reaches.
+
+    **A deviation names the project, which action it is (`"grant"` — held
+    beyond the default, or `"removal"` — a default no longer held), who made
+    it and when.** An explicit grant that happens to equal a default project
+    is not a deviation: nothing differs from the default, so nothing is
+    listed — `store.change_person_products` never writes such a grant row in
+    the first place, but a grant made by hand before this slice, or before a
+    registry change made the project this person's default, is read the same
+    way rather than flagged.
+    """
+    ident, err = _identify(request)
+    refused = refusals.not_found()
+    if err or ident.kind != "approved_client" or not identity.authorized(
+            ident, "person.write"):
+        return refused
+    conn = store.connect()
+    try:
+        allowed = (store.is_administrator(conn, ident.actor)
+                   and store.person_exists(conn, person_id))
+        if not allowed:
+            return refused
+        # After the administrator check, so the 400 tells nobody the 404
+        # hides that this route exists (issue_01M1MTCTH3PW0DWDEXAZA5KFET).
+        if (err := _reject_unknown_params(request, set())):
+            return err
+        default_all = projects.slugs_created_by(person_id)
+        if default_all is None:
+            return refusals.refuse(503, "the project registry is unavailable")
+        default_set = {p for p in default_all if identity.in_scope(ident, p)}
+        scope, scope_params = _scope_clause(ident)
+        held_rows = conn.execute(
+            f"SELECT product, granted_by, granted_at FROM person_products "
+            f"WHERE person_id = ?{scope} ORDER BY product",
+            [person_id, *scope_params]).fetchall()
+        # See `GET /people/{person_id}/projects` for why this is skipped
+        # when `default_set` is empty.
+        removed_rows = conn.execute(
+            f"SELECT product, removed_by, removed_at FROM "
+            f"person_product_removals WHERE person_id = ?{scope} "
+            f"ORDER BY product",
+            [person_id, *scope_params]).fetchall() if default_set else []
+    finally:
+        conn.close()
+    held = {r["product"]: r for r in held_rows}
+    removed = {r["product"]: r for r in removed_rows}
+    effective = sorted((default_set - set(removed)) | set(held))
+    deviations = sorted((
+        [{"project": p, "action": "grant",
+          "by": r["granted_by"], "at": r["granted_at"]}
+         for p, r in held.items() if p not in default_set]
+        + [{"project": p, "action": "removal",
+            "by": r["removed_by"], "at": r["removed_at"]}
+           for p, r in removed.items() if p in default_set]
+    ), key=lambda d: d["project"])
+    return {"person_id": person_id, "projects": effective, "count": len(effective),
+            "default": sorted(default_set), "deviations": deviations}
 
 
 # --- signal acknowledgment (ADR-0038) ------------------------------------------
@@ -12461,6 +13564,8 @@ async def policy_version(request: Request):
         return err
     if not identity.authorized(ident, "policy.read"):
         return refusals.forbidden("policy.read")
+    if (err := _reject_unknown_params(request, set())):
+        return err
     version = await run_in_threadpool(store.policy_version)
     return {"version": version}
 
@@ -12484,6 +13589,9 @@ async def resolve_policy(request: Request):
         return err
     if not identity.authorized(ident, "policy.read"):
         return refusals.forbidden("policy.read")
+    if (err := _reject_unknown_params(
+            request, {"agent", "crew", "model"})):
+        return err
     # **STRIPPED BEFORE THE LOOKUP, not merely before the required-field
     # check** (reviewer, PR #41). This is an exact-match table by design (no
     # wildcards, per the ADR), so two spellings of "the same combination" that
@@ -12511,6 +13619,43 @@ async def resolve_policy(request: Request):
         "default": store.POLICY_ALLOW,
         "version": version,
     }
+
+
+def _policy_key(payload: dict) -> tuple[dict | None, JSONResponse | None]:
+    """The (agent, crew, model, target) combination a policy write or removal
+    names, each field stripped and bounded, or a refusal. Shared by `PUT` and
+    `DELETE /policy` so the two cannot disagree about which row a body names.
+
+    **STRIPPED BEFORE VALIDATION AND BEFORE STORAGE** (reviewer, PR #41),
+    matching the convention this file already follows for every other
+    identifier-shaped field meant for exact matching (`acting_human` via
+    `identity.attested_human`, `dec_id.strip()`, `run_id.strip()`
+    elsewhere). This table has no wildcard matching by design, so a value
+    stored with incidental whitespace is a row no real lookup ever finds
+    again — a write that returns 200 and then does nothing.
+
+    **THE TYPE CHECK GATES REJECTION; STRIPPING IS A SEPARATE STEP**
+    (reviewer, PR #41, round 2). The first pass at this fix let `isinstance`
+    decide only whether to strip, which is not the same check as deciding
+    whether to refuse: a truthy non-string reached `len()` uncaught (a 500 on
+    `{"agent": 12345}`) or, for a truthy container, passed straight through
+    to `store.clip`, whose documented behaviour turns a non-string into an
+    empty string — a write returning 200 for a row no real caller could ever
+    address, the identical failure class this whole fix exists to close."""
+    stripped = {}
+    for field in ("agent", "crew", "model", "target"):
+        value = payload.get(field)
+        if not isinstance(value, str):
+            return None, refusals.refuse(400, f"{field} is required")
+        value = value.strip()
+        if not value:
+            return None, refusals.refuse(400, f"{field} is required")
+        if len(value) > store.MAX_POLICY_FIELD:
+            return None, refusals.refuse(
+                400, f"{field} is longer than {store.MAX_POLICY_FIELD} "
+                     f"characters")
+        stripped[field] = value
+    return stripped, None
 
 
 @app.put("/policy")
@@ -12548,35 +13693,9 @@ async def write_policy(request: Request):
     human, attest_err = identity.attested_human(ident, payload)
     if attest_err:
         return refusals.refuse(403, attest_err["error"])
-    # **STRIPPED BEFORE VALIDATION AND BEFORE STORAGE** (reviewer, PR #41),
-    # matching the convention this file already follows for every other
-    # identifier-shaped field meant for exact matching (`acting_human` via
-    # `identity.attested_human`, `dec_id.strip()`, `run_id.strip()`
-    # elsewhere). This table has no wildcard matching by design, so a value
-    # stored with incidental whitespace is a row no real lookup ever finds
-    # again — a write that returns 200 and then does nothing.
-    stripped = {}
-    for field in ("agent", "crew", "model", "target"):
-        value = payload.get(field)
-        # **THE TYPE CHECK GATES REJECTION; STRIPPING IS A SEPARATE STEP**
-        # (reviewer, PR #41, round 2). The first pass at this fix let
-        # `isinstance` decide only whether to strip, which is not the same
-        # check as deciding whether to refuse: a truthy non-string reached
-        # `len()` uncaught (a 500 on `{"agent": 12345}`) or, for a truthy
-        # container, passed straight through to `store.clip`, whose
-        # documented behaviour turns a non-string into an empty string —
-        # a write returning 200 for a row no real caller could ever address,
-        # the identical failure class this whole fix exists to close.
-        if not isinstance(value, str):
-            return refusals.refuse(400, f"{field} is required")
-        value = value.strip()
-        if not value:
-            return refusals.refuse(400, f"{field} is required")
-        if len(value) > store.MAX_POLICY_FIELD:
-            return refusals.refuse(
-                400, f"{field} is longer than {store.MAX_POLICY_FIELD} "
-                     f"characters")
-        stripped[field] = value
+    stripped, err = _policy_key(payload)
+    if err:
+        return err
     decision = payload.get("decision")
     # **`isinstance` BEFORE THE SET TEST, because a dict or a list is
     # unhashable and `x not in frozenset(...)` RAISES on one** rather than
@@ -12613,6 +13732,120 @@ async def write_policy(request: Request):
         "decision": stored["decision"], "acting_human": human,
         "attested_by": ident.actor, "version": version,
     }
+
+
+@app.delete("/policy")
+async def remove_policy(request: Request):
+    """Remove the explicit row for one (agent, crew, model, target)
+    combination, so it falls back to its class default (CQ·134). The tool-
+    policy specification says the operator edits the policy by "adding a
+    denial, removing one, or changing its scope", and before this route a
+    row could be set to `allow` but never returned to "no entry on file".
+
+    **The same gate as `PUT /policy`**: `policy.write`, the unconditional
+    `approved_client` refusal, and `attested_human` as the recorded actor.
+    Removing a denial is a permission change, so it takes the identical gate.
+    The body names the row exactly as a write does, through `_policy_key`.
+
+    **A black-box or private crew's row is refused, 409.** `crew_registry.
+    withheld` finds such a crew's agents through these rows to keep their
+    names off the roster, so removing one would publish a name whose prefix
+    does not give it away. Those rows change through the crew's registration.
+    An unreadable project registry refuses 503, closed.
+
+    No row on file answers 404 and writes no event."""
+    ident, err = _identify(request)
+    if err:
+        return err
+    if not identity.authorized(ident, "policy.write"):
+        return refusals.forbidden("policy.write")
+    if ident.kind != "approved_client":
+        return refusals.forbidden("policy.write")
+    try:
+        payload = await request.json()
+    except (ValueError, TypeError):
+        return refusals.refuse(400, "body must be a JSON object")
+    if not isinstance(payload, dict):
+        return refusals.refuse(400, "body must be a JSON object")
+    human, attest_err = identity.attested_human(ident, payload)
+    if attest_err:
+        return refusals.refuse(403, attest_err["error"])
+    key, err = _policy_key(payload)
+    if err:
+        return err
+
+    def _remove():
+        if key["crew"].casefold() in crew_registry.withholding_crews():
+            return None, refusals.refuse(
+                409, "this row is a withheld crew's declared permission",
+                hint="a black-box or private crew's rows change through its "
+                     "registration, because the roster finds its agents "
+                     "through them")
+        removed = store.remove_policy(key, human)
+        if removed is None:
+            return None, refusals.refuse(
+                404, "no explicit row is on file for this combination")
+        return (removed, store.policy_version()), None
+
+    try:
+        result, refusal = await run_in_threadpool(_remove)
+    except crew_registry.RegistryUnreadable as e:
+        return refusals.refuse(
+            503, str(e),
+            hint="retry once the registry at the configured path is "
+                 "readable again")
+    except store.WritesDisabled as e:
+        return refusals.refuse(503, "the Library is not the write path yet",
+                               hint=str(e))
+    if refusal:
+        return refusal
+    removed, version = result
+    return {
+        "agent": removed["agent"], "crew": removed["crew"],
+        "model": removed["model"], "target": removed["target"],
+        "removed_decision": removed["decision"], "acting_human": human,
+        "attested_by": ident.actor, "version": version,
+    }
+
+
+@app.get("/policy")
+async def list_policy(request: Request):
+    """Every explicit policy row, narrowed by exact match on any of `agent`,
+    `crew`, `model` and `target`, paged (CQ·134). `GET /policy/resolve`
+    answers for one known (agent, crew, model) triple, so before this route
+    nothing could show what the table had accumulated.
+
+    **Gated like a write, to `policy.write` and `approved_client`.** The rows
+    name every agent a black-box crew registered, which `crew_registry.
+    withheld` keeps off the roster; serving them to every `policy.read`
+    holder would publish those names. Administering the table is the
+    operator's act, through the client that writes it."""
+    ident, err = _identify(request)
+    if err:
+        return err
+    if not identity.authorized(ident, "policy.write"):
+        return refusals.forbidden("policy.write")
+    if ident.kind != "approved_client":
+        return refusals.forbidden("policy.write")
+    if (err := _reject_unknown_params(
+            request, {"agent", "crew", "model", "target", "limit", "offset"})):
+        return err
+    limit, offset, err = _page(request)
+    if err:
+        return err
+    filters = {}
+    for field in ("agent", "crew", "model", "target"):
+        value = (request.query_params.get(field) or "").strip()
+        if not value:
+            continue
+        if len(value) > store.MAX_POLICY_FIELD:
+            return refusals.refuse(
+                400, f"{field} is longer than {store.MAX_POLICY_FIELD} characters")
+        filters[field] = value
+    (rows, total), version = await run_in_threadpool(
+        lambda: (store.list_policy(filters, limit, offset), store.policy_version()))
+    return {"rows": rows, "count": len(rows), "total": total, "offset": offset,
+            "truncated": offset + len(rows) < total, "version": version}
 
 
 # --- black-box project registration (issue_01M19QQNTWD4RD9MSZZRKHYM7N) ------
@@ -12867,6 +14100,8 @@ async def list_black_box_registrations(request: Request):
         return refusals.forbidden("policy.read")
     if ident.kind != "approved_client":
         return refusals.forbidden("policy.read")
+    if (err := _reject_unknown_params(request, set())):
+        return err
     rows = await run_in_threadpool(store.black_box_registrations)
     registrations = [_black_box_registration_dict(r) for r in rows]
     return {"registrations": registrations, "count": len(registrations)}
@@ -12894,6 +14129,8 @@ async def get_black_box_registration(crew: str, request: Request):
         return refusals.forbidden("policy.read")
     if ident.kind != "approved_client":
         return refusals.forbidden("policy.read")
+    if (err := _reject_unknown_params(request, set())):
+        return err
     crew = crew.strip()
     if not crew:
         return refusals.refuse(400, "crew is required")
@@ -13044,6 +14281,8 @@ async def read_machine_certificate(fingerprint_sha256: str, request: Request):
         return err
     if not identity.authorized(ident, "machine.verify"):
         return refusals.forbidden("machine.verify")
+    if (err := _reject_unknown_params(request, set())):
+        return err
     try:
         result = await run_in_threadpool(
             machine_registry.status_for, fingerprint_sha256)
@@ -13187,6 +14426,8 @@ async def read_signing_certificate(fingerprint: str, request: Request):
         return err
     if not identity.authorized(ident, "signing.verify"):
         return refusals.forbidden("signing.verify")
+    if (err := _reject_unknown_params(request, set())):
+        return err
     try:
         result = await run_in_threadpool(
             signing_registry.status_for, fingerprint)
@@ -13224,6 +14465,9 @@ async def list_ledgers(request: Request):
         return err
     if not identity.authorized(ident, "ledger.read"):
         return refusals.forbidden("ledger.read")
+    if (err := _reject_unknown_params(
+            request, {"limit", "offset", "scope_id"})):
+        return err
     limit, offset, err = _page(request)
     if err:
         return err
@@ -13303,6 +14547,56 @@ def _optional_amount(payload: dict, field: str):
     return _amount(payload, field)
 
 
+async def _refuse_unbookable_product(product: str):
+    """The refusal for a ledger product that is unregistered, private or a
+    black box, or None when the product may carry a ledger. Called by
+    `POST /ledger-entries` and `PUT /ledgers`, the two routes that create a
+    ledger row (issue_01M4PMVGGFVGDGBSJBTFA2T3RP, ADR-0043).
+
+    Without it, `ensure_live_ledger` made a ledger for any string, so an
+    `agent` credential scoped "*" could book spend to a black-box crew with
+    its agent name in `agent`, and `GET /ledger-entries` and `GET /ledgers`
+    served both back; `PUT /ledgers` could name one the same way. The
+    private check is `create_signal`'s, for the same reasons its comment
+    gives: the union of `private_repos()` and `private_crew_names()`, plus
+    the black-box registrations, failing closed when the registry cannot be
+    read.
+
+    **An unregistered product is refused too, which `create_signal` does
+    not do.** A ledger is a project's (`store.LEDGER_SCOPES`), so a name the
+    registry does not know has no ledger, and ADR-0043's Ask is a black box
+    with no registry entry at all, which only this refusal walls. Every live
+    ledger's scope resolved when this landed (2026-10-12, eleven scopes, none
+    private), so no reporter loses spend to it.
+
+    The scope is still stored as the caller spelled it, never the resolved
+    slug: live ledgers are keyed `agent-platform` and `selector-backend`, and
+    canonicalizing would split each into a second, uncapped ledger.
+
+    One 404 for all three, the same one the scope check returns, so neither
+    route is an oracle for which crews are black boxes.
+    """
+    private = await run_in_threadpool(projects.private_repos)
+    crew_names = await run_in_threadpool(projects.private_crew_names)
+    if private is None or crew_names is None:
+        return refusals.refuse(
+            503, "the project registry could not be read, so a black-box "
+                 "crew cannot be told apart from an ordinary one, and no "
+                 "ledger is written",
+            hint="retry once the registry at the configured path is "
+                 "readable again")
+    resolved = projects.resolve(product)
+    if not resolved:
+        return refusals.not_found()
+    names = {product.casefold(), resolved.strip().casefold()}
+    if names & (private | crew_names):
+        return refusals.not_found()
+    registered = await run_in_threadpool(store.black_box_registration_crews)
+    if names & registered:
+        return refusals.not_found()
+    return None
+
+
 @app.put("/ledgers")
 async def grant_ledger(request: Request):
     """Set a scope's cap set — warn, soft cap, hard cap. Orient-only-write.
@@ -13375,6 +14669,9 @@ async def grant_ledger(request: Request):
             400, f"scope_id is longer than {store.MAX_LEDGER_SCOPE_ID} characters")
     if scope_kind == "project" and not identity.in_scope(ident, scope_id):
         return refusals.not_found()
+    refused = await _refuse_unbookable_product(scope_id)
+    if refused is not None:
+        return refused
     # DOLLARS ON THE WIRE, MICRO-DOLLARS IN THE STORE. The caller speaks the
     # unit a human types; the column holds the exact integer a refusal is
     # computed from. Converting here rather than asking every caller to means
@@ -13577,6 +14874,11 @@ async def report_spend(request: Request):
             400, f"product is longer than {store.MAX_LEDGER_SCOPE_ID} characters")
     if not identity.in_scope(ident, product):
         return refusals.not_found()
+
+    refused = await _refuse_unbookable_product(product)
+    if refused is not None:
+        return refused
+
     source = payload.get("source")
     if not isinstance(source, str) or source not in store.LEDGER_SOURCES:
         return refusals.refuse(
@@ -13790,6 +15092,8 @@ async def list_runs(request: Request):
         return err
     if not identity.authorized(ident, "item.read"):
         return refusals.forbidden("item.read")
+    if (err := _reject_unknown_params(request, set())):
+        return err
 
     # **BLACK-BOX CREWS ARE EXCLUDED BEFORE ANYTHING ELSE, AND AN UNREADABLE
     # REGISTRY SERVES NOTHING** (security-reviewer, PR #51, blocking). ADR-0043:
@@ -13913,6 +15217,10 @@ async def list_ledger_entries(request: Request):
         return err
     if not identity.authorized(ident, "ledger.read"):
         return refusals.forbidden("ledger.read")
+    if (err := _reject_unknown_params(request, {
+            "limit", "offset", "product", "day", "from", "to", "source",
+            "run_id", "item_id", "epic_id"})):
+        return err
     limit, offset, err = _page(request)
     if err:
         return err
@@ -14305,8 +15613,14 @@ def _validate_review_record_payload(payload: dict):
         return None, refusals.refuse(
             400, f"verdict is longer than {store.MAX_REVIEW_VERDICT} characters")
 
-    prose = payload.get("prose") or ""
-    if not isinstance(prose, str):
+    # Only an absent key or a JSON null means "no prose", the shape
+    # `POST /signals` gives `body` (library#201). `or ""` coerced 0, false,
+    # [] and {} to "" before the type check ran, so each was stored as
+    # empty prose with a 201 (issue_01M3XPJX701JSV60GNM5ZK0NJ0).
+    prose = payload.get("prose")
+    if prose is None:
+        prose = ""
+    elif not isinstance(prose, str):
         return None, refusals.refuse(400, "prose must be a string")
     if len(prose) > store.MAX_TEXT:
         return None, refusals.refuse(
@@ -14833,6 +16147,9 @@ async def review_record_verdicts(request: Request):
         return err
     if not identity.authorized(ident, "review_record.read"):
         return refusals.forbidden("review_record.read")
+    if (err := _reject_unknown_params(
+            request, {"repo_identity", "pr", "reviewed_ref"})):
+        return err
     scheme, bare_repo, repo_identity, err = _validate_review_repo_identity(
         request.query_params.get("repo_identity"))
     if err:
@@ -14902,6 +16219,10 @@ async def list_review_records(request: Request):
         return err
     if not identity.authorized(ident, "review_record.read"):
         return refusals.forbidden("review_record.read")
+    if (err := _reject_unknown_params(request, {
+            "limit", "offset", "repo_identity", "path", "doc_id",
+            "item_id", "pr", "reviewed_ref"})):
+        return err
     limit, offset, err = _page(request)
     if err:
         return err
@@ -14977,6 +16298,8 @@ async def get_review_record(record_id: str, request: Request):
         return err
     if not identity.authorized(ident, "review_record.read"):
         return refusals.forbidden("review_record.read")
+    if (err := _reject_unknown_params(request, {"include_versions"})):
+        return err
     conn = store.connect()
     try:
         row = conn.execute(

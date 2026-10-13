@@ -75,7 +75,7 @@ def client(tmp_path, monkeypatch, ledger_tables):
             blocking_root_id TEXT, blocking_holder TEXT, blocks_by TEXT);
         CREATE TABLE call_slips (
             id TEXT PRIMARY KEY, item_id TEXT, product TEXT, claim_owner_label TEXT,
-            issued_at TEXT, expires_at TEXT);
+            issued_at TEXT, expires_at TEXT, grant_json TEXT);
     """)
     # **`claimed_at` IS SET ON EVERY CLAIMED ROW, and its absence was hiding a
     # bug** (reviewer, PR #20). Both `claim_status` and `claim_statuses`

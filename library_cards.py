@@ -24,7 +24,7 @@ credential, not yet a distinct per-agent identity.** ADR-0062: "the
 Individuator holds it and makes every Library call on the agent's behalf."
 Until a per-agent credential exists on this path, the value recorded here is
 the Individuator's — the closest authenticated fact available today, and a
-placeholder for the same reason `_call_slip_grant`'s `model` field is.
+placeholder until that per-agent credential exists.
 
 **`state` is a column existing runtime code never moves.** `POST
 /tokens/revoke` (issue_01M12NE155ABV0K2K50P6CBWKJ) is a separate task; this
