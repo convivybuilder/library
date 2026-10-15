@@ -265,7 +265,8 @@ def bootstrap(display_name: str, *, now=None) -> tuple[str, str]:
             "VALUES (?, ?, ?)", (person_id, now_iso, ACTOR))
         prior = _add_client_credential(
             identity.CLIENT_TOKENS, token,
-            {"name": person_id, "products": ["*"]})
+            {"name": person_id, "products": ["*"],
+             "created_at": identity.created_at_stamp(now)})
         written = True
         conn.commit()
     except BaseException:

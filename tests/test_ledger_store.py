@@ -10,6 +10,7 @@ real database would fail.
 """
 from __future__ import annotations
 
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -98,6 +99,109 @@ def test_a_repeated_dedup_key_does_not_move_the_total_twice(ledger):
     try:
         assert store.ledger_total(conn, ledger["id"], DAY) == 1_000_000
         assert conn.execute("SELECT COUNT(*) c FROM ledger_entries").fetchone()["c"] == 1
+    finally:
+        conn.close()
+
+
+def test_a_dedup_key_matching_a_different_ledgers_entry_refuses_without_its_fields(
+        db, ledger):
+    """`dedup_key` is unique across the whole `ledger_entries` table, not per
+    ledger (CQ·107). A caller scoped to one project reporting a key that
+    collided with another project's entry must not be able to read that
+    entry's id, day, amount or lane back under its own `ledger_id` — the
+    pre-check is where that match is found, and it must refuse rather than
+    replay it.
+
+    **A test that fails if the ledger comparison is removed**: reverting
+    `record_spend`'s pre-check to "any dedup_key match is a replay" makes
+    this call return `(True, dict(other_entry), None)` instead of raising,
+    and `pytest.raises` below catches that.
+    """
+    other = make_ledger(scope_id="vivy")
+    _, other_entry, _ = spend(other["id"], 9_000_000, dedup_key="shared-key")
+    with pytest.raises(store.DedupKeyTaken) as caught:
+        spend(ledger["id"], 2_000_000, dedup_key="shared-key")
+    assert caught.value.dedup_key == "shared-key"
+    assert other_entry["id"] not in str(caught.value)
+    conn = store.connect()
+    try:
+        assert store.ledger_total(conn, ledger["id"], DAY) == 0
+        assert store.ledger_total(conn, other["id"], DAY) == 9_000_000
+        assert conn.execute(
+            "SELECT COUNT(*) c FROM ledger_entries").fetchone()["c"] == 1
+    finally:
+        conn.close()
+
+
+def test_a_raced_dedup_key_matching_a_different_ledger_still_refuses(
+        db, ledger, monkeypatch):
+    """The `IntegrityError` race path re-reads the row that won the race, and
+    it needs the same cross-ledger check the pre-check has — otherwise a
+    caller could reach another project's entry just by winning the race
+    instead of losing the pre-check (CQ·107).
+
+    **Driven by blinding the pre-check's first look**, the technique
+    `test_a_lost_race_still_names_the_plan_that_won` (`test_course_writes.py`)
+    uses for `POST /courses`: a competing row is committed by a second
+    connection first, so it is exactly the row a concurrent report would
+    have left; then the first read `record_spend` would use to see it is made
+    to return nothing, so the INSERT below hits the real unique constraint
+    and the exception handler is what has to catch the cross-ledger match.
+
+    **A test that fails if the ledger comparison is removed from this path**:
+    reverting the race path's check back to "any winner is a replay" makes
+    this call return `(True, dict(winner), None)` instead of raising.
+    """
+    other = make_ledger(scope_id="vivy")
+    winner = sqlite3.connect(db)
+    winner.execute(
+        "INSERT INTO ledger_entries (id, ledger_id, day, usd_micro, at, "
+        "ingested_at, source, product, reported_by, dedup_key) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        ("lde_winner", other["id"], DAY, 1_000_000, "2026-08-23 00:00:00",
+         "2026-08-23 00:00:00", "agentctl", "vivy", "agentctl", "race-key"))
+    winner.commit()
+    winner.close()
+
+    real_connect_rw = store.connect_rw
+    blinded = {"done": False}
+
+    class _Empty:
+        def fetchone(self):
+            return None
+
+    class _BlindOnce:
+        """Forwards every call to the real connection, except the dedup
+        pre-check's SELECT, which it answers empty exactly once — the same
+        shape `blind_first_look` gives `_live_course_refusal` in
+        `test_course_writes.py`, applied here to a connection method rather
+        than a named function, since this pre-check has none to patch."""
+
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, sql, params=()):
+            if (not blinded["done"] and sql ==
+                    "SELECT * FROM ledger_entries WHERE dedup_key = ?"):
+                blinded["done"] = True
+                return _Empty()
+            return self._conn.execute(sql, params)
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    monkeypatch.setattr(store, "connect_rw",
+                        lambda: _BlindOnce(real_connect_rw()))
+    with pytest.raises(store.DedupKeyTaken):
+        spend(ledger["id"], 2_000_000, dedup_key="race-key")
+    assert blinded["done"], (
+        "the pre-check was never blinded; this test did not reach the race path")
+    conn = store.connect()
+    try:
+        assert store.ledger_total(conn, ledger["id"], DAY) == 0
+        assert conn.execute(
+            "SELECT COUNT(*) c FROM ledger_entries WHERE dedup_key = 'race-key'"
+        ).fetchone()["c"] == 1
     finally:
         conn.close()
 

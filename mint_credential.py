@@ -24,12 +24,13 @@ credential store file itself, and refuses a dangling symlink rather than writing
 (`~/.library/api-tokens.json`, or `LIBRARY_API_TOKENS`), which resolves as
 `agent` unless `--kind system` is given — `approved_client` is never
 nameable there (`identity.NAMEABLE_KINDS`) — and there alone `--grants` adds
-capabilities beyond the role's own. `--file clients` writes to
-`identity.CLIENT_TOKENS`, whose every entry resolves as `approved_client`
-regardless of what it says, and there alone `--holds-reserved` and
-`--withholds` narrow the human-reserved capabilities a client credential
-carries — all three validated with `identity`'s own load-time validators, so
-this command cannot write an entry `identity` would then refuse to serve.
+capabilities beyond the role's own and `--crew` names which crew took the
+credential (CQ·10). `--file clients` writes to `identity.CLIENT_TOKENS`,
+whose every entry resolves as `approved_client` regardless of what it says,
+and there alone `--holds-reserved` and `--withholds` narrow the
+human-reserved capabilities a client credential carries — all four
+validated with `identity`'s own load-time validators, so this command
+cannot write an entry `identity` would then refuse to serve.
 
 **The token is generated here with `secrets.token_urlsafe(32)`, printed on
 stdout, and nothing else is.** Status goes to stderr, so
@@ -390,9 +391,45 @@ def _agent_fields(grants: list[str], kind: str, label: str) -> dict:
     return {"grants": sorted(grants_fs)} if grants_fs else {}
 
 
+def _profile_field(profile: str | None, kind: str, label: str) -> dict:
+    """`{"profile": "<project>/<variant>"}`, or `{}` when `--profile` was not
+    given — validated with `identity._entry_profile`, the exact function
+    `identity.resolve()` calls over every agents-file entry at read time, so
+    this command cannot write a binding that function would then refuse to
+    serve (issue_01M35QG0VANA5P1XE3PH6A7PS4). `--file agents` only; `main()`
+    refuses `--profile` outright for `--file clients` before this is ever
+    called, and `kind` here is never `"approved_client"` for the same
+    reason."""
+    if profile is None:
+        return {}
+    try:
+        validated = identity._entry_profile({"profile": profile}, kind, label)
+    except identity._BadEntry as exc:
+        raise Refused(str(exc)) from None
+    return {"profile": validated}
+
+
+def _crew_field(crew: str | None, kind: str, label: str) -> dict:
+    """`{"crew": "<slug>"}`, or `{}` when `--crew` was not given — validated
+    with `identity._entry_crew`, the exact function `identity.resolve()`
+    calls over every agents-file entry at read time, so this command cannot
+    write a crew name that function would then refuse to serve (CQ·10).
+    `--file agents` only; `main()` refuses `--crew` outright for `--file
+    clients` before this is ever called, and `kind` here is never
+    `"approved_client"` for the same reason."""
+    if crew is None:
+        return {}
+    try:
+        validated = identity._entry_crew({"crew": crew}, kind, label)
+    except identity._BadEntry as exc:
+        raise Refused(str(exc)) from None
+    return {"crew": validated}
+
+
 def _build_entry(*, file: str, name: str, products: list[str], kind: str,
                   holds_reserved: list[str] | None, withholds: list[str],
-                  grants: list[str], replace: bool) -> tuple[Path, dict, str]:
+                  grants: list[str], profile: str | None, crew: str | None,
+                  replace: bool) -> tuple[Path, dict, str]:
     """Validate everything `mint()` would write and generate the token, but
     write nothing: returns `(path, entries, token)`, where `entries` is the
     exact dict `path` should end up holding. Splitting build from commit
@@ -414,11 +451,14 @@ def _build_entry(*, file: str, name: str, products: list[str], kind: str,
             f"{name!r} already has a credential in {path} ({label}); pass "
             f"--replace to replace it. Nothing was written.")
 
-    entry: dict = {"name": name, "products": products}
+    entry: dict = {"name": name, "products": products,
+                   "created_at": identity.created_at_stamp()}
     if file == "agents":
         if kind != "agent":
             entry["kind"] = kind
         entry.update(_agent_fields(grants, kind, f"{name!r} (new)"))
+        entry.update(_profile_field(profile, kind, f"{name!r} (new)"))
+        entry.update(_crew_field(crew, kind, f"{name!r} (new)"))
     else:
         entry.update(_client_fields(withholds, holds_reserved, f"{name!r} (new)"))
 
@@ -460,7 +500,8 @@ def _revoke_entry(path: Path, name: str) -> None:
 
 def mint(*, file: str, name: str, products: list[str], kind: str,
          holds_reserved: list[str] | None, withholds: list[str],
-         grants: list[str] = (), replace: bool) -> str:
+         grants: list[str] = (), profile: str | None = None,
+         crew: str | None = None, replace: bool) -> str:
     """Add one credential to `identity.TOKENS` or `identity.CLIENT_TOKENS`;
     return the raw token. `main` does not call this directly — it needs the
     build and the commit as separate steps to sequence `--out` between them
@@ -469,7 +510,7 @@ def mint(*, file: str, name: str, products: list[str], kind: str,
     path, entries, token = _build_entry(
         file=file, name=name, products=products, kind=kind,
         holds_reserved=holds_reserved, withholds=withholds, grants=list(grants),
-        replace=replace)
+        profile=profile, crew=crew, replace=replace)
     _commit(path, entries)
     return token
 
@@ -486,7 +527,8 @@ def main(argv=None) -> int:
                         "of minting one; refused, writing nothing, if no "
                         "entry or more than one entry carries that name. "
                         "Incompatible with --out, --replace, --products, "
-                        "--kind, --grants, --holds-reserved and --withholds.")
+                        "--kind, --grants, --profile, --crew, "
+                        "--holds-reserved and --withholds.")
     p.add_argument("--products", default=None,
                    help="comma-separated product scope (default: *, every product)")
     p.add_argument("--kind", choices=("agent", "system"), default=None,
@@ -505,6 +547,24 @@ def main(argv=None) -> int:
                         "(role_caps | grants) - withholds, so --kind agent "
                         "--grants review_record.create yields the agent "
                         "role plus that one capability")
+    p.add_argument("--profile", default=None, metavar="PROJECT/VARIANT",
+                   help="--file agents only: bind this credential to one "
+                        "dispatch profile, '<project>/<variant>' — every "
+                        "/reference/* read (and the Reference Room half of "
+                        "GET /search) then scopes to what that profile's "
+                        "include rules select, fail-closed if the profile "
+                        "does not resolve. Omit for a credential that reads "
+                        "the whole Reference Room, as every credential "
+                        "does today.")
+    p.add_argument("--crew", default=None, metavar="SLUG",
+                   help="--file agents only: which crew took this "
+                        "credential — lowercase letters, digits and "
+                        "hyphens only. The Library records it beside a held "
+                        "item's claim and an epic lease's holder, and "
+                        "refuses a release, resolve, reopen, checkout or "
+                        "claim from a different crew's credential (CQ·10). "
+                        "Omit for a credential bound to no crew, which "
+                        "keeps today's behaviour.")
     p.add_argument("--out", default=None, metavar="PATH",
                    help="write the token to PATH instead of stdout, atomically, "
                         "at mode 0600 from creation, creating its parent "
@@ -544,6 +604,10 @@ def main(argv=None) -> int:
             conflicts.append("--kind")
         if args.grants is not None:
             conflicts.append("--grants")
+        if args.profile is not None:
+            conflicts.append("--profile")
+        if args.crew is not None:
+            conflicts.append("--crew")
         if args.holds_reserved is not None:
             conflicts.append("--holds-reserved")
         if args.withholds is not None:
@@ -579,6 +643,16 @@ def main(argv=None) -> int:
         print("mint_credential: --grants applies only to --file agents",
               file=sys.stderr)
         return 2
+    if args.file == "clients" and args.profile is not None:
+        print("mint_credential: --profile applies only to --file agents; a "
+              "client credential has no single dispatch profile to bind to",
+              file=sys.stderr)
+        return 2
+    if args.file == "clients" and args.crew is not None:
+        print("mint_credential: --crew applies only to --file agents; every "
+              "entry in the approved-client file resolves as "
+              "approved_client, not as one crew's", file=sys.stderr)
+        return 2
 
     products_raw = args.products if args.products is not None else "*"
     products = [x.strip() for x in products_raw.split(",") if x.strip()]
@@ -606,6 +680,8 @@ def main(argv=None) -> int:
                             if args.holds_reserved is not None else None),
             withholds=_split_caps(args.withholds),
             grants=_split_caps(args.grants),
+            profile=args.profile,
+            crew=args.crew,
             replace=args.replace)
     except Refused as e:
         print(f"mint_credential: {e}", file=sys.stderr)

@@ -16,6 +16,11 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 PREVIOUS_HEAD = "d70d450ef8c7"
 COLUMN = "found_during"
+# This migration's own revision rather than `"head"`, for the reason
+# `test_item_model_migration.py` gives: `short_description` (`5c10b5ba7f45`)
+# adds another column to `issue_items` further up the chain, and the exact
+# column-list assertion below is about this migration alone.
+THIS_REVISION = "ee33c883acc4"
 
 
 def alembic(*args, db):
@@ -50,7 +55,7 @@ def test_upgrade_is_additive_on_a_database_that_holds_items(tmp_path):
     # A copy of the populated database is what the upgrade runs against.
     copy = tmp_path / "copy.db"
     copy.write_bytes(db.read_bytes())
-    result = alembic("upgrade", "head", db=copy)
+    result = alembic("upgrade", THIS_REVISION, db=copy)
     assert result.returncode == 0, result.stderr
 
     after = _columns(copy)

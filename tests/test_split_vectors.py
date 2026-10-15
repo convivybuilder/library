@@ -75,7 +75,7 @@ def source(tmp_path):
     connect` still need to exist alongside them."""
     path = tmp_path / "library.db"
     conn = _conn(path)
-    conn.execute("CREATE TABLE issue_items (id TEXT PRIMARY KEY)")
+    conn.execute("CREATE TABLE issue_items (id TEXT PRIMARY KEY, short_description TEXT)")
     conn.execute("CREATE TABLE signals (id TEXT PRIMARY KEY)")
     conn.execute(vectors.VEC_TABLE_DDL)
     conn.execute(vectors.SIGNAL_VEC_TABLE_DDL)

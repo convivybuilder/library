@@ -24,6 +24,8 @@ their own files; the source scan at the bottom fails when a second writer of
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
+import itertools
 import json
 import re
 import sqlite3
@@ -58,7 +60,7 @@ def client(tmp_path, monkeypatch):
     conn.executescript("""
         CREATE TABLE issue_items (
             id TEXT PRIMARY KEY, product TEXT, title TEXT, body TEXT, refs TEXT,
-            severity TEXT, state TEXT, claimed_by TEXT, claimed_at TEXT,
+            severity TEXT, state TEXT, claimed_by TEXT, claimed_by_crew TEXT, claimed_at TEXT,
             resolution TEXT, resolved_by TEXT, resolved_at TEXT, outcome_note TEXT,
             once_key TEXT UNIQUE, created_by TEXT, created_at TEXT, run_id TEXT,
             type TEXT, created_by_kind TEXT, needs TEXT, park_reason TEXT,
@@ -66,7 +68,7 @@ def client(tmp_path, monkeypatch):
             parent_id TEXT, topics TEXT, maturity TEXT, specification TEXT,
             definition_of_done TEXT, prerequisites TEXT,
             model_choice TEXT, model_reason TEXT, model_set_by_client TEXT,
-            model_acting_human TEXT, model_set_at TEXT, found_during TEXT, item_key TEXT);
+            model_acting_human TEXT, model_set_at TEXT, found_during TEXT, item_key TEXT, short_description TEXT);
         CREATE TABLE issue_item_key_counters (
             scope_kind TEXT, scope_id TEXT, next_value INTEGER,
             PRIMARY KEY (scope_kind, scope_id));
@@ -77,7 +79,7 @@ def client(tmp_path, monkeypatch):
             id INTEGER PRIMARY KEY AUTOINCREMENT, item_id TEXT, actor TEXT,
             kind TEXT, body TEXT, run_id TEXT, at TEXT);
         CREATE TABLE issue_leases (
-            id TEXT PRIMARY KEY, root_id TEXT, taken_for TEXT, holder TEXT,
+            id TEXT PRIMARY KEY, root_id TEXT, taken_for TEXT, holder TEXT, holder_crew TEXT,
             run_id TEXT, taken_at TEXT, heartbeat_at TEXT, released_at TEXT,
             release_reason TEXT, released_by TEXT, note TEXT);
         CREATE UNIQUE INDEX ix_live_root ON issue_leases (root_id)
@@ -85,7 +87,7 @@ def client(tmp_path, monkeypatch):
         CREATE TABLE lease_refusals (
             id TEXT PRIMARY KEY, at TEXT, requested_item_id TEXT, product TEXT,
             requester TEXT, actor TEXT, blocking_lease_id TEXT,
-            blocking_root_id TEXT, blocking_holder TEXT, blocks_by TEXT);
+            blocking_root_id TEXT, blocking_holder TEXT, blocks_by TEXT, blocking_taken_for TEXT);
         CREATE TABLE courses (
             id TEXT PRIMARY KEY, product TEXT, title TEXT, entries TEXT,
             status TEXT, version INTEGER, created_by TEXT, created_at TEXT,
@@ -238,18 +240,26 @@ def test_the_course_is_read_inside_the_write_lock(client, monkeypatch):
 
 
 def test_the_record_names_the_client_the_human_the_course_and_the_position(client):
+    spec_sha = hashlib.sha256(b"scope a").hexdigest()
+    dod_sha = hashlib.sha256(b"done a").hexdigest()
     r = _approve(client, "epic_a")
     assert r.json()["approval"] == {
         "approved_by": "deck", "acting_human": HUMAN,
         "course_id": "course_vivy", "position": 2, "course_size": 2,
-        "newly_placed": True}
+        "newly_placed": True, "restored_position": False,
+        "specification_sha256": spec_sha,
+        "definition_of_done_sha256": dod_sha}
     note = _notes("epic_a")[0]
     assert "deck" in note and HUMAN in note
     assert "course_vivy" in note and "position 2 of 2" in note
+    assert f"specification_sha256: {spec_sha}" in note
+    assert f"definition_of_done_sha256: {dod_sha}" in note
     event = _events()[0]
     assert event["action"] == store.COURSE_ACTION_APPROVED
     assert event["actor"] == "deck"
-    assert f"epic_a approved by deck for {HUMAN}" == event["note"]
+    assert (f"epic_a approved by deck for {HUMAN} "
+            f"(specification_sha256={spec_sha}, "
+            f"definition_of_done_sha256={dod_sha})") == event["note"]
     assert json.loads(event["entries"]) == ["epic_c", "epic_a"]
 
 
@@ -263,6 +273,39 @@ def test_a_second_approval_appends_after_the_first(client):
     assert _approve(client, "epic_a").status_code == 200
     assert _approve(client, "epic_b").status_code == 200
     assert _course()["entries"] == ["epic_c", "epic_a", "epic_b"]
+
+
+# --- the text hashes (CQ·146, ADR-0030) ----------------------------------------
+
+
+def test_the_digests_equal_hashlib_of_the_stored_text(client):
+    r = _approve(client, "epic_a")
+    approval = r.json()["approval"]
+    assert approval["specification_sha256"] == hashlib.sha256(
+        b"scope a").hexdigest()
+    assert approval["definition_of_done_sha256"] == hashlib.sha256(
+        b"done a").hexdigest()
+
+
+def test_a_missing_or_empty_field_hashes_to_null():
+    # The approve route refuses an epic missing either field outright
+    # (`test_an_epic_with_no_specification_or_definition_of_done_is_refused`
+    # below), so this is the hash helper's own contract: a field that was
+    # never there and a field sent as `""` both record as `None`, never as
+    # the hash of an empty string.
+    assert libapp._full_sha256(None) is None
+    assert libapp._full_sha256("") is None
+    assert libapp._full_sha256("x") == hashlib.sha256(b"x").hexdigest()
+
+
+def test_changing_the_specification_after_approval_no_longer_matches_the_recorded_digest(
+        client):
+    recorded = _approve(client, "epic_a").json()["approval"][
+        "specification_sha256"]
+    client.post("/items/epic_a/correct", json={"specification": "a new end state"},
+                headers=_h(AGENT))
+    current = hashlib.sha256(_row("epic_a")["specification"].encode()).hexdigest()
+    assert recorded != current
 
 
 # --- the credential --------------------------------------------------------------
@@ -623,11 +666,176 @@ def test_the_retype_launder_still_ends_proposed_and_off_the_course(client):
     assert "epic_a" not in _course()["entries"]
 
 
-def test_a_demoted_epic_can_be_approved_again_and_goes_to_the_end(client):
+# --- re-approval after a demotion (the operator, 2026-10-15; platform/decisions/0087) -----------
+
+
+_edits = itertools.count()
+
+
+def _demote(client, item_id):
+    r = client.post(f"/items/{item_id}/correct",
+                    json={"specification": f"changed {item_id} {next(_edits)}"},
+                    headers=_h(AGENT))
+    assert r.status_code == 200 and r.json()["maturity"] == "proposed", r.text
+
+
+def _set_order(entries):
+    """A reorder the way the Course route records one: the new array, and an
+    event carrying it."""
+    conn = _db()
+    conn.execute("UPDATE courses SET entries = ?, version = version + 1 "
+                 "WHERE id = 'course_vivy'", (json.dumps(entries),))
+    conn.execute("INSERT INTO course_events (course_id, actor, action, entries, "
+                 "note, at) VALUES ('course_vivy', 'test', 'reordered', ?, '', ?)",
+                 (json.dumps(entries), _ts()))
+    conn.commit()
+    conn.close()
+
+
+def test_a_demoted_epic_returns_to_where_it_stood_when_nothing_changed(client):
     assert _approve(client, "epic_a").status_code == 200
     assert _approve(client, "epic_b").status_code == 200
-    client.post("/items/epic_a/correct", json={"specification": "changed"},
-                headers=_h(AGENT))
+    _demote(client, "epic_a")
     assert _course()["entries"] == ["epic_c", "epic_b"]
+    r = _approve(client, "epic_a")
+    assert r.status_code == 200, r.text
+    assert _course()["entries"] == ["epic_c", "epic_a", "epic_b"]
+    approval = r.json()["approval"]
+    assert approval["position"] == 2 and approval["restored_position"] is True
+    assert "where it stood before its demotion" in _notes("epic_a")[-1]
+    event = _events()[-1]
+    assert event["action"] == store.COURSE_ACTION_APPROVED
+    assert json.loads(event["entries"]) == ["epic_c", "epic_a", "epic_b"]
+    assert "returned to position 2" in event["note"]
+
+
+def test_epics_appended_since_the_demotion_do_not_stop_the_return(client):
     assert _approve(client, "epic_a").status_code == 200
+    _demote(client, "epic_a")
+    assert _approve(client, "epic_b").status_code == 200
+    r = _approve(client, "epic_a")
+    assert r.json()["approval"]["restored_position"] is True
+    assert _course()["entries"] == ["epic_c", "epic_a", "epic_b"]
+
+
+def _orderless_event(action):
+    """A retitle, supersede or waypoint event: `entries` NULL, because the
+    order did not move."""
+    conn = _db()
+    conn.execute("INSERT INTO course_events (course_id, actor, action, entries, "
+                 "note, at) VALUES ('course_vivy', 'test', ?, NULL, '', ?)",
+                 (action, _ts()))
+    conn.commit()
+    conn.close()
+
+
+@pytest.mark.parametrize("action", ["retitled", "waypoint_added"])
+def test_an_event_that_did_not_move_the_order_does_not_stop_the_return(
+        client, action):
+    """PR 286 review, round 1: a NULL snapshot read as an empty Course looked
+    like the epic's departure, before and after the real demotion alike."""
+    assert _approve(client, "epic_a").status_code == 200
+    assert _approve(client, "epic_b").status_code == 200
+    _orderless_event(action)
+    _demote(client, "epic_a")
+    _orderless_event(action)
+    r = _approve(client, "epic_a")
+    assert r.json()["approval"]["restored_position"] is True
+    assert _course()["entries"] == ["epic_c", "epic_a", "epic_b"]
+
+
+def test_an_unreadable_snapshot_sends_it_to_the_end(client):
+    assert _approve(client, "epic_a").status_code == 200
+    assert _approve(client, "epic_b").status_code == 200
+    _demote(client, "epic_a")
+    conn = _db()
+    conn.execute("UPDATE course_events SET entries = 'not json' WHERE id = "
+                 "(SELECT max(id) FROM course_events)")
+    conn.commit()
+    conn.close()
+    r = _approve(client, "epic_a")
+    assert r.json()["approval"]["restored_position"] is False
     assert _course()["entries"] == ["epic_c", "epic_b", "epic_a"]
+
+
+def test_a_reorder_since_the_demotion_sends_it_to_the_end(client):
+    assert _approve(client, "epic_a").status_code == 200
+    assert _approve(client, "epic_b").status_code == 200
+    _demote(client, "epic_a")
+    _set_order(["epic_b", "epic_c"])
+    r = _approve(client, "epic_a")
+    assert r.json()["approval"]["restored_position"] is False
+    assert _course()["entries"] == ["epic_b", "epic_c", "epic_a"]
+
+
+def test_another_epics_demotion_since_sends_it_to_the_end(client):
+    """Removing a neighbour shifts every later index, so the old position no
+    longer names the same place."""
+    assert _approve(client, "epic_a").status_code == 200
+    assert _approve(client, "epic_b").status_code == 200
+    _demote(client, "epic_a")
+    _demote(client, "epic_b")
+    r = _approve(client, "epic_a")
+    assert r.json()["approval"]["restored_position"] is False
+    assert _course()["entries"] == ["epic_c", "epic_a"]
+
+
+def test_another_epics_demotion_before_it_left_does_not_stop_the_return(client):
+    """The order it left behind is the one to compare against, so a change that
+    landed before it left is part of that order."""
+    assert _approve(client, "epic_b").status_code == 200
+    assert _approve(client, "epic_a").status_code == 200
+    _demote(client, "epic_b")
+    _set_order(["epic_a", "epic_c"])
+    _demote(client, "epic_a")
+    r = _approve(client, "epic_a")
+    assert r.json()["approval"]["restored_position"] is True
+    assert _course()["entries"] == ["epic_a", "epic_c"]
+
+
+def test_an_epic_removed_by_a_reorder_rather_than_a_demotion_goes_to_the_end(
+        client):
+    assert _approve(client, "epic_a").status_code == 200
+    assert _approve(client, "epic_b").status_code == 200
+    _set_order(["epic_c", "epic_b"])
+    conn = _db()
+    conn.execute("UPDATE issue_items SET maturity = 'proposed' "
+                 "WHERE id = 'epic_a'")
+    conn.commit()
+    conn.close()
+    r = _approve(client, "epic_a")
+    assert r.json()["approval"]["restored_position"] is False
+    assert _course()["entries"] == ["epic_c", "epic_b", "epic_a"]
+
+
+def test_a_demotion_from_a_superseded_course_does_not_place_it_on_the_new_one(
+        client):
+    assert _approve(client, "epic_a").status_code == 200
+    assert _approve(client, "epic_b").status_code == 200
+    _demote(client, "epic_a")
+    conn = _db()
+    conn.execute("UPDATE courses SET status = 'superseded' "
+                 "WHERE id = 'course_vivy'")
+    conn.execute(
+        "INSERT INTO courses (id, product, title, entries, status, version, "
+        "created_by, created_at) VALUES ('course_vivy_2', 'vivy', 'Next', ?, "
+        "'live', 1, 'test', ?)", (json.dumps(["epic_b", "epic_c"]), _ts()))
+    conn.commit()
+    conn.close()
+    r = _approve(client, "epic_a")
+    assert r.json()["approval"]["restored_position"] is False
+    assert _course("course_vivy_2")["entries"] == ["epic_b", "epic_c", "epic_a"]
+
+
+def test_a_second_demotion_returns_it_to_where_it_stood_most_recently(client):
+    assert _approve(client, "epic_a").status_code == 200
+    assert _approve(client, "epic_b").status_code == 200
+    _demote(client, "epic_a")
+    _set_order(["epic_b", "epic_c"])
+    assert _approve(client, "epic_a").status_code == 200
+    assert _course()["entries"] == ["epic_b", "epic_c", "epic_a"]
+    _set_order(["epic_a", "epic_b", "epic_c"])
+    _demote(client, "epic_a")
+    r = _approve(client, "epic_a")
+    assert r.json()["approval"]["restored_position"] is True
+    assert _course()["entries"] == ["epic_a", "epic_b", "epic_c"]

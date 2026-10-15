@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -24,7 +25,12 @@ AGENT = "agent-token"
 NARROW = "narrow-token"
 ORIENT = "orient-token"
 SUBSCRIBER = "subscriber-token"
-H = {"Library-Protocol": "1"}
+# Granted the repository `knowledge` alone, which the registry below resolves
+# to the project `library`: the shape a credential written before the ledger
+# fold would have.
+REPO_ONLY = "repo-only-token"
+REPO_ONLY_CLIENT = "repo-only-client-token"
+H ={"Library-Protocol": "1"}
 
 
 def _agent(**over):
@@ -54,6 +60,14 @@ def client(tmp_path, monkeypatch, vector_index):
         " state, created_by, created_at, type, needs) "
         "VALUES ('issue_1','library','a thing','b','{}','medium','open',"
         " 'someone','2026-08-23 00:00:00','bug','agent')")
+    # Filed under the REPOSITORY, never the project — `issue_items.product`
+    # is not normalized, and this is the row the ledger-fold tests check
+    # still resolves to `library`'s ledger.
+    conn.execute(
+        "INSERT INTO issue_items (id, product, title, body, refs, severity, "
+        " state, created_by, created_at, type, needs) "
+        "VALUES ('issue_repo','knowledge','a thing filed under the repo','b',"
+        " '{}','medium','open','someone','2026-08-23 00:00:00','bug','agent')")
     conn.commit()
     conn.close()
 
@@ -61,10 +75,13 @@ def client(tmp_path, monkeypatch, vector_index):
     tokens.write_text(json.dumps({
         AGENT: {"name": "an-agent", "products": ["*"]},
         NARROW: {"name": "vivy-only", "products": ["vivy"]},
+        REPO_ONLY: {"name": "knowledge-only", "products": ["knowledge"]},
         SUBSCRIBER: {"name": "bosun-reporter", "products": ["*"],
                      "grants": ["ledger.spend.subscription"]}}))
     client_tokens = tmp_path / "client-tokens.json"
-    client_tokens.write_text(json.dumps({ORIENT: {"name": "orient", "products": ["*"]}}))
+    client_tokens.write_text(json.dumps({
+        ORIENT: {"name": "orient", "products": ["*"]},
+        REPO_ONLY_CLIENT: {"name": "knowledge-client", "products": ["knowledge"]}}))
     monkeypatch.setattr(store, "DB_PATH", db)
     monkeypatch.setattr(identity, "TOKENS", tokens)
     monkeypatch.setattr(identity, "CLIENT_TOKENS", client_tokens)
@@ -74,7 +91,7 @@ def client(tmp_path, monkeypatch, vector_index):
     # real one, so every product these tests report under is listed here.
     registry = tmp_path / "projects.json"
     registry.write_text(json.dumps({
-        "_meta": {}, "library": {"repos": []}, "vivy": {"repos": []},
+        "_meta": {}, "library": {"repos": ["knowledge"]}, "vivy": {"repos": []},
         "keel": {"repos": []}}))
     monkeypatch.setattr(projects, "REGISTRY_PATH", registry)
     projects.reload()
@@ -247,6 +264,27 @@ def test_a_repeated_report_is_idempotent(client):
     assert second.json()["idempotent"] is True
     assert second.json()["id"] == first.json()["id"]
     assert client.get("/ledgers", headers=_agent()).json()["ledgers"][0]["total_usd"] == 2
+
+
+def test_a_dedup_key_matching_another_products_ledger_is_refused_with_nothing_leaked(client):
+    """`dedup_key` is unique across the whole `ledger_entries` table, not per
+    ledger (CQ·107): a caller scoped to one project must not be able to post
+    a spend whose key collides with another project's entry and read that
+    entry's id, day, amount or lane back under its own `ledger_id`. Both
+    ledgers' totals are unchanged — nothing was recorded on either side."""
+    first = report(client, 9, product="vivy", dedup_key="shared-key")
+    assert first.status_code == 200, first.text
+    r = report(client, 2, product="library", dedup_key="shared-key")
+    assert r.status_code == 409, r.text
+    body = r.json()
+    assert "dedup_key" in body["error"]
+    leaked = {"id", "day", "usd", "lane", "ledger_id", "product"}
+    assert not leaked & set(body.keys())
+    assert first.json()["id"] not in json.dumps(body)
+    ledgers = {row["scope_id"]: row for row in
+              client.get("/ledgers", headers=_agent()).json()["ledgers"]}
+    assert ledgers["library"]["total_usd"] == 0
+    assert ledgers["vivy"]["total_usd"] == 9
 
 
 def test_spend_for_an_uncapped_scope_is_recorded(client):
@@ -615,6 +653,92 @@ def test_a_hard_capped_ledger_with_no_soft_cap_refuses_the_checkout(client):
     assert r.json()["ledger"]["cap"] == "hard_cap"
 
 
+# --- every ledger is keyed by its registry project, never by a repository ----
+
+def test_a_cap_on_the_project_also_refuses_an_item_filed_under_its_repository(client):
+    """`issue_items.product` is not normalized — a work item may still be
+    filed under a repository name (`issue_repo`, this fixture's product
+    `knowledge`, which resolves to `library`). The cap still refuses it:
+    `_do_checkout` resolves `item['product']` to its project before it ever
+    reads the ledger."""
+    set_caps(client, scope_id="library", soft_cap_usd=10)
+    report(client, 10)
+    r = client.post("/items/issue_repo/checkout", headers=_agent(),
+                    json={"owner": "co-library"})
+    assert r.status_code == 409
+    assert r.json()["ledger"]["cap"] == "soft_cap"
+
+
+def test_a_spend_reported_under_a_repository_lands_on_its_projects_ledger(client):
+    r = report(client, 5, product="knowledge")
+    assert r.status_code == 200, r.text
+    assert r.json()["ledger_id"]
+    ledgers = client.get("/ledgers", headers=_agent()).json()["ledgers"]
+    assert len(ledgers) == 1
+    assert ledgers[0]["scope_id"] == "library"
+    assert ledgers[0]["total_usd"] == 5
+
+
+def test_put_ledgers_naming_a_repository_sets_the_projects_caps(client):
+    r = set_caps(client, scope_id="knowledge", soft_cap_usd=10)
+    assert r.status_code == 200, r.text
+    assert r.json()["scope_id"] == "library"
+    r = client.get("/ledgers", headers=_agent(), params={"scope_id": "knowledge"})
+    ledgers = r.json()["ledgers"]
+    assert len(ledgers) == 1
+    assert ledgers[0]["scope_id"] == "library"
+    assert ledgers[0]["caps"]["soft_cap_usd"] == 10
+
+
+def test_a_grant_naming_only_a_repository_cannot_book_its_projects_ledger(client):
+    """The scope is checked against the ledger the write lands on.
+
+    `knowledge` resolves to `library`, whose ledger also carries every other
+    repository folded into it, so a grant naming `knowledge` alone must not
+    move `library`'s total (security review, library#270 round 1).
+    """
+    r = report(client, 5, token=REPO_ONLY, product="knowledge")
+    assert r.status_code == 404, r.text
+    assert client.get("/ledgers", headers=_agent()).json()["ledgers"] == []
+    entries = client.get("/ledger-entries", headers=_agent()).json()["entries"]
+    assert entries == []
+
+
+def test_a_grant_naming_only_a_repository_cannot_set_its_projects_caps(client):
+    body = {"scope_kind": "project", "scope_id": "knowledge",
+            "acting_human": "operator", "soft_cap_usd": 10}
+    r = client.put("/ledgers", json=body,
+                   headers={**H, "Authorization": f"Bearer {REPO_ONLY_CLIENT}"})
+    assert r.status_code == 404, r.text
+    assert client.get("/ledgers", headers=_agent()).json()["ledgers"] == []
+
+
+def test_a_grant_naming_only_a_repository_does_not_see_its_projects_ledger(client):
+    """Reads answer to the same rule as the two writes above: a ledger is
+    visible to a grant naming its project, so a grant naming one repository
+    does not see the spend every other repository folded into it booked.
+    """
+    report(client, 5, product="knowledge")
+    report(client, 3, product="vivy")
+    repo_only = {**H, "Authorization": f"Bearer {REPO_ONLY}"}
+    assert client.get("/ledgers", headers=repo_only).json()["ledgers"] == []
+    assert client.get("/ledger-entries", headers=repo_only).json()["entries"] == []
+    narrow = {**H, "Authorization": f"Bearer {NARROW}"}
+    [ledger] = client.get("/ledgers", headers=narrow).json()["ledgers"]
+    assert ledger["scope_id"] == "vivy"
+    [entry] = client.get("/ledger-entries", headers=narrow).json()["entries"]
+    assert entry["product"] == "vivy"
+
+
+def test_get_ledger_entries_product_filter_resolves_a_repository(client):
+    report(client, 5, product="knowledge")
+    r = client.get("/ledger-entries", headers=_agent(),
+                   params={"product": "knowledge"})
+    entries = r.json()["entries"]
+    assert len(entries) == 1
+    assert entries[0]["product"] == "library"
+
+
 def test_crossing_the_warning_threshold_alone_does_not_refuse_checkout(client):
     set_caps(client, warn_usd=10)
     report(client, 100)
@@ -691,6 +815,29 @@ def test_crossing_the_soft_cap_reports_soft_cap_not_warn(client):
     set_caps(client, warn_usd=5, soft_cap_usd=10)
     r = report(client, 12)
     assert r.json()["crossed"] == "soft_cap"
+
+
+def test_the_threshold_signal_carries_a_produced_at_since_can_bound_on(client):
+    """CQ·207: `produced_at` used to be stored `None` on this kind, which
+    `GET /signals?since=` never matches (`_since_clause`'s own docstring). A
+    bound just before the crossing finds the row; a bound just after it does
+    not — the shape that breaks again if the write site reverts to `None`."""
+    set_caps(client, warn_usd=10)
+    before = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    report(client, 6)
+    assert report(client, 6).json()["crossed"] == "warn"
+    after = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    since_before = client.get(
+        "/signals?kind=ledger.threshold-crossed&since=" + before,
+        headers=_agent()).json()
+    assert len(since_before["signals"]) == 1
+    assert since_before["signals"][0]["produced_at"] is not None
+
+    since_after = client.get(
+        "/signals?kind=ledger.threshold-crossed&since=" + after,
+        headers=_agent()).json()
+    assert since_after["signals"] == []
 
 
 # --- void ------------------------------------------------------------------------
@@ -1140,6 +1287,21 @@ def test_spend_against_an_item_this_vault_does_not_hold_has_no_epic(client):
     assert r.status_code == 200, r.text
     assert r.json()["epic_id"] is None
     assert entries(client).json()["entries"][0]["epic_id"] is None
+
+
+def test_spend_against_an_epic_filed_under_a_repository_still_derives_its_epic(client):
+    """The item's own `product` column may still be a repository name —
+    `issue_items` is not normalized — while the entry's `product` is now
+    the resolved project. `record_spend` compares the two by ledger scope
+    rather than by the raw string, so the fold that moved every ledger onto
+    its project did not also break epic derivation for an item filed this
+    way (both name `knowledge`/`library`, the same project)."""
+    insert_item("issue_repo_epic", item_type="epic", product="knowledge")
+    set_caps(client, soft_cap_usd=160)
+    r = report(client, 1, item_id="issue_repo_epic", product="knowledge")
+    assert r.status_code == 200, r.text
+    assert r.json()["epic_id"] == "issue_repo_epic"
+    assert entries(client).json()["entries"][0]["epic_id"] == "issue_repo_epic"
 
 
 # An item that exists, but in a different product than the entry reporting

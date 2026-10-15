@@ -45,7 +45,7 @@ def client(tmp_path, monkeypatch):
     # than tripping the empty-roster refusal by accident of an unpopulated
     # table (issue_01M34SYVH2M48K2S0FQK3K6REY).
     conn.executescript("""
-        CREATE TABLE issue_items (id TEXT PRIMARY KEY);
+        CREATE TABLE issue_items (id TEXT PRIMARY KEY, short_description TEXT);
         CREATE TABLE roster_agents (
             id INTEGER PRIMARY KEY,
             name TEXT NOT NULL UNIQUE,

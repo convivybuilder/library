@@ -53,7 +53,7 @@ def client(tmp_path, monkeypatch, vector_index):
     conn.executescript("""
         CREATE TABLE issue_items (
             id TEXT PRIMARY KEY, product TEXT, title TEXT, body TEXT, refs TEXT,
-            severity TEXT, state TEXT, claimed_by TEXT, claimed_at TEXT,
+            severity TEXT, state TEXT, claimed_by TEXT, claimed_by_crew TEXT, claimed_at TEXT,
             resolution TEXT, resolved_by TEXT, resolved_at TEXT, outcome_note TEXT,
             once_key TEXT UNIQUE, created_by TEXT, created_at TEXT, run_id TEXT,
             type TEXT, created_by_kind TEXT, needs TEXT, park_reason TEXT,
@@ -61,7 +61,7 @@ def client(tmp_path, monkeypatch, vector_index):
             parent_id TEXT, topics TEXT, maturity TEXT, specification TEXT,
             definition_of_done TEXT, prerequisites TEXT,
             model_choice TEXT, model_reason TEXT, model_set_by_client TEXT,
-            model_acting_human TEXT, model_set_at TEXT, found_during TEXT, item_key TEXT);
+            model_acting_human TEXT, model_set_at TEXT, found_during TEXT, item_key TEXT, short_description TEXT);
         CREATE TABLE issue_item_key_counters (
             scope_kind TEXT, scope_id TEXT, next_value INTEGER,
             PRIMARY KEY (scope_kind, scope_id));
@@ -72,7 +72,7 @@ def client(tmp_path, monkeypatch, vector_index):
             id INTEGER PRIMARY KEY AUTOINCREMENT, item_id TEXT, actor TEXT,
             kind TEXT, body TEXT, run_id TEXT, at TEXT);
         CREATE TABLE issue_leases (
-            id TEXT PRIMARY KEY, root_id TEXT, taken_for TEXT, holder TEXT,
+            id TEXT PRIMARY KEY, root_id TEXT, taken_for TEXT, holder TEXT, holder_crew TEXT,
             run_id TEXT, taken_at TEXT, heartbeat_at TEXT, released_at TEXT,
             release_reason TEXT, released_by TEXT, note TEXT);
         CREATE UNIQUE INDEX ix_live_root ON issue_leases (root_id)
@@ -966,3 +966,46 @@ def test_concurrent_creates_in_the_same_scope_never_collide(client):
     assert len(set(keys)) == len(keys), f"a number was reused: {keys}"
     numbers = sorted(int(k.split("·")[1]) for k in keys)
     assert numbers == list(range(1, 9))
+
+
+# --- short_description (issue_01M0XR0QSMKBSGBYD49CPTJ37E) ----------------------
+
+
+def test_an_item_can_be_filed_with_a_short_description(client):
+    r = client.post("/items", json=_body(short_description="  Ribbon labels  "),
+                    headers=_h())
+    assert r.status_code == 201
+    assert r.json()["short_description"] == "Ribbon labels"
+    got = client.get(f"/items/{r.json()['id']}", headers=_h())
+    assert got.json()["short_description"] == "Ribbon labels"
+
+
+def test_short_description_absent_or_blank_is_none(client):
+    for body in (_body(), _body(short_description=None),
+                 _body(short_description="   ")):
+        r = client.post("/items", json=body, headers=_h())
+        assert r.status_code == 201
+        assert r.json()["short_description"] is None
+
+
+def test_a_short_description_at_the_cap_is_accepted(client):
+    label = "s" * store.MAX_SHORT_DESCRIPTION
+    r = client.post("/items", json=_body(short_description=label), headers=_h())
+    assert r.status_code == 201
+    assert r.json()["short_description"] == label
+
+
+def test_a_short_description_over_the_cap_is_refused_and_names_the_bound(client):
+    """Refused rather than clipped: a clipped label is one its author never saw,
+    and the refusal is where a caller learns the bound."""
+    r = client.post("/items", json=_body(
+        short_description="s" * (store.MAX_SHORT_DESCRIPTION + 1)), headers=_h())
+    assert r.status_code == 400
+    assert r.json()["limit"] == store.MAX_SHORT_DESCRIPTION
+    assert r.json()["length"] == store.MAX_SHORT_DESCRIPTION + 1
+
+
+def test_a_short_description_that_is_not_a_string_is_refused(client):
+    r = client.post("/items", json=_body(short_description=["a"]), headers=_h())
+    assert r.status_code == 400
+    assert "short_description" in r.json()["error"]

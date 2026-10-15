@@ -802,6 +802,37 @@ def test_fresh_install_copies_code_builds_venv_and_records_commit(seed_repo, hom
     assert "deploy/library/serve.sh" in plist.read_text()
 
 
+def test_fresh_install_rewrites_console_script_shebangs_to_the_deployed_path(seed_repo, home):
+    """pip writes each console script in the staged venv ($DEPLOY_DIR.new/
+    .venv/bin) with an absolute shebang naming the interpreter AT THE STAGE
+    PATH, which the installer's own swap renames away from under it
+    (CQ-111). This checks every regular file in the DEPLOYED venv's bin/:
+    none of them may still name the ".new" staging directory, and every one
+    that is a shebang script naming a venv's bin/ must name this one."""
+    repo = seed_repo("v1")
+    result = run_installer("--repo=" + str(repo), home=home)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "did not name" not in result.stderr
+    assert "failed after the swap" not in result.stderr
+
+    deploy_dir = home / DEPLOY.lstrip("/")
+    venv_bin = deploy_dir / ".venv" / "bin"
+    checked = []
+    for script in venv_bin.iterdir():
+        if script.is_symlink() or not script.is_file():
+            continue
+        first_line = script.read_bytes().split(b"\n", 1)[0]
+        if not first_line.startswith(b"#!") or b"/.venv/bin/" not in first_line:
+            continue
+        shebang = first_line[2:].decode()
+        assert ".new" not in shebang, \
+            f"{script.name}'s shebang still names the staging directory: {shebang}"
+        assert shebang.startswith(str(venv_bin) + "/"), \
+            f"{script.name}'s shebang does not name the deployed venv: {shebang}"
+        checked.append(script.name)
+    assert checked, "no console script shebang was found to check — pip itself always writes one"
+
+
 def test_status_reports_the_deployed_commit_with_no_side_effects(seed_repo, home):
     repo = seed_repo("v1")
     sha = _git(repo, "rev-parse", "main").stdout.strip()

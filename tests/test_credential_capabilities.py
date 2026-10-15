@@ -561,3 +561,133 @@ def test_holds_reserved_on_a_non_client_entry_refuses_that_entry(env, kind):
                      "holds_reserved": []}})
     assert client.get("/whoami", headers=_h(GRANTED)).status_code == 401
     assert client.get("/whoami", headers=_h(AGENT)).status_code == 200
+
+
+# --- profile: a credential's bound dispatch profile (issue_01M35QG0VANA5P1XE3PH6A7PS4) ---
+
+
+@pytest.mark.parametrize("kind", [None, "system", "customer_reader", "orchestrator"])
+def test_a_valid_profile_on_an_agents_file_entry_resolves(env, kind):
+    client, write, *_ = env
+    entry = {"name": "shipwright", "products": ["*"],
+             "profile": "shipwright/daytime"}
+    if kind:
+        entry["kind"] = kind
+    write({GRANTED: entry})
+    ident = identity.resolve(f"Bearer {GRANTED}")
+    assert ident is not None
+    assert ident.profile == "shipwright/daytime"
+    # Resolving nothing extra, never withheld, never a route-visible field:
+    # `profile` is a scoping instruction `app.py` reads off `ident` directly,
+    # not a capability.
+    assert client.get("/whoami", headers=_h(GRANTED)).status_code == 200
+
+
+def test_an_entry_with_no_profile_resolves_to_none(env):
+    ident = identity.resolve(f"Bearer {AGENT}")
+    assert ident is not None
+    assert ident.profile is None
+
+
+@pytest.mark.parametrize("bad", [
+    123, [], {}, None, "", "no-slash", "/missing-project", "missing-variant/",
+    "a/b/c", "has space/daytime", "shipwright/has space",
+])
+def test_a_malformed_profile_refuses_only_that_entry(env, bad):
+    client, write, *_ = env
+    write({GRANTED: {"name": "g", "products": ["*"], "profile": bad}})
+    assert client.get("/whoami", headers=_h(GRANTED)).status_code == 401
+    assert client.get("/whoami", headers=_h(AGENT)).status_code == 200
+
+
+def test_a_profile_on_a_client_entry_stops_every_request(env):
+    """The client store is fatal to the whole service on an unresolvable
+    entry, the same as any other field that entry may not carry
+    (`_entry_holds_reserved`'s own shape, in the other direction)."""
+    client, write, *_ = env
+    write(client_entries={WITHHELD: {"name": "bosun", "products": ["*"],
+                                     "profile": "shipwright/daytime"}})
+    assert client.get("/whoami", headers=_h(WITHHELD)).status_code == 503
+    assert client.get("/whoami", headers=_h(CLIENT)).status_code == 503
+
+
+def test_a_profile_at_the_maximum_identifier_length_resolves(env):
+    client, write, *_ = env
+    project, variant = "p" * store.MAX_IDENT, "v" * store.MAX_IDENT
+    write({GRANTED: {"name": "g", "products": ["*"],
+                     "profile": f"{project}/{variant}"}})
+    ident = identity.resolve(f"Bearer {GRANTED}")
+    assert ident is not None
+    assert ident.profile == f"{project}/{variant}"
+
+
+def test_a_profile_segment_past_the_maximum_length_is_refused(env):
+    client, write, *_ = env
+    over = "p" * (store.MAX_IDENT + 1)
+    write({GRANTED: {"name": "g", "products": ["*"],
+                     "profile": f"{over}/daytime"}})
+    assert client.get("/whoami", headers=_h(GRANTED)).status_code == 401
+    assert client.get("/whoami", headers=_h(AGENT)).status_code == 200
+
+
+# --- crew: which crew took a credential (CQ·10, the operator's ruling of 2026-10-15) --
+
+
+@pytest.mark.parametrize("kind", [None, "system", "customer_reader", "orchestrator"])
+def test_a_valid_crew_on_an_agents_file_entry_resolves(env, kind):
+    client, write, *_ = env
+    entry = {"name": "shipwright", "products": ["*"], "crew": "shipwright"}
+    if kind:
+        entry["kind"] = kind
+    write({GRANTED: entry})
+    ident = identity.resolve(f"Bearer {GRANTED}")
+    assert ident is not None
+    assert ident.crew == "shipwright"
+    # Resolving nothing extra, never withheld, never a route-visible field:
+    # `crew` is a coordination label `app.py` reads off `ident` directly, not
+    # a capability.
+    assert client.get("/whoami", headers=_h(GRANTED)).status_code == 200
+
+
+def test_an_entry_with_no_crew_resolves_to_none(env):
+    ident = identity.resolve(f"Bearer {AGENT}")
+    assert ident is not None
+    assert ident.crew is None
+
+
+@pytest.mark.parametrize("bad", [
+    123, [], {}, None, "", "Has-Upper", "has space", "has_underscore", "a/b",
+])
+def test_a_malformed_crew_refuses_only_that_entry(env, bad):
+    client, write, *_ = env
+    write({GRANTED: {"name": "g", "products": ["*"], "crew": bad}})
+    assert client.get("/whoami", headers=_h(GRANTED)).status_code == 401
+    assert client.get("/whoami", headers=_h(AGENT)).status_code == 200
+
+
+def test_a_crew_on_a_client_entry_stops_every_request(env):
+    """The client store is fatal to the whole service on an unresolvable
+    entry, the same as any other field that entry may not carry
+    (`_entry_holds_reserved`'s own shape, in the other direction)."""
+    client, write, *_ = env
+    write(client_entries={WITHHELD: {"name": "bosun", "products": ["*"],
+                                     "crew": "shipwright"}})
+    assert client.get("/whoami", headers=_h(WITHHELD)).status_code == 503
+    assert client.get("/whoami", headers=_h(CLIENT)).status_code == 503
+
+
+def test_a_crew_at_the_maximum_identifier_length_resolves(env):
+    client, write, *_ = env
+    crew = "a" * store.MAX_IDENT
+    write({GRANTED: {"name": "g", "products": ["*"], "crew": crew}})
+    ident = identity.resolve(f"Bearer {GRANTED}")
+    assert ident is not None
+    assert ident.crew == crew
+
+
+def test_a_crew_past_the_maximum_length_is_refused(env):
+    client, write, *_ = env
+    over = "a" * (store.MAX_IDENT + 1)
+    write({GRANTED: {"name": "g", "products": ["*"], "crew": over}})
+    assert client.get("/whoami", headers=_h(GRANTED)).status_code == 401
+    assert client.get("/whoami", headers=_h(AGENT)).status_code == 200

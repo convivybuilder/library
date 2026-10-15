@@ -34,7 +34,7 @@ def orient_db(path):
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
     conn.execute("CREATE TABLE reading_rooms (id TEXT PRIMARY KEY)")
-    conn.execute("CREATE TABLE issue_items (id TEXT PRIMARY KEY)")
+    conn.execute("CREATE TABLE issue_items (id TEXT PRIMARY KEY, short_description TEXT)")
     conn.commit()
     conn.close()
     return path
@@ -44,7 +44,7 @@ def library_db(path):
     """A file holding the moving tables and none of the staying ones — the shape
     `migrate.py` writes and asserts."""
     conn = sqlite3.connect(path)
-    conn.execute("CREATE TABLE issue_items (id TEXT PRIMARY KEY)")
+    conn.execute("CREATE TABLE issue_items (id TEXT PRIMARY KEY, short_description TEXT)")
     conn.execute("CREATE TABLE signals (id TEXT PRIMARY KEY)")
     conn.commit()
     conn.close()

@@ -57,6 +57,7 @@ from __future__ import annotations
 import json
 import sqlite3
 
+import identity
 import reference
 
 
@@ -103,21 +104,33 @@ def profile_row(conn: sqlite3.Connection, project: str, variant: str
     return d
 
 
-def _rule_clause(rule: dict) -> tuple[str, list]:
+def _rule_clause(rule: dict, *, alias: str = "") -> tuple[str, list]:
     """One `include` rule as a SQL `WHERE` fragment and its bound params,
     matching `knowledge-ctx.query_rule`'s per-field semantics exactly (see
-    this module's docstring)."""
-    where = ["kind = ?"]
+    this module's docstring).
+
+    **`alias`, ADDED FOR `bound_scope` BELOW** (issue_01M35QG0VANA5P1XE3PH6A7PS4):
+    this function's own caller, `resolve_counted`, queries bare `docs` with
+    no join and no alias, which is the default (`alias=""`) and leaves every
+    column name exactly as it always read. `bound_scope` ANDs a profile's
+    scope into a caller's own query over `docs d` — every Reference Room
+    route in `app.py` joins the FTS table or aliases the listing this way —
+    so it passes `alias="d"` to get `d.kind`, `d.project`, `d.status` and
+    `d.audience` instead. One function either way: there is no second
+    translation of a rule into SQL for the aliased case."""
+    prefix = f"{alias}." if alias else ""
+    where = [f"{prefix}kind = ?"]
     params: list = [rule["kind"]]
 
     rule_projects = rule.get("project")
     if rule_projects:
-        where.append(f"project IN ({','.join('?' * len(rule_projects))})")
+        where.append(
+            f"{prefix}project IN ({','.join('?' * len(rule_projects))})")
         params.extend(rule_projects)
 
     status = rule.get("status")
     if status:
-        where.append("status = ?")
+        where.append(f"{prefix}status = ?")
         params.append(status)
     else:
         # THE DEFAULT MATCHES `reference.DEFAULT_STATUSES`, the same
@@ -126,18 +139,58 @@ def _rule_clause(rule: dict) -> tuple[str, list]:
         # silently pull in an archived document `knowledge-ctx` would also
         # have skipped.
         placeholders = ",".join("?" * len(reference.DEFAULT_STATUSES))
-        where.append(f"status IN ({placeholders})")
+        where.append(f"{prefix}status IN ({placeholders})")
         params.extend(reference.DEFAULT_STATUSES)
 
     audience_contains = rule.get("audience_contains")
     if audience_contains:
-        # UNALIASED: this query has no join and gives `docs` no alias, unlike
-        # `app.py`'s `d`-aliased Reference Room routes, so the default
-        # `expr="audience"` is right here without being passed explicitly.
-        where.append(reference.audience_clause(len(audience_contains)))
+        # UNALIASED BY DEFAULT: this query has no join and gives `docs` no
+        # alias, unlike `app.py`'s `d`-aliased Reference Room routes, so the
+        # default `expr="audience"` is right here without being passed
+        # explicitly — and `expr=f"{prefix}audience"` is exactly `"audience"`
+        # again when `prefix` is empty.
+        where.append(reference.audience_clause(len(audience_contains),
+                                                expr=f"{prefix}audience"))
         params.extend(audience_contains)
 
     return " AND ".join(where), params
+
+
+def bound_scope(conn: sqlite3.Connection, ident: identity.Identity, *,
+                alias: str = "") -> tuple[str, list] | None:
+    """The SQL fragment and its bound params testing whether a `docs` row
+    (optionally `alias`-prefixed) falls inside `ident`'s bound dispatch
+    profile — ready to AND straight into a caller's own `WHERE`. `None` when
+    `ident` carries no binding at all (`ident.profile is None`), the signal
+    to the caller that it must not narrow its query — every credential
+    behaves exactly as it did before this existed (issue_01M35QG0VANA5P1XE3PH6A7PS4).
+
+    **THE SAME `_rule_clause` `resolve_counted` EVALUATES — NEVER A SECOND
+    TRANSLATION OF A RULE INTO SQL.** `alias` only prefixes the column names
+    so a caller joining `docs` under its own alias can AND this straight
+    into an existing query rather than re-running it.
+
+    **FAIL CLOSED.** A binding naming a `<project>/<variant>` the `profiles`
+    table does not hold, or one that resolves to a profile with no `include`
+    rules at all, answers `("(1 = 0)", [])` — every row refused, never the
+    unscoped corpus. A profile WITH rules is the OR of each rule's own
+    clause, matching `resolve()`'s own union: a row in scope for any one
+    rule is in scope.
+    """
+    if ident.profile is None:
+        return None
+    project, variant = ident.profile.split("/", 1)
+    row = profile_row(conn, project, variant)
+    rules = row["include"] if row is not None else []
+    if not rules:
+        return "(1 = 0)", []
+    parts: list[str] = []
+    params: list = []
+    for rule in rules:
+        clause, rule_params = _rule_clause(rule, alias=alias)
+        parts.append(f"({clause})")
+        params.extend(rule_params)
+    return "(" + " OR ".join(parts) + ")", params
 
 
 def resolve(profile_row: dict, index_conn: sqlite3.Connection) -> list[dict]:

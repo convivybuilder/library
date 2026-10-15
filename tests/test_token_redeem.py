@@ -47,6 +47,7 @@ from mtls_server import RunningServer, tls_config
 
 AGENT = "agent-token-vivy"
 OTHER_SCOPE = "agent-token-constance-only"
+NOREF = "agent-token-vivy-noref"
 MACHINE = "macbook"
 OTHER_MACHINE = "keelboat"
 
@@ -114,7 +115,7 @@ def base_client(tmp_path, monkeypatch):
         CREATE TABLE issue_items (
             id TEXT PRIMARY KEY, product TEXT, title TEXT, type TEXT,
             state TEXT, needs TEXT, created_by_kind TEXT, parent_id TEXT,
-            created_at TEXT, refs TEXT);
+            created_at TEXT, refs TEXT, short_description TEXT);
         CREATE TABLE call_slips (
             id TEXT PRIMARY KEY, item_id TEXT, product TEXT,
             claim_owner_label TEXT, issued_at TEXT, expires_at TEXT,
@@ -155,6 +156,8 @@ def base_client(tmp_path, monkeypatch):
     tokens.write_text(json.dumps({
         AGENT: {"name": "vivy-agent", "products": ["vivy"]},
         OTHER_SCOPE: {"name": "constance-agent", "products": ["constance"]},
+        NOREF: {"name": "vivy-noref-agent", "products": ["vivy"],
+                "withholds": ["reference.read"]},
     }))
     monkeypatch.setattr(store, "DB_PATH", db)
     monkeypatch.setattr(identity, "TOKENS", tokens)
@@ -178,6 +181,7 @@ def client(base_client):
     _register(store.DB_PATH, MACHINE, _der(cert))
     _bind(store.DB_PATH, AGENT, MACHINE)
     _bind(store.DB_PATH, OTHER_SCOPE, MACHINE)
+    _bind(store.DB_PATH, NOREF, MACHINE)
     return TestClient(_OverMTLS(libapp.app, _der(cert), _uri(MACHINE)))
 
 
@@ -573,3 +577,29 @@ def test_missing_token_redeem_capability_is_refused(client, monkeypatch):
     assert r.status_code == 403
     assert "token.redeem" in r.json()["error"]
     assert _cards() == []
+
+
+RESOLVED_GRANT = {**GRANT, "persona_md": "# coder\n\nYou write the change.",
+                  "persona_resolved": True, "persona_unresolved_reason": None}
+
+
+def test_a_redeemer_with_reference_read_gets_the_definition_as_minted(client):
+    slip_id = _mint_slip(grant=RESOLVED_GRANT)
+    body = _redeem(client, slip_id).json()
+    assert body["grant"] == {"slip_id": slip_id, **RESOLVED_GRANT}
+
+
+def test_a_redeemer_without_reference_read_gets_the_placeholder(client):
+    """A slip is redeemed by whichever credential presents it, gated on
+    `token.redeem`, so the body a checkout caller holding `reference.read`
+    was minted must not reach a redeemer that withholds it
+    (security-reviewer, convivy/library#283)."""
+    slip_id = _mint_slip(grant=RESOLVED_GRANT)
+    r = _redeem(client, slip_id, token=NOREF)
+    assert r.status_code == 200, r.text
+    grant = r.json()["grant"]
+    assert grant["persona_md"] == libapp._persona_md(None)
+    assert grant["persona_resolved"] is False
+    assert grant["persona_unresolved_reason"] == "unresolved"
+    assert "You write the change." not in r.text
+    assert grant["docs"] == RESOLVED_GRANT["docs"]

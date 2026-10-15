@@ -4,12 +4,24 @@ The 2026-08-24 incident: `vectors.available()` started returning False on every
 call after `.venv` was deleted out from under the running process, and
 `/signals/search` refused every request with 503 for twenty minutes while
 `/health` kept answering ready — it read a static literal that touched neither
-the database nor the vector index. These tests hold the fix: the CURRENT
-readiness, cached rather than checked on every call, and never able to make
-`/health` itself fail.
+the database nor the vector index. The fix was a cache, checked rather than a
+static literal.
+
+The 2026-08-26 measurement: that cache recomputed on whichever caller's
+request tripped the TTL, and the recompute itself took 2.8-4.3s in service
+against single-digit milliseconds measured the same way out of process — an
+intermittent false "down" on the one route whose job is answering that
+question correctly. The fix here moves the recompute to a background task
+(`_readiness_refresh_loop`, started in `lifespan`) on the same TTL cadence;
+`health()` now only ever reads `_readiness_cache` through `_readiness_snapshot`
+and never recomputes on the request path, however stale the cache has gotten.
+These tests hold both fixes: the CURRENT readiness, refreshed off the request
+path, never able to make `/health` itself fail, and reporting not-ready
+rather than a frozen ready once the cache is older than it should ever be.
 """
 from __future__ import annotations
 
+import asyncio
 import dis
 import json
 
@@ -181,6 +193,10 @@ def test_the_commit_key_is_absent_rather_than_null_when_unresolvable(client,
 
 
 def test_health_reports_ready_when_the_vector_index_is_healthy(client):
+    """`_semantic_search_readiness()` stands in for one tick of
+    `_readiness_refresh_loop` — the loop is what seeds this in production,
+    and `health()` must faithfully report whatever it left behind."""
+    libapp._semantic_search_readiness()
     r = client.get("/health")
     assert r.status_code == 200
     assert r.json()["semantic_search"]["ready"] is True
@@ -190,6 +206,7 @@ def test_health_reports_not_ready_when_vectors_available_is_false(client, monkey
     monkeypatch.setattr(
         vectors, "available",
         lambda path=None, timeout=None: (False, "the vector index is unreadable (x)"))
+    libapp._semantic_search_readiness()
     r = client.get("/health")
     assert r.status_code == 200
     assert r.json()["semantic_search"]["ready"] is False
@@ -202,6 +219,7 @@ def test_health_reports_not_ready_when_the_vectors_file_is_missing(
     comment promise (reviewer + security-reviewer,
     issue_01M35R5GA1SKRG2CMQRF189NDE round 1)."""
     monkeypatch.setattr(vectors, "VECTORS_DB_PATH", tmp_path / "no-such-vectors.db")
+    libapp._semantic_search_readiness()
     r = client.get("/health")
     assert r.status_code == 200
     assert r.json()["semantic_search"]["ready"] is False
@@ -211,6 +229,8 @@ def test_health_stays_200_when_the_readiness_check_raises(client, monkeypatch):
     def boom(path=None, timeout=None):
         raise RuntimeError("the venv is gone")
     monkeypatch.setattr(vectors, "available", boom)
+    ready, _ = libapp._semantic_search_readiness()  # must not raise, out here
+    assert ready is False
     r = client.get("/health")
     assert r.status_code == 200
     body = r.json()
@@ -219,67 +239,89 @@ def test_health_stays_200_when_the_readiness_check_raises(client, monkeypatch):
     assert body["semantic_search"]["ready"] is False
 
 
-def test_health_caches_readiness_within_the_ttl(client, monkeypatch):
-    calls = []
+def test_health_does_not_call_vectors_available_even_with_an_expired_cache(
+        client, monkeypatch):
+    """The 2026-08-26 defect this PR exists to close: `health()` must never
+    recompute on the caller's own request, no matter how far past the TTL
+    the cache has gotten — only `_readiness_refresh_loop` recomputes now, on
+    its own schedule, off the request path entirely."""
+    stale_but_not_expired = (
+        libapp.time.monotonic() - libapp._READINESS_TTL_SECONDS - 1, True, "ready")
+    monkeypatch.setattr(libapp, "_readiness_cache", stale_but_not_expired)
 
-    def counting(path=None, timeout=None):
-        calls.append(1)
-        return True, "ready"
-    monkeypatch.setattr(vectors, "available", counting)
-    client.get("/health")
-    client.get("/health")
-    assert len(calls) == 1, "a second call inside the TTL must not re-check"
+    def fail_if_called(*a, **k):
+        raise AssertionError("health() must never call vectors.available itself")
+    monkeypatch.setattr(vectors, "available", fail_if_called)
+
+    r = client.get("/health")
+    assert r.status_code == 200
+    assert r.json()["semantic_search"]["ready"] is True
 
 
-def test_health_rechecks_once_the_cache_expires(client, monkeypatch):
-    calls = []
+def test_health_reports_not_ready_when_the_cache_is_older_than_the_stale_bound(
+        client, monkeypatch):
+    """A refresher that is stuck or dead must surface as not-ready rather than
+    serving a `ready: true` nothing is checking anymore — the 2026-08-24
+    failure, recurring in the new design this PR builds."""
+    long_dead = (
+        libapp.time.monotonic() - libapp._READINESS_STALE_AFTER_SECONDS - 1,
+        True, "ready")
+    monkeypatch.setattr(libapp, "_readiness_cache", long_dead)
 
-    def counting(path=None, timeout=None):
-        calls.append(1)
-        return True, "ready"
-    monkeypatch.setattr(vectors, "available", counting)
-    now = [1000.0]
-    monkeypatch.setattr(libapp.time, "monotonic", lambda: now[0])
-    client.get("/health")
-    now[0] += libapp._READINESS_TTL_SECONDS + 1
-    client.get("/health")
-    assert len(calls) == 2, "a call past the TTL must re-check"
+    def fail_if_called(*a, **k):
+        raise AssertionError("health() must never call vectors.available itself")
+    monkeypatch.setattr(vectors, "available", fail_if_called)
+
+    r = client.get("/health")
+    assert r.status_code == 200
+    assert r.json()["semantic_search"]["ready"] is False
+
+
+def test_health_reports_not_ready_before_the_first_refresh_ever_completes(client):
+    """`_readiness_cache` starts `None` until something seeds it. In a real
+    deploy `lifespan` always has by the time a request can arrive; this is
+    the defined answer for the window before that, or a caller — like this
+    bare `TestClient` — that never ran `lifespan` at all."""
+    assert libapp._readiness_cache is None
+    r = client.get("/health")
+    assert r.status_code == 200
+    assert r.json()["semantic_search"]["ready"] is False
 
 
 def test_the_reason_is_never_in_the_response_unauthenticated(client, monkeypatch):
     monkeypatch.setattr(
-        vectors, "available",
-        lambda path=None, timeout=None: (False, "the vector index is unreadable (a detail)"))
+        libapp, "_readiness_cache",
+        (libapp.time.monotonic(), False, "the vector index is unreadable (a detail)"))
     r = client.get("/health")
     assert "reason" not in r.json()["semantic_search"]
 
 
 def test_the_reason_is_never_in_the_response_authenticated(client, monkeypatch):
     monkeypatch.setattr(
-        vectors, "available",
-        lambda path=None, timeout=None: (False, "the vector index is unreadable (a detail)"))
+        libapp, "_readiness_cache",
+        (libapp.time.monotonic(), False, "the vector index is unreadable (a detail)"))
     r = client.get("/health", headers=_auth())
     assert "reason" not in r.json()["semantic_search"]
 
 
-def test_a_not_ready_result_reaches_the_log(client, monkeypatch, capsys):
+def test_a_not_ready_result_reaches_the_log(monkeypatch, capsys):
     monkeypatch.setattr(
         vectors, "available",
         lambda path=None, timeout=None: (False, "the vector index is unreadable (a detail)"))
-    client.get("/health")
+    libapp._semantic_search_readiness()
     err = capsys.readouterr().err
     assert "the vector index is unreadable (a detail)" in err
 
 
-def test_a_healthy_result_writes_no_log_line(client, monkeypatch, capsys):
+def test_a_healthy_result_writes_no_log_line(monkeypatch, capsys):
     monkeypatch.setattr(
         vectors, "available", lambda path=None, timeout=None: (True, "ready"))
-    client.get("/health")
+    libapp._semantic_search_readiness()
     err = capsys.readouterr().err
     assert "semantic search not ready" not in err
 
 
-def test_readiness_cache_hit_reads_the_global_exactly_once():
+def test_readiness_snapshot_reads_the_global_exactly_once():
     """A prior version read `_readiness_cache` four separate times on the
     cache-hit path — once for `is not None`, once for the TTL compare, once
     each for the two returned fields — each compiling to its own
@@ -288,26 +330,103 @@ def test_readiness_cache_hit_reads_the_global_exactly_once():
     between any two of those loads could hand back a `ready` from one
     generation paired with a `reason` from another that never coexisted. This
     can't be pinned by racing real threads without flakiness, so it's pinned
-    structurally: the cache-hit path must bind the global to a local exactly
-    once and read the tuple through that local from there on.
+    structurally: the read path must bind the global to a local exactly once
+    and read the tuple through that local from there on.
     """
     loads = [
-        i for i in dis.get_instructions(libapp._readiness_cache_hit)
+        i for i in dis.get_instructions(libapp._readiness_snapshot)
         if i.opname == "LOAD_GLOBAL" and i.argval == "_readiness_cache"
     ]
     assert len(loads) == 1
 
 
-def test_health_does_not_touch_the_threadpool_on_a_cache_hit(client, monkeypatch):
-    """A 15s TTL against a watchdog polling every second means most calls hit
-    the cache; each of those should be a pure in-memory lookup on the event
-    loop, not a threadpool round-trip."""
-    client.get("/health")  # populates the cache
-
+def test_health_never_touches_the_threadpool(client, monkeypatch):
+    """`health()` only ever reads `_readiness_cache` now — every recompute
+    happens on `_readiness_refresh_loop`'s own schedule, off the request path
+    entirely, so this must hold whether or not the cache has been seeded."""
     def fail_if_called(*args, **kwargs):
-        raise AssertionError("cache hit must not go through run_in_threadpool")
+        raise AssertionError("health() must never go through run_in_threadpool")
     monkeypatch.setattr(libapp, "run_in_threadpool", fail_if_called)
 
     r = client.get("/health")
     assert r.status_code == 200
-    assert r.json()["semantic_search"]["ready"] is True
+
+
+def test_background_refresh_updates_the_cache(monkeypatch):
+    """`_readiness_refresh_loop` is what keeps `_readiness_cache` warm in
+    production; drive it directly rather than waiting out the real
+    `_READINESS_TTL_SECONDS`."""
+    calls = []
+
+    def counting(path=None, timeout=None):
+        calls.append(1)
+        return True, "ready"
+    monkeypatch.setattr(vectors, "available", counting)
+    monkeypatch.setattr(libapp, "_READINESS_TTL_SECONDS", 0.01)
+    libapp._readiness_cache = None
+
+    async def _drive():
+        task = asyncio.create_task(libapp._readiness_refresh_loop())
+        try:
+            for _ in range(500):
+                if libapp._readiness_cache is not None:
+                    break
+                await asyncio.sleep(0.01)
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    asyncio.run(_drive())
+    assert libapp._readiness_cache is not None
+    assert len(calls) == 1
+
+
+def test_refresh_loop_survives_when_the_check_itself_raises(monkeypatch):
+    """`_semantic_search_readiness` already converts an exception from the
+    check into a not-ready result rather than raising, by its own contract.
+    This pins the loop's OWN defense for the case that contract doesn't
+    hold — a bug reaching the loop despite it — by making the check itself
+    raise directly, past its own try/except, and confirming the loop ticks
+    again anyway rather than dying silently."""
+    calls = []
+
+    def boom():
+        calls.append(1)
+        raise RuntimeError("a bug reached the loop despite the check's contract")
+    monkeypatch.setattr(libapp, "_semantic_search_readiness", boom)
+    monkeypatch.setattr(libapp, "_READINESS_TTL_SECONDS", 0.01)
+
+    async def _drive():
+        task = asyncio.create_task(libapp._readiness_refresh_loop())
+        try:
+            for _ in range(500):
+                if len(calls) >= 2:
+                    break
+                await asyncio.sleep(0.01)
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    asyncio.run(_drive())
+    assert len(calls) >= 2, "the loop must keep ticking after the check raises"
+
+
+def test_lifespan_seeds_the_cache_before_yielding(monkeypatch):
+    """Recommended in the fix's own design: one synchronous refresh in
+    `lifespan`, before the first request can arrive, so `health()` never
+    finds `_readiness_cache` empty on a real deploy."""
+    monkeypatch.setattr(
+        vectors, "available", lambda path=None, timeout=None: (True, "ready"))
+    libapp._readiness_cache = None
+
+    async def _run():
+        async with libapp.lifespan(libapp.app):
+            assert libapp._readiness_cache is not None
+
+    asyncio.run(_run())

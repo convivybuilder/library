@@ -43,7 +43,7 @@ def client(tmp_path, monkeypatch):
     conn.executescript("""
         CREATE TABLE issue_items (
             id TEXT PRIMARY KEY, product TEXT, title TEXT, body TEXT, refs TEXT,
-            severity TEXT, state TEXT, claimed_by TEXT, claimed_at TEXT,
+            severity TEXT, state TEXT, claimed_by TEXT, claimed_by_crew TEXT, claimed_at TEXT,
             resolution TEXT, resolved_by TEXT, resolved_at TEXT, outcome_note TEXT,
             once_key TEXT UNIQUE, created_by TEXT, created_at TEXT, run_id TEXT,
             type TEXT, created_by_kind TEXT, needs TEXT, park_reason TEXT,
@@ -51,7 +51,7 @@ def client(tmp_path, monkeypatch):
             parent_id TEXT, topics TEXT, maturity TEXT, specification TEXT,
             definition_of_done TEXT, prerequisites TEXT,
             model_choice TEXT, model_reason TEXT, model_set_by_client TEXT,
-            model_acting_human TEXT, model_set_at TEXT, found_during TEXT, item_key TEXT);
+            model_acting_human TEXT, model_set_at TEXT, found_during TEXT, item_key TEXT, short_description TEXT);
         CREATE TABLE issue_item_key_counters (
             scope_kind TEXT, scope_id TEXT, next_value INTEGER,
             PRIMARY KEY (scope_kind, scope_id));
@@ -62,7 +62,7 @@ def client(tmp_path, monkeypatch):
             id INTEGER PRIMARY KEY AUTOINCREMENT, item_id TEXT, actor TEXT,
             kind TEXT, body TEXT, run_id TEXT, at TEXT);
         CREATE TABLE issue_leases (
-            id TEXT PRIMARY KEY, root_id TEXT, taken_for TEXT, holder TEXT,
+            id TEXT PRIMARY KEY, root_id TEXT, taken_for TEXT, holder TEXT, holder_crew TEXT,
             run_id TEXT, taken_at TEXT, heartbeat_at TEXT, released_at TEXT,
             release_reason TEXT, released_by TEXT, note TEXT);
         CREATE UNIQUE INDEX ix_live_root ON issue_leases (root_id)
@@ -70,7 +70,7 @@ def client(tmp_path, monkeypatch):
         CREATE TABLE lease_refusals (
             id TEXT PRIMARY KEY, at TEXT, requested_item_id TEXT, product TEXT,
             requester TEXT, actor TEXT, blocking_lease_id TEXT,
-            blocking_root_id TEXT, blocking_holder TEXT, blocks_by TEXT);
+            blocking_root_id TEXT, blocking_holder TEXT, blocks_by TEXT, blocking_taken_for TEXT);
         CREATE TABLE courses (
             id TEXT PRIMARY KEY, product TEXT, title TEXT, entries TEXT,
             status TEXT, version INTEGER, created_by TEXT, created_at TEXT,
@@ -236,6 +236,32 @@ def test_a_terminal_item_cannot_be_corrected(client):
 ])
 def test_a_value_outside_its_closed_set_is_refused(client, body):
     assert _correct(client, "bug", body).status_code == 400
+
+
+def test_the_item_is_read_inside_the_write_lock(client, monkeypatch):
+    """CQ·100. Read before the lock, two corrections to different columns
+    each judged the approval rule against the same stale row and both landed.
+    Asserting the order, because an interleaving test would pass by timing on
+    a race it missed."""
+    seen = []
+    real = store.connect_rw
+
+    class Spy:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, sql, *args):
+            if sql.startswith("SELECT * FROM issue_items"):
+                seen.append(self._conn.in_transaction)
+            return self._conn.execute(sql, *args)
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    monkeypatch.setattr(store, "connect_rw", lambda: Spy(real()))
+    r = _correct(client, "bug", {"severity": "high"})
+    assert r.status_code == 200, r.text
+    assert seen and seen[0] is True
 
 
 def test_a_correction_that_changes_nothing_is_a_no_op(client):
@@ -415,8 +441,11 @@ def test_a_demotion_and_its_course_removal_are_one_transaction(client):
                  "BEGIN SELECT RAISE(ABORT, 'forced'); END")
     conn.commit()
     conn.close()
-    with pytest.raises(Exception):
-        _correct(client, "epic_ok", {"specification": "a different scope"})
+    # A client of its own that answers the forced failure as a 500, so only
+    # this test reads a server error as a response rather than an exception.
+    lenient = TestClient(libapp.app, raise_server_exceptions=False)
+    r = _correct(lenient, "epic_ok", {"specification": "a different scope"})
+    assert r.status_code == 500
     assert _row("epic_ok")["maturity"] == "approved"
     assert _course_entries() == ["epic", "epic_ok", "other_epic_in_order"]
 
@@ -1233,29 +1262,33 @@ def test_an_unenumerable_subtree_refuses_the_retype(client, monkeypatch):
 # function gives when it reads that state directly.
 
 
-def test_a_correction_that_races_a_concurrent_resolve_is_rolled_back(client,
-                                                                      monkeypatch):
-    """Deterministic rather than a coin-flip on OS scheduling. Correct is held
-    at `_hold_for_write` — after it has read the item and before it takes the
-    write lock — while a resolve runs to completion and commits; only then is
-    correct allowed to proceed to its own write. The seam has to be before the
-    lock: a correction held after it would keep the resolve out entirely.
+def test_a_resolve_that_arrives_mid_correction_waits_for_it(client, monkeypatch):
+    """CQ·100. The correction takes the write lock before it reads the item,
+    so a resolve that arrives while it is deciding cannot commit underneath
+    it: the resolve waits, the correction lands, then the resolve runs. Held
+    at `_hold_for_write`, which now sits inside the lock, for half a second,
+    well under the 5 s busy timeout the resolve waits on.
+
+    This replaces a test that held the correction BEFORE the lock and let the
+    resolve commit in that window, proving the state compare-and-swap caught
+    it. That window no longer exists; the compare-and-swap stays as the second
+    line, and nothing can reach it from this route.
     """
     import threading
+    import time
 
     correct_ready = threading.Event()
-    resolve_done = threading.Event()
+    results, observed = {}, {}
     real_hold = libapp._hold_for_write
 
     def hold_racer(conn, ident, item, owner, *, act):
         if act == "a correction":
             correct_ready.set()
-            assert resolve_done.wait(timeout=20), "resolve never completed"
+            time.sleep(0.5)
+            observed["resolve_done_while_held"] = "resolve" in results
         return real_hold(conn, ident, item, owner, act=act)
 
     monkeypatch.setattr(libapp, "_hold_for_write", hold_racer)
-
-    results = {}
 
     def do_correct():
         results["correct"] = _correct(client, "bug", {"severity": "high"})
@@ -1264,7 +1297,6 @@ def test_a_correction_that_races_a_concurrent_resolve_is_rolled_back(client,
         assert correct_ready.wait(timeout=20), "correct never reached the seam"
         results["resolve"] = client.post(
             "/items/bug/resolve", json={"resolution": "fixed"}, headers=_h())
-        resolve_done.set()
 
     threads = [threading.Thread(target=do_correct),
                threading.Thread(target=do_resolve)]
@@ -1275,15 +1307,12 @@ def test_a_correction_that_races_a_concurrent_resolve_is_rolled_back(client,
 
     assert set(results) == {"correct", "resolve"}, (
         "a request died before reaching the race seam")
+    assert observed["resolve_done_while_held"] is False
+    assert results["correct"].status_code == 200, results["correct"].json()
     assert results["resolve"].status_code == 200, results["resolve"].json()
-    assert results["correct"].status_code == 409, results["correct"].json()
-    assert results["correct"].json()["error"] == (
-        "the item is no longer open; it is now fixed")
-
     row = _row("bug")
     assert row["state"] == "fixed"
-    assert row["severity"] == "low"
-    assert _notes("bug") == []
+    assert row["severity"] == "high"
 
 
 # --- topics, added 2026-09-08 ----------------------------------------------------

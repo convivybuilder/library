@@ -287,6 +287,24 @@ def test_run_installs_when_deployed_is_behind_origin(watch, monkeypatch):
     assert cleared == [True]
 
 
+def test_run_logs_a_successful_installs_output_warnings_included(watch, monkeypatch, capsys):
+    """An install that exits 0 can still have warned, as the installer does
+    when a console script will not run after the swap (CQ·111). Its output
+    reaches the log before the success line rather than being dropped."""
+    _stub(monkeypatch, watch,
+         fetch_origin_main=lambda: None,
+         origin_main_sha=lambda: "new-target",
+         read_deployed_commit=lambda: "old",
+         load_failed_target=lambda: None,
+         run_library_install=lambda: _CP(0, "▸ Deployed: area\n", "! pip --version failed\n"),
+         clear_failed_target=lambda: None)
+    assert watch.run() == 0
+    out = capsys.readouterr().out
+    assert "▸ Deployed: area" in out
+    assert "! pip --version failed" in out
+    assert out.index("! pip --version failed") < out.index("succeeded for new-target")
+
+
 def test_run_reports_once_and_suppresses_the_next_tick_for_the_same_target(
         watch, monkeypatch):
     # load_failed_target/save_failed_target are deliberately left real here

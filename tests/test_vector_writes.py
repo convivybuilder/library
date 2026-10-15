@@ -48,7 +48,7 @@ def db(tmp_path, monkeypatch, vector_index):
     conn.executescript("""
         CREATE TABLE issue_items (
             id TEXT PRIMARY KEY, product TEXT, title TEXT, body TEXT, refs TEXT,
-            severity TEXT, state TEXT, claimed_by TEXT, claimed_at TEXT,
+            severity TEXT, state TEXT, claimed_by TEXT, claimed_by_crew TEXT, claimed_at TEXT,
             resolution TEXT, resolved_by TEXT, resolved_at TEXT, outcome_note TEXT,
             once_key TEXT UNIQUE, created_by TEXT, created_at TEXT, run_id TEXT,
             type TEXT, created_by_kind TEXT, needs TEXT, park_reason TEXT,
@@ -56,7 +56,7 @@ def db(tmp_path, monkeypatch, vector_index):
             parent_id TEXT, topics TEXT, maturity TEXT, specification TEXT,
             definition_of_done TEXT, prerequisites TEXT,
             model_choice TEXT, model_reason TEXT, model_set_by_client TEXT,
-            model_acting_human TEXT, model_set_at TEXT, found_during TEXT, item_key TEXT);
+            model_acting_human TEXT, model_set_at TEXT, found_during TEXT, item_key TEXT, short_description TEXT);
         CREATE TABLE issue_item_key_counters (
             scope_kind TEXT, scope_id TEXT, next_value INTEGER,
             PRIMARY KEY (scope_kind, scope_id));

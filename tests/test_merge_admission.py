@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import datetime, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -342,6 +343,34 @@ def test_outcome_writes_a_signal(client, tmp_path, monkeypatch):
     meta = json.loads(row["meta"])
     assert meta["merged"] is False
     assert meta["reason"] == "x"
+
+
+def test_the_admission_signal_carries_a_produced_at_since_can_bound_on(
+        client, tmp_path, monkeypatch):
+    """CQ·207: `produced_at` used to be stored `None` on this kind, which
+    `GET /signals?since=` never matches (`_since_clause`'s own docstring). A
+    bound just before the call finds the row; a bound just after it does
+    not — the shape that breaks again if the write site reverts to `None`."""
+    db = tmp_path / "control.db"
+    monkeypatch.setattr(store, "DB_PATH", db)
+    before = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    client.post("/merge/admission", json=_admission_body(), headers=_h())
+    after = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    # SYSTEM, NOT AGENT: the row's `product` is the literal `repo` field
+    # (`convivy/library`), which `_scope_clause` compares verbatim, and
+    # AGENT's scope is the resolved product slug (`library`) rather than
+    # that literal. SYSTEM's `products: ["*"]` sees every row regardless.
+    since_before = client.get(
+        "/signals?kind=merge_admission_stub_call&since=" + before,
+        headers=_h(SYSTEM)).json()
+    assert len(since_before["signals"]) == 1
+    assert since_before["signals"][0]["produced_at"] is not None
+
+    since_after = client.get(
+        "/signals?kind=merge_admission_stub_call&since=" + after,
+        headers=_h(SYSTEM)).json()
+    assert since_after["signals"] == []
 
 
 def test_each_call_writes_its_own_signal_with_no_dedup_key(client, tmp_path, monkeypatch):

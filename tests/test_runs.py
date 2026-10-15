@@ -143,11 +143,11 @@ def client(tmp_path, sock_dir, monkeypatch):
     conn.executescript("""
         CREATE TABLE issue_items (
             id TEXT PRIMARY KEY, product TEXT, title TEXT, body TEXT, refs TEXT,
-            severity TEXT, state TEXT, claimed_by TEXT, claimed_at TEXT,
+            severity TEXT, state TEXT, claimed_by TEXT, claimed_by_crew TEXT, claimed_at TEXT,
             created_by TEXT, created_at TEXT, type TEXT, needs TEXT,
-            parent_id TEXT, run_id TEXT);
+            parent_id TEXT, run_id TEXT, short_description TEXT);
         CREATE TABLE issue_leases (
-            id TEXT PRIMARY KEY, root_id TEXT, taken_for TEXT, holder TEXT,
+            id TEXT PRIMARY KEY, root_id TEXT, taken_for TEXT, holder TEXT, holder_crew TEXT,
             run_id TEXT, taken_at TEXT, heartbeat_at TEXT, expires_at TEXT,
             released_at TEXT, release_reason TEXT, released_by TEXT, note TEXT);
     """)

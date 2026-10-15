@@ -43,7 +43,7 @@ def client(tmp_path, monkeypatch):
     conn.executescript("""
         CREATE TABLE issue_items (
             id TEXT PRIMARY KEY, product TEXT, title TEXT, body TEXT, refs TEXT,
-            severity TEXT, state TEXT, claimed_by TEXT, claimed_at TEXT,
+            severity TEXT, state TEXT, claimed_by TEXT, claimed_by_crew TEXT, claimed_at TEXT,
             resolution TEXT, resolved_by TEXT, resolved_at TEXT, outcome_note TEXT,
             once_key TEXT, created_by TEXT, created_at TEXT, run_id TEXT, type TEXT,
             created_by_kind TEXT, needs TEXT, park_reason TEXT,
@@ -51,12 +51,12 @@ def client(tmp_path, monkeypatch):
             parent_id TEXT, topics TEXT, maturity TEXT, specification TEXT,
             definition_of_done TEXT, prerequisites TEXT,
             model_choice TEXT, model_reason TEXT, model_set_by_client TEXT,
-            model_acting_human TEXT, model_set_at TEXT, found_during TEXT, item_key TEXT);
+            model_acting_human TEXT, model_set_at TEXT, found_during TEXT, item_key TEXT, short_description TEXT);
         CREATE TABLE issue_item_key_counters (
             scope_kind TEXT, scope_id TEXT, next_value INTEGER,
             PRIMARY KEY (scope_kind, scope_id));
         CREATE TABLE issue_leases (
-            id TEXT PRIMARY KEY, root_id TEXT, taken_for TEXT, holder TEXT,
+            id TEXT PRIMARY KEY, root_id TEXT, taken_for TEXT, holder TEXT, holder_crew TEXT,
             run_id TEXT, taken_at TEXT, heartbeat_at TEXT, released_at TEXT,
             release_reason TEXT, released_by TEXT, note TEXT);
         CREATE UNIQUE INDEX ix_live_root ON issue_leases (root_id)
@@ -242,14 +242,23 @@ def test_type_epic_narrows_the_listing(client):
     assert listed(client, "type=epic") == {"epic_1"}
 
 
-def test_a_dropped_type_is_refused_rather_than_answered_empty(client):
-    """A work item carries no type but `epic`, so `bug` could only ever match a
-    closed row kept as history — refusing says so instead of a caller reading an
-    empty page as "no matches in scope"."""
+def test_an_unknown_type_answers_an_empty_page_rather_than_a_refusal(client):
+    """`type` has no default — omitting it already returns every type — so the
+    contract's DEFAULT clause (§3.2) says it must not validate, unlike `needs`
+    just below. `?type=nonsense` matches no row and answers 200."""
     seed("untyped_1")
-    r = client.get("/items?type=bug", headers=_h())
-    assert r.status_code == 400
-    assert "bug" in r.json()["error"]
+    r = client.get("/items?type=nonsense", headers=_h())
+    assert r.status_code == 200
+    assert r.json()["items"] == []
+
+
+def test_a_dropped_type_still_matches_a_closed_row_that_kept_it(client):
+    """A work item carries no type but `epic` going forward, but a row closed
+    under a dropped type such as `bug` still carries it, and the filter must
+    find it rather than reading it as unknown."""
+    seed("bug_1", type="bug")
+    seed("untyped_1")
+    assert listed(client, "type=bug") == {"bug_1"}
 
 
 # --- the total, which paging depends on ------------------------------------------

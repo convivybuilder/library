@@ -266,11 +266,29 @@ def test_a_single_row_over_the_budget_still_moves_whole(db, monkeypatch):
 
 
 def test_a_move_pass_and_a_concurrent_writer_neither_get_a_lock_error(db):
+    """The race runs in WAL, the mode the live vault and cold file are in.
+
+    The fixture creates its file in rollback-journal mode, and
+    `store.connect_rw` swallows a contested switch to WAL, so when the
+    writer thread and the move pass opened at the same instant the race
+    could run in rollback mode. There SQLite returns "database is locked"
+    without invoking the busy handler when a reader upgrading to a writer
+    meets a writer waiting to commit, which is deadlock avoidance rather than
+    a timeout. That failed library main twice on 2026-10-15 on a loaded
+    runner, and forcing rollback mode under eight-way parallel load
+    reproduced the same error locally, 1 run in 420, against 0 in 420 in
+    WAL. Production never runs in rollback mode, so the test switches the
+    file before the race starts.
+    """
+    conn = sqlite3.connect(db)
+    assert conn.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    conn.close()
     for i in range(40):
         _insert(db, f"sig_old_{i:03d}", "note",
                 ingested_at=f"2020-01-01 00:00:{i:02d}.000000")
 
     errors = []
+    move_errors = []
     writes = []
     stop = threading.Event()
 
@@ -301,12 +319,18 @@ def test_a_move_pass_and_a_concurrent_writer_neither_get_a_lock_error(db):
     try:
         assert ct.run(dry_run=False, do_restore=False) == 0
     except sqlite3.OperationalError as e:
-        errors.append(e)
+        move_errors.append(e)
     finally:
         stop.set()
         t.join(timeout=5)
 
-    assert not errors, f"a concurrent write hit a lock error: {errors}"
+    # Which side raised, and in which mode, is what tells a lost write from a
+    # move pass that will retry; the 2026-10-15 failures could say neither.
+    mode = sqlite3.connect(db).execute("PRAGMA journal_mode").fetchone()[0]
+    assert not errors, (f"the concurrent writer hit a lock error in "
+                        f"{mode} mode: {errors}")
+    assert not move_errors, (f"the move pass hit a lock error in {mode} "
+                             f"mode: {move_errors}")
     assert writes, "the concurrent writer never got a turn — this test proves nothing"
     for i in range(40):
         assert not _hot_exists(db, f"sig_old_{i:03d}")

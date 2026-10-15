@@ -14,6 +14,7 @@ constraint, so a copy of the DDL would test the copy.
 """
 from __future__ import annotations
 
+import datetime
 import io
 import json
 import os
@@ -209,6 +210,17 @@ def test_the_credential_is_one_the_librarys_own_identity_resolves(
     person_id = _rows(first_install, "SELECT id FROM people")[0][0]
     assert ident.actor == person_id
     assert identity.in_scope(ident, "any-product-at-all")
+
+
+def test_the_credential_records_when_it_was_minted(first_install, capsys):
+    """The entry's `created_at` is the instant the person row records, in the
+    credential file's own format (CQ·140)."""
+    rc, out, _ = _run(capsys, NAME)
+    assert rc == 0
+    entry = identity._client_tokens()[out.strip()]
+    created = _rows(first_install, "SELECT created_at FROM people")[0][0]
+    assert entry["created_at"] == identity.created_at_stamp(
+        datetime.datetime.fromisoformat(created))
 
 
 def test_stdout_is_the_token_alone_and_status_goes_to_stderr(

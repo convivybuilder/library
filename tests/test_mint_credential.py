@@ -9,6 +9,7 @@ either — the same shape `tests/test_bootstrap_library.py` builds for
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import stat
 import subprocess
@@ -46,6 +47,42 @@ def _run(capsys, *argv):
     return rc, out, err
 
 
+def _without_created_at(entry: dict) -> dict:
+    """The entry minus its `created_at`, after checking that field is a
+    well-formed UTC stamp; the tests that compare a whole entry compare the
+    rest of it."""
+    rest = dict(entry)
+    assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", rest.pop("created_at"))
+    return rest
+
+
+@pytest.mark.parametrize("file", ["agents", "clients"])
+def test_a_minted_entry_records_when_it_was_minted(fresh_files, capsys, file):
+    """CQ·140: each entry carries its own minting time, so a credential's age
+    is no longer read off the file's mtime, which is one value for every
+    entry in the file."""
+    before = identity.created_at_stamp()
+    rc, out, _ = _run(capsys, "--file", file, "--name", "orient")
+    after = identity.created_at_stamp()
+    assert rc == 0
+    path = identity.TOKENS if file == "agents" else identity.CLIENT_TOKENS
+    entry = json.loads(path.read_text())[out.strip()]
+    assert before <= entry["created_at"] <= after
+
+
+def test_resolve_ignores_created_at_however_it_is_written(fresh_files):
+    """`resolve()` never consults the field, so an entry with a malformed one
+    authenticates exactly as an entry without one."""
+    fresh_files.mkdir(parents=True)
+    identity.TOKENS.write_text(json.dumps({
+        "tok-none": {"name": "a", "products": ["*"]},
+        "tok-junk": {"name": "b", "products": ["*"], "created_at": {"not": "a date"}},
+    }))
+    for token, actor in (("tok-none", "a"), ("tok-junk", "b")):
+        ident = identity.resolve(f"Bearer {token}")
+        assert ident is not None and ident.actor == actor
+
+
 # --- the import-time trap `library#155`'s review caught ----------------------
 
 
@@ -73,7 +110,7 @@ def test_a_fresh_shell_with_neither_db_variable_set_does_not_crash(tmp_path):
     token = result.stdout.strip()
     assert token
     loaded = json.loads((tmp_path / ".library" / "api-tokens.json").read_text())
-    assert loaded[token] == {"name": "orient", "products": ["*"]}
+    assert _without_created_at(loaded[token]) == {"name": "orient", "products": ["*"]}
 
 
 # --- minting into each file, read back through identity's own resolver -------
@@ -264,6 +301,102 @@ def test_empty_grants_writes_no_grants_key(fresh_files, capsys):
     assert "grants" not in loaded[token]
 
 
+# --- --profile: --file agents only (issue_01M35QG0VANA5P1XE3PH6A7PS4) --------
+
+
+def test_profile_is_written_and_resolves(fresh_files, capsys):
+    rc, out, err = _run(capsys, "--file", "agents", "--name", "shipwright",
+                        "--profile", "shipwright/daytime")
+    assert rc == 0, err
+    token = out.strip()
+    loaded = identity._tokens()
+    assert loaded[token]["profile"] == "shipwright/daytime"
+
+    ident = identity.resolve(f"Bearer {token}")
+    assert ident is not None
+    assert ident.profile == "shipwright/daytime"
+
+
+def test_no_profile_writes_no_profile_key(fresh_files, capsys):
+    rc, out, _ = _run(capsys, "--file", "agents", "--name", "orient")
+    assert rc == 0
+    token = out.strip()
+    loaded = identity._tokens()
+    assert "profile" not in loaded[token]
+
+
+def test_a_malformed_profile_is_refused_and_writes_nothing(fresh_files, capsys):
+    identity.TOKENS.parent.mkdir(parents=True)
+    identity.TOKENS.write_text(json.dumps(
+        {"an-existing-token": {"name": "deck", "products": ["*"]}}))
+    identity.TOKENS.chmod(0o600)
+    before = identity.TOKENS.read_bytes()
+
+    rc, out, err = _run(capsys, "--file", "agents", "--name", "orient",
+                        "--profile", "no-slash-here")
+    assert rc == 1
+    assert out == ""
+    assert "profile" in err
+    assert identity.TOKENS.read_bytes() == before
+
+
+def test_profile_for_the_clients_file_is_refused(fresh_files, capsys):
+    rc, out, err = _run(capsys, "--file", "clients", "--name", "orient",
+                        "--profile", "shipwright/daytime")
+    assert rc == 2
+    assert out == ""
+    assert "--file agents" in err
+    assert not identity.CLIENT_TOKENS.exists()
+
+
+# --- --crew: --file agents only (CQ·10, the operator's ruling of 2026-10-15) ----------
+
+
+def test_crew_is_written_and_resolves(fresh_files, capsys):
+    rc, out, err = _run(capsys, "--file", "agents", "--name", "shipwright",
+                        "--crew", "shipwright")
+    assert rc == 0, err
+    token = out.strip()
+    loaded = identity._tokens()
+    assert loaded[token]["crew"] == "shipwright"
+
+    ident = identity.resolve(f"Bearer {token}")
+    assert ident is not None
+    assert ident.crew == "shipwright"
+
+
+def test_no_crew_writes_no_crew_key(fresh_files, capsys):
+    rc, out, _ = _run(capsys, "--file", "agents", "--name", "orient")
+    assert rc == 0
+    token = out.strip()
+    loaded = identity._tokens()
+    assert "crew" not in loaded[token]
+
+
+def test_a_malformed_crew_is_refused_and_writes_nothing(fresh_files, capsys):
+    identity.TOKENS.parent.mkdir(parents=True)
+    identity.TOKENS.write_text(json.dumps(
+        {"an-existing-token": {"name": "deck", "products": ["*"]}}))
+    identity.TOKENS.chmod(0o600)
+    before = identity.TOKENS.read_bytes()
+
+    rc, out, err = _run(capsys, "--file", "agents", "--name", "orient",
+                        "--crew", "Has-Upper")
+    assert rc == 1
+    assert out == ""
+    assert "crew" in err
+    assert identity.TOKENS.read_bytes() == before
+
+
+def test_crew_for_the_clients_file_is_refused(fresh_files, capsys):
+    rc, out, err = _run(capsys, "--file", "clients", "--name", "orient",
+                        "--crew", "shipwright")
+    assert rc == 2
+    assert out == ""
+    assert "--file agents" in err
+    assert not identity.CLIENT_TOKENS.exists()
+
+
 # --- round 2 (reviewer): an explicit --products "" must still be refused ----
 #
 # `--products` defaulting to `None` (so `--revoke` can tell it apart from an
@@ -314,8 +447,8 @@ def test_replace_swaps_the_token_and_keeps_the_name(fresh_files, capsys):
 
     loaded = identity._tokens()
     assert list(loaded.keys()) == [second_token]
-    assert loaded[second_token] == {"name": "orient", "products": ["*"],
-                                    "kind": "system"}
+    assert _without_created_at(loaded[second_token]) == {
+        "name": "orient", "products": ["*"], "kind": "system"}
 
 
 # --- file safety: mode, atomicity, and other entries -------------------------
@@ -786,7 +919,7 @@ def test_revoke_removes_exactly_that_entry_and_keeps_others(fresh_files, capsys)
 
     loaded = identity._tokens()
     assert list(loaded.keys()) == [kept_token]
-    assert loaded[kept_token] == {"name": "deck", "products": ["*"]}
+    assert _without_created_at(loaded[kept_token]) == {"name": "deck", "products": ["*"]}
     assert gone_token not in loaded
     assert identity.resolve(f"Bearer {gone_token}") is None
     assert identity.resolve(f"Bearer {kept_token}") is not None
@@ -887,6 +1020,8 @@ def test_revoke_a_duplicated_name_is_refused_and_writes_nothing_and_names_neithe
     ["--products", "vivy"],
     ["--kind", "system"],
     ["--grants", "review_record.create"],
+    ["--profile", "shipwright/daytime"],
+    ["--crew", "shipwright"],
     ["--holds-reserved", "signal.ack"],
     ["--withholds", "item.create"],
 ])

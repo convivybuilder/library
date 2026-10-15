@@ -25,7 +25,7 @@ import store
 SCHEMA = """
 CREATE TABLE issue_items (
     id TEXT PRIMARY KEY, product TEXT, title TEXT, once_key TEXT UNIQUE,
-    embedded_at TEXT, created_at TEXT);
+    embedded_at TEXT, created_at TEXT, short_description TEXT);
 CREATE TABLE signals (
     id TEXT PRIMARY KEY, product TEXT, body TEXT,
     dedup_key TEXT UNIQUE, embedded_at TEXT, ingested_at TEXT);
@@ -33,10 +33,10 @@ CREATE TABLE decision_items (id TEXT PRIMARY KEY, product TEXT, body TEXT);
 CREATE TABLE signal_acks (id TEXT PRIMARY KEY, signal_id TEXT, identity TEXT);
 CREATE TABLE courses (id TEXT PRIMARY KEY, product TEXT, title TEXT);
 CREATE TABLE issue_leases (
-    id TEXT PRIMARY KEY, root_id TEXT, holder TEXT, released_at TEXT);
+    id TEXT PRIMARY KEY, root_id TEXT, holder TEXT, holder_crew TEXT, released_at TEXT);
 CREATE UNIQUE INDEX ix_issue_leases_live_root ON issue_leases (root_id)
     WHERE released_at IS NULL;
-CREATE TABLE lease_refusals (id TEXT PRIMARY KEY, at TEXT);
+CREATE TABLE lease_refusals (id TEXT PRIMARY KEY, at TEXT, blocking_taken_for TEXT);
 CREATE TABLE course_events (id TEXT PRIMARY KEY, course_id TEXT, at TEXT);
 CREATE TABLE issue_comments (
     id INTEGER PRIMARY KEY AUTOINCREMENT, item_id TEXT, actor TEXT,

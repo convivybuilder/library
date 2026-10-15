@@ -1837,6 +1837,82 @@ say "Building pinned interpreter ($PYTHON_BIN -m venv)"
 rm -rf "$BUILD_CACHE"
 unset CARGO_HOME RUSTUP_HOME PIP_CACHE_DIR XDG_CACHE_HOME
 
+# --- rewrite the staged console scripts' shebangs for where they end up ----
+# pip writes each console script (pip itself, and one per entry point any
+# requirement declares — alembic, etc.) with an absolute shebang naming the
+# interpreter AT THE PATH THE VENV STOOD WHEN PIP RAN: $STAGE/.venv/bin/
+# python3.11. The swap below renames $STAGE to $DEPLOY_DIR, so every one of
+# those shebangs is left naming a path that no longer exists (CQ-111).
+# `python -m venv --upgrade` repairs neither: it refreshes the interpreter
+# links and skips `setup_scripts` entirely, so it rewrites no activation
+# script, and it leaves a console script pip already wrote untouched — both
+# confirmed against a throwaway venv moved and then upgraded in place. That
+# is why the activation-script branch below is load-bearing rather than a
+# belt to `--upgrade`'s braces. So this rewrites
+# the scripts themselves, by hand, here in the stage and before the swap:
+# the swap stays the single atomic rename it already is, and every shebang
+# is correct the moment it lands, with no window where $DEPLOY_DIR holds
+# code whose scripts name a path that is about to vanish.
+#
+# Run with the staged venv's own python3 — never the shell — because the
+# portable way to rewrite one line of a file without `sed -i`, whose flag
+# syntax differs between BSD and GNU (platform/decisions/0010: this script
+# runs on both), is the same small-inline-script shape _DB_READ_PY already
+# uses above. Symlinks (python, python3, python3.11 itself) are left alone:
+# pip never points a console script's shebang at one of those, and rewriting
+# a symlink's own target is a different, uninvited change. The four
+# activation scripts embed the same stage path as plain text, not a shebang
+# — confirmed directly: activate, activate.csh and activate.fish each embed
+# it as VIRTUAL_ENV=<path>, Activate.ps1 derives its venv directory at
+# import time from its own script location and embeds no path at all — so
+# the rewrite checks all four and only touches the three that carry it.
+_REWRITE_VENV_SHEBANGS_PY='
+import os
+import sys
+
+stage_venv, deploy_venv = sys.argv[1], sys.argv[2]
+bin_dir = os.path.join(stage_venv, "bin")
+old_interp_prefix = "#!" + stage_venv + "/bin/"
+activation_scripts = ("activate", "activate.csh", "activate.fish", "Activate.ps1")
+rewritten = []
+
+for name in sorted(os.listdir(bin_dir)):
+    path = os.path.join(bin_dir, name)
+    if os.path.islink(path) or not os.path.isfile(path):
+        continue
+    with open(path, "rb") as f:
+        data = f.read()
+    nl = data.find(b"\n")
+    first_line = data[:nl] if nl != -1 else data
+    try:
+        first_text = first_line.decode("utf-8")
+    except UnicodeDecodeError:
+        continue
+    if first_text.startswith(old_interp_prefix):
+        new_first = "#!" + deploy_venv + "/bin/" + first_text[len(old_interp_prefix):]
+        new_data = new_first.encode("utf-8") + data[len(first_line):]
+        mode = os.stat(path).st_mode
+        with open(path, "wb") as f:
+            f.write(new_data)
+        os.chmod(path, mode)
+        rewritten.append(name)
+    elif name in activation_scripts:
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        if stage_venv in text:
+            mode = os.stat(path).st_mode
+            with open(path, "wb") as f:
+                f.write(text.replace(stage_venv, deploy_venv).encode("utf-8"))
+            os.chmod(path, mode)
+            rewritten.append(name)
+
+print(" ".join(rewritten))
+'
+say "Rewriting staged console-script shebangs for $DEPLOY_DIR"
+"$STAGE/.venv/bin/python3" -c "$_REWRITE_VENV_SHEBANGS_PY" "$STAGE/.venv" "$DEPLOY_DIR/.venv" >/dev/null
+
 {
   echo "ref: $REF"
   echo "commit: $SHA"
@@ -1921,6 +1997,24 @@ if [ "$RELOADING" -ne 1 ] && [ -n "$OLD" ]; then
 fi
 
 say "Deployed: $DEPLOY_DIR (commit $SHA)"
+
+# --- verify: run one of the rewritten console scripts for real, rather than
+# grepping its shebang, so a version string that only LOOKS right is not
+# read as proof. Warns only (CQ-111): the service never execs a console
+# script itself (serve.sh execs $DEPLOY_DIR/.venv/bin/python3 directly), the
+# code has already swapped in, and a plist reload below may already be
+# under way — undoing the install over a broken console script would be a
+# bigger outage than the thing it's catching, for a path nothing serving
+# traffic depends on.
+PIP_VERSION_OUT=""
+if ! PIP_VERSION_OUT="$("$DEPLOY_DIR/.venv/bin/pip" --version 2>&1)"; then
+  warn "$DEPLOY_DIR/.venv/bin/pip --version failed after the swap: $PIP_VERSION_OUT"
+else
+  case "$PIP_VERSION_OUT" in
+    *"$DEPLOY_DIR/.venv"*) ;;
+    *) warn "$DEPLOY_DIR/.venv/bin/pip --version did not name $DEPLOY_DIR/.venv: $PIP_VERSION_OUT" ;;
+  esac
+fi
 
 # --- plist: written now, after the code swap above, from the SAME candidate
 # the decision at the top of this script already made (never re-read, never

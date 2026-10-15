@@ -280,6 +280,24 @@ class SubtreeTooLarge(RuntimeError):
     """
 
 
+class CrewMismatch(Exception):
+    """A live lease whose `holder` string matches this caller's `owner` is
+    recorded as a different crew's (CQ·10).
+
+    Raised instead of returning quietly from the refresh branch `take` would
+    otherwise take: a caller reaching that branch has read the real holder's
+    name from somewhere and typed it back, which is exactly the attack this
+    exception exists to stop rather than silently honour. Carries the lease
+    row so the caller can decide what to disclose — `app.py`'s own refusal
+    names neither crew.
+    """
+
+    def __init__(self, row):
+        self.lease = row
+        super().__init__(f"lease {row['id']} on {row['root_id']} is "
+                         f"recorded as a different crew's")
+
+
 class LeaseConflict(Exception):
     """A live lease already fences what this checkout would take.
 
@@ -354,12 +372,15 @@ def subtree_ids(conn, root_id: str, *, max_nodes: int | None = None):
 
 
 def find_conflict(conn, root_id: str, *, now=None,
-                  ignore_holder: str | None = None):
+                  ignore_holder: str | None = None,
+                  holder_crew: str | None = None, crew_exempt: bool = False):
     """The live lease that would collide with taking a lease on `root_id`.
 
     `ignore_holder` skips that holder's own leases: a lease never refuses its
     own holder (the operator, 2026-09-11: "The idea is that *only* the person/agent with
     the checkout can make the change. Not that *nobody* can make a change.").
+    Which leases are "its own" is `held_by`'s answer, crew included, through
+    `holder_crew` and `crew_exempt`.
 
     **THE INVARIANT IS THAT NO TWO LIVE LEASES MAY HAVE OVERLAPPING FENCES**, and
     it takes two lookups in opposite directions because a fence reaches downward
@@ -384,12 +405,15 @@ def find_conflict(conn, root_id: str, *, now=None,
     extent was never enumerated, which fails OPEN.
     """
     conflicts = live_conflicts(conn, root_id, now=now,
-                               ignore_holder=ignore_holder)
+                               ignore_holder=ignore_holder,
+                               holder_crew=holder_crew, crew_exempt=crew_exempt)
     return conflicts[0] if conflicts else None
 
 
 def live_conflicts(conn, root_id: str, *, now=None,
-                   ignore_holder: str | None = None) -> list:
+                   ignore_holder: str | None = None,
+                   holder_crew: str | None = None,
+                   crew_exempt: bool = False) -> list:
     """EVERY live lease overlapping this fence, nearest first, leaving out
     `ignore_holder`'s own when it is given.
 
@@ -410,7 +434,8 @@ def live_conflicts(conn, root_id: str, *, now=None,
     """
     def counts(held) -> bool:
         return (not is_dead(held, now=now)
-                and (ignore_holder is None or held["holder"] != ignore_holder))
+                and not held_by(held, ignore_holder, crew=holder_crew,
+                                crew_exempt=crew_exempt))
 
     out = []
     for rid in [root_id, *ancestor_ids(conn, root_id)]:
@@ -436,18 +461,35 @@ def _release_row(conn, row, *, reason: str, by: str, note: str | None = None):
         (now.isoformat(" "), reason, by, note, row["id"]))
 
 
-def held_by(row, holder: str | None) -> bool:
-    """Whether `holder` holds the lease `row`.
+def held_by(row, holder: str | None, *, crew: str | None = None,
+            crew_exempt: bool = False) -> bool:
+    """Whether `holder`, presenting a credential of `crew`, holds the lease `row`.
+
+    **THE HOLDER STRING ALONE IS NOT ENOUGH ON A CREWED LEASE** (CQ·10;
+    security-reviewer, PR 287 round 1). Anyone can read a holder's name and
+    type it back, so a lease that records a crew is the caller's own only when
+    the caller's crew matches it, or the caller is `crew_exempt` (the
+    human-attested approved client ADR-0026 reserves). A lease with no recorded
+    crew matches on the string alone, as before. A caller that passes no crew
+    and no exemption is never the holder of a crewed lease, so a call site that
+    forgets to pass them fails closed.
 
     A comparison, not a disclosure. It lives here so a caller that only compares
     holders does not read the holder field itself, which is the token
     `test_every_lease_disclosure_checks_the_roots_product` looks for when it
     finds the functions that disclose a lease to a caller.
     """
-    return holder is not None and row["holder"] == holder
+    if holder is None or row["holder"] != holder:
+        return False
+    try:
+        recorded = row["holder_crew"]
+    except (IndexError, KeyError):
+        recorded = None
+    return crew_exempt or recorded is None or recorded == crew
 
 
-def record_write(conn, item, *, holder: str, actor: str, act: str) -> None:
+def record_write(conn, item, *, holder: str, actor: str, act: str,
+                 holder_crew: str | None = None) -> None:
     """Record a lease held for exactly one write: taken and released at once.
 
     `app._hold_for_write` calls this when no live lease covers `item`, so the
@@ -456,19 +498,37 @@ def record_write(conn, item, *, holder: str, actor: str, act: str) -> None:
     so it fences nothing and no live-lease query ever sees it. It rides the
     caller's transaction: committed with the write, or rolled back with it when
     a later check refuses.
+
+    `holder_crew` is which crew took it (CQ·10), `None` for a credential
+    bound to no crew — every credential minted before that field existed.
+    Recorded for parity with every other lease row even though this one
+    fences nothing: a caller reading `issue_leases` back should not find a
+    `LEASE_WRITTEN` row the odd one out for lacking it.
     """
     now = _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None).isoformat(" ")
     conn.execute(
         "INSERT INTO issue_leases (id, root_id, taken_for, holder, taken_at, "
-        "heartbeat_at, released_at, release_reason, released_by, note) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        "heartbeat_at, released_at, release_reason, released_by, note, "
+        "holder_crew) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         (f"lease_{new_ulid()}", root_id_for(conn, item), item["id"], holder, now,
-         now, now, LEASE_WRITTEN, actor, act))
+         now, now, LEASE_WRITTEN, actor, act, holder_crew))
 
 
 def take(conn, item, *, holder: str, actor: str, run_id: str | None = None,
+         holder_crew: str | None = None, crew_exempt: bool = False,
          force: bool = False):
     """Take, refresh or reclaim the lease covering `item`, for `holder`.
+
+    `holder_crew` is which crew `holder` names, recorded on every row this
+    inserts or refreshes (CQ·10). `crew_exempt` is true for a human-attested
+    approved-client caller, the one ADR-0026 reserves the live-lease-breaking
+    force path to regardless of crew; every other caller's own crew is
+    checked against a live lease's recorded one on the refresh branch below,
+    raising `CrewMismatch` rather than silently refreshing a different
+    crew's lease — see that exception's own docstring for why this has to be
+    its own raise rather than folded into the conflict scan `find_conflict`
+    already runs: the scan's own `ignore_holder` treats a matching `holder`
+    string as this caller's own and never reaches it as a conflict at all.
 
     Four outcomes, distinguished because the override rate depends on it:
 
@@ -509,19 +569,35 @@ def take(conn, item, *, holder: str, actor: str, run_id: str | None = None,
         conn.execute("BEGIN IMMEDIATE")
 
     def _refresh(row):
+        # **AN EXEMPT CALLER KEEPS THE CREW ALREADY RECORDED** (reviewer, PR
+        # 287 round 1). An approved client carries no crew, so stamping its
+        # `holder_crew` would write NULL over a crewed lease and hand that
+        # lease to any uncrewed credential that types the holder's name.
+        crew = row["holder_crew"] if crew_exempt else holder_crew
         conn.execute(
             "UPDATE issue_leases SET heartbeat_at = ?, taken_at = ?, "
-            "taken_for = ?, run_id = COALESCE(?, run_id) WHERE id = ?",
+            "taken_for = ?, run_id = COALESCE(?, run_id), holder_crew = ? "
+            "WHERE id = ?",
             # `taken_at` moves too: a LIVE holder re-checking out resets the hard
             # cap. That is the one path that may, which is what bounds a misnamed
-            # heartbeat to the cap.
+            # heartbeat to the cap. A non-exempt caller's crew is stamped
+            # outright: the crew check upstream cleared it to re-take the row.
             (now.isoformat(" "), now.isoformat(" "), item["id"], run_id,
-             row["id"]))
+             crew, row["id"]))
         return conn.execute("SELECT * FROM issue_leases WHERE id = ?",
                             (row["id"],)).fetchone()
 
     held = live_lease_on(conn, root_id)
     if held is not None and held["holder"] == holder and not is_dead(held, now=now):
+        # **THE CREW CHECK RUNS FIRST, under the write lock just above**
+        # (CQ·10). `held["holder"] == holder` is exactly the condition an
+        # attacker who read this lease's real holder off it and typed it
+        # back as `owner` also satisfies — this is the one branch
+        # `find_conflict`'s `ignore_holder` scan cannot catch, because it
+        # treats a matching string as this caller's own by design.
+        if (not crew_exempt and held["holder_crew"] is not None
+                and held["holder_crew"] != holder_crew):
+            raise CrewMismatch(held)
         # THE HOLDER RE-CHECKING OUT ITS OWN LIVE LEASE. Returns here rather than
         # falling through, because the insert below would add a second live row
         # on this root, which the partial unique index refuses. The walk itself
@@ -544,7 +620,9 @@ def take(conn, item, *, holder: str, actor: str, run_id: str | None = None,
     # it was refused by its own lease until then. Its two leases now overlap,
     # which blocks nobody else: every other holder still meets both of them.
     while (conflict := find_conflict(conn, root_id, now=now,
-                                     ignore_holder=holder)) is not None:
+                                     ignore_holder=holder,
+                                     holder_crew=holder_crew,
+                                     crew_exempt=crew_exempt)) is not None:
         if not force:
             raise conflict
         _release_row(conn, conflict.lease, reason=LEASE_OVERRIDDEN, by=actor,
@@ -565,9 +643,9 @@ def take(conn, item, *, holder: str, actor: str, run_id: str | None = None,
     try:
         conn.execute(
             "INSERT INTO issue_leases (id, root_id, taken_for, holder, run_id, "
-            "taken_at, heartbeat_at) VALUES (?,?,?,?,?,?,?)",
+            "taken_at, heartbeat_at, holder_crew) VALUES (?,?,?,?,?,?,?,?)",
             (lease_id, root_id, item["id"], holder, run_id, now.isoformat(" "),
-             now.isoformat(" ")))
+             now.isoformat(" "), holder_crew))
     except sqlite3.IntegrityError:
         # LOST THE INSERT RACE against a concurrent checkout of the same root.
         # With the write lock held from the scan this is now the narrow case the
@@ -613,11 +691,13 @@ def record_refusal(conn, item, conflict, *, requester: str, actor: str) -> None:
     conn.execute(
         "INSERT INTO lease_refusals (id, at, requested_item_id, product, "
         "requester, actor, blocking_lease_id, blocking_root_id, "
-        "blocking_holder, blocks_by) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        "blocking_holder, blocks_by, blocking_taken_for) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         (f"ref_{new_ulid()}",
          _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None).isoformat(" "),
          item["id"], item["product"], requester, actor, held["id"],
-         held["root_id"], held["holder"], conflict.blocks_by))
+         held["root_id"], held["holder"], conflict.blocks_by,
+         held["taken_for"]))
 
 
 def claim_status(conn, item, *, now=None):
@@ -1026,11 +1106,14 @@ def release_claim(conn, item_id: str, *, actor: str, note: str | None,
     call site. A claim returned while its fence stays up is the worst of both —
     the item returns to the queue, a drain picks it up, and the checkout is
     refused by a lease its own previous holder walked away from.
+
+    `claimed_by_crew` clears with `claimed_by`: a row back in the pool should
+    not read as still bound to whoever last held it, crew included.
     """
     now = _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None)
     conn.execute(
-        "UPDATE issue_items SET state = ?, claimed_by = NULL, claimed_at = NULL "
-        "WHERE id = ?", (store.ITEM_STATE_OPEN, item_id))
+        "UPDATE issue_items SET state = ?, claimed_by = NULL, claimed_at = NULL, "
+        "claimed_by_crew = NULL WHERE id = ?", (store.ITEM_STATE_OPEN, item_id))
     conn.execute(
         "INSERT INTO issue_events (item_id, actor, from_state, to_state, at, note) "
         "VALUES (?,?,?,?,?,?)",
@@ -1054,6 +1137,13 @@ def refusal_dict(row, *, blocker_visible: bool = False) -> dict:
     the branch above the requested item, or a descendant held something below it.
     The two mean different things about how work was sliced, which is why
     `librarian_metrics` breaks its count down by the same field.
+
+    **`blocking_taken_for` IS THE ITEM THE OTHER CREW ASKED FOR**
+    (issue_01M0RCF408K7TBE0N9VP224MGA). Equal to `requested_item_id`, the two
+    crews wanted the same item; different, one crew's fence covered the other's
+    sibling. Neither `blocks_by` nor `blocking_root_id` can say which, because
+    a leaf leases its parent. Null on a row recorded before the column existed
+    whose lease is gone.
     """
     out = {
         "id": row["id"],
@@ -1077,6 +1167,9 @@ def refusal_dict(row, *, blocker_visible: bool = False) -> dict:
         out["blocking_lease_id"] = row["blocking_lease_id"]
         out["blocking_root_id"] = row["blocking_root_id"]
         out["blocking_holder"] = row["blocking_holder"]
+        # Withheld with the three above, because it names the other crew's
+        # work as surely as its root does.
+        out["blocking_taken_for"] = row["blocking_taken_for"]
     else:
         out["blocked"] = True
     return out

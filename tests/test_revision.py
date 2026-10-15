@@ -55,7 +55,7 @@ def client(tmp_path, monkeypatch, vector_index):
     conn.executescript("""
         CREATE TABLE issue_items (
             id TEXT PRIMARY KEY, product TEXT, title TEXT, body TEXT, refs TEXT,
-            severity TEXT, state TEXT, claimed_by TEXT, claimed_at TEXT,
+            severity TEXT, state TEXT, claimed_by TEXT, claimed_by_crew TEXT, claimed_at TEXT,
             resolution TEXT, resolved_by TEXT, resolved_at TEXT, outcome_note TEXT,
             once_key TEXT UNIQUE, created_by TEXT, created_at TEXT, run_id TEXT,
             type TEXT, created_by_kind TEXT, needs TEXT, park_reason TEXT,
@@ -63,7 +63,7 @@ def client(tmp_path, monkeypatch, vector_index):
             parent_id TEXT, topics TEXT, maturity TEXT, specification TEXT,
             definition_of_done TEXT, prerequisites TEXT,
             model_choice TEXT, model_reason TEXT, model_set_by_client TEXT,
-            model_acting_human TEXT, model_set_at TEXT, found_during TEXT, item_key TEXT);
+            model_acting_human TEXT, model_set_at TEXT, found_during TEXT, item_key TEXT, short_description TEXT);
         CREATE TABLE issue_item_key_counters (
             scope_kind TEXT, scope_id TEXT, next_value INTEGER,
             PRIMARY KEY (scope_kind, scope_id));
@@ -74,7 +74,7 @@ def client(tmp_path, monkeypatch, vector_index):
             id INTEGER PRIMARY KEY AUTOINCREMENT, item_id TEXT, actor TEXT,
             kind TEXT, body TEXT, run_id TEXT, at TEXT);
         CREATE TABLE issue_leases (
-            id TEXT PRIMARY KEY, root_id TEXT, taken_for TEXT, holder TEXT,
+            id TEXT PRIMARY KEY, root_id TEXT, taken_for TEXT, holder TEXT, holder_crew TEXT,
             run_id TEXT, taken_at TEXT, heartbeat_at TEXT, released_at TEXT,
             release_reason TEXT, released_by TEXT, note TEXT);
         CREATE UNIQUE INDEX ix_live_root ON issue_leases (root_id)
@@ -82,7 +82,7 @@ def client(tmp_path, monkeypatch, vector_index):
         CREATE TABLE lease_refusals (
             id TEXT PRIMARY KEY, at TEXT, requested_item_id TEXT, product TEXT,
             requester TEXT, actor TEXT, blocking_lease_id TEXT,
-            blocking_root_id TEXT, blocking_holder TEXT, blocks_by TEXT);
+            blocking_root_id TEXT, blocking_holder TEXT, blocks_by TEXT, blocking_taken_for TEXT);
         CREATE TABLE courses (
             id TEXT PRIMARY KEY, product TEXT, title TEXT, entries TEXT,
             status TEXT, version INTEGER, created_by TEXT, created_at TEXT,
@@ -733,3 +733,39 @@ def test_a_revision_that_races_a_concurrent_resolve_is_rolled_back(client,
     assert row["state"] == "fixed"
     assert row["title"] == "A held item"
     assert _notes("held") == []
+
+
+# --- short_description (issue_01M0XR0QSMKBSGBYD49CPTJ37E) ----------------------
+
+
+def test_a_short_description_can_be_set_and_cleared(client):
+    _take_lease("held")
+    r = _revise(client, "held", {"short_description": "Held label"})
+    assert r.status_code == 200
+    assert r.json()["item"]["short_description"] == "Held label"
+    assert _row("held")["short_description"] == "Held label"
+    assert "**short_description:**" in _notes("held")[0]
+    r = _revise(client, "held", {"short_description": None})
+    assert r.status_code == 200
+    assert _row("held")["short_description"] is None
+
+
+def test_a_short_description_over_the_cap_is_refused_and_stores_nothing(client):
+    _take_lease("held")
+    r = _revise(client, "held", {
+        "short_description": "s" * (store.MAX_SHORT_DESCRIPTION + 1)})
+    assert r.status_code == 400
+    assert r.json()["limit"] == store.MAX_SHORT_DESCRIPTION
+    assert _row("held")["short_description"] is None
+
+
+def test_a_short_description_revision_keeps_the_approval_and_the_vectors(client):
+    """The label is not embedded and is not part of what an operator approves,
+    so changing it moves neither."""
+    _take_lease("epic")
+    libapp.vectors.embed_item_by_id(libapp.vectors.VAULT_CHART_HOUSE, "epic")
+    before = conftest.vectors_for(store.DB_PATH, "epic")
+    r = _revise(client, "epic", {"short_description": "Epic label"})
+    assert r.status_code == 200
+    assert r.json()["item"]["maturity"] == "approved"
+    assert conftest.vectors_for(store.DB_PATH, "epic") == before

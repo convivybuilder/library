@@ -18,9 +18,11 @@ token the Library minted rather than a file both processes read.
 """
 from __future__ import annotations
 
+import datetime as _dt
 import hashlib
 import json
 import os
+import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -599,6 +601,23 @@ class Identity:
     # human-reserved capability its role does. A set (even empty): it holds
     # exactly those of them and no other, whatever HUMAN_RESERVED_CAPS gains.
     holds_reserved: frozenset[str] | None = None
+    # None: this credential reads the whole Reference Room, as every one
+    # does today. A `"<project>/<variant>"` string: every `/reference/*`
+    # read (and the Reference Room half of `GET /search`) is scoped
+    # server-side to what that profile's `include` rules select
+    # (issue_01M35QG0VANA5P1XE3PH6A7PS4, `crew_profiles.bound_scope`).
+    # Settable only on an agents-file entry — never on a client — and
+    # validated at load time the same way every other entry field is.
+    profile: str | None = None
+    # None: this credential names no crew, which is every credential minted
+    # before this field existed and every one minted with no `--crew`. A
+    # crew slug: which crew took it, so a held work item or epic lease this
+    # credential takes on can later refuse a release, resolve, reopen,
+    # checkout or claim from a different crew's credential naming the same
+    # `owner` string (CQ·10, the operator's ruling of 2026-10-15). Settable only on an
+    # agents-file entry — never on a client, which is Orient, Deck or the
+    # Bosun's own machine credential rather than one crew's.
+    crew: str | None = None
 
     @property
     def caps(self) -> frozenset[str]:
@@ -788,6 +807,87 @@ def _entry_holds_reserved(meta: dict, kind: str, label: str,
     return frozenset(raw)
 
 
+# **`<project>/<variant>` — THE SAME SHAPE `crew_profiles.profile_row` KEYS
+# ON**, each part a non-empty identifier of at most `store.MAX_IDENT`
+# characters, matching `crew_registry._validate_ident_str`'s own bound on
+# `project` and `variant`. Checked here at load time rather than left for
+# `crew_profiles.bound_scope` to discover at read time, so a malformed
+# `profile` refuses the one entry that carries it (on the agents file) or the
+# whole client store (see `_entry_profile` below) the same way every other
+# malformed field does, rather than silently scoping every read to nothing
+# the first time a route asks.
+PROFILE_RE = re.compile(
+    r"\A[A-Za-z0-9][A-Za-z0-9._-]{0," + str(store.MAX_IDENT - 1) + r"}"
+    r"/[A-Za-z0-9][A-Za-z0-9._-]{0," + str(store.MAX_IDENT - 1) + r"}\Z")
+
+
+def _entry_profile(meta: dict, kind: str, label: str) -> str | None:
+    """The entry's `profile` dispatch-profile binding, `None` when the field
+    is absent, or `_BadEntry`.
+
+    **NOT SETTABLE ON A CLIENT ENTRY.** `profile` scopes an agents-file
+    credential's `/reference/*` reads to one crew's dispatch profile; the
+    approved-client file carries a verified human's client (ADR-0038), which
+    has no single dispatch profile to bind to and must keep reading the
+    whole Reference Room, as it does today. Refusing it here is the same
+    shape `_entry_holds_reserved` refuses the opposite direction with: a
+    field meaningful on one side of the credential split is refused on the
+    other, rather than silently ignored.
+
+    Refused on any kind: a value that is not a string, or one that does not
+    match `PROFILE_RE` — `crew_profiles.bound_scope` splits this string on
+    its one `/` with no further validation, so a malformed value refused
+    here is a malformed value that never reaches that split.
+    """
+    if "profile" not in meta:
+        return None
+    if kind == "approved_client":
+        raise _BadEntry(f"entry {label}: kind {kind!r} may not carry "
+                        f"'profile'; only an agents-file entry does")
+    raw = meta["profile"]
+    if not isinstance(raw, str) or not PROFILE_RE.match(raw):
+        raise _BadEntry(
+            f"entry {label}: 'profile' must be '<project>/<variant>', each "
+            f"part a non-empty identifier of at most {store.MAX_IDENT} "
+            f"characters; got {raw!r}")
+    return raw
+
+
+# **A CREW SLUG: lowercase letters, digits and hyphens only, bounded by
+# `store.MAX_IDENT`** (CQ·10, the operator's ruling of 2026-10-15). It names which crew
+# took a credential and nothing else — `resolve_capabilities` never reads it,
+# and no role or entry grants or withholds a capability by it.
+CREW_RE = re.compile(r"\A[a-z0-9-]{1," + str(store.MAX_IDENT) + r"}\Z")
+
+
+def _entry_crew(meta: dict, kind: str, label: str) -> str | None:
+    """The entry's `crew` — which crew took this credential — `None` when the
+    field is absent, or `_BadEntry`.
+
+    **NOT SETTABLE ON A CLIENT ENTRY**, the same shape `_entry_profile`
+    refuses the opposite direction with. The approved-client file carries
+    Orient, Deck or the Bosun's own machine credential (ADR-0038), never one
+    crew's, so a client entry naming a crew is refused here — `_client_tokens()`
+    calls this over every client entry too, which makes the refusal fatal to
+    the whole store the same way an unresolvable `profile` already is.
+
+    Refused on any kind: a value that is not a string, or one that is not a
+    crew slug matching `CREW_RE`.
+    """
+    if "crew" not in meta:
+        return None
+    if kind == "approved_client":
+        raise _BadEntry(f"entry {label}: kind {kind!r} may not carry "
+                        f"'crew'; only an agents-file entry does")
+    raw = meta["crew"]
+    if not isinstance(raw, str) or not CREW_RE.match(raw):
+        raise _BadEntry(
+            f"entry {label}: 'crew' must be a slug of lowercase letters, "
+            f"digits and hyphens, at most {store.MAX_IDENT} characters; "
+            f"got {raw!r}")
+    return raw
+
+
 def describe_credentials() -> str:
     """What this process can authenticate, for a startup log.
 
@@ -951,6 +1051,8 @@ def _client_tokens() -> dict:
                 _, withholds = _entry_capabilities(meta, "approved_client",
                                                    label)
                 _entry_holds_reserved(meta, "approved_client", label, withholds)
+                _entry_profile(meta, "approved_client", label)
+                _entry_crew(meta, "approved_client", label)
             except _BadEntry as exc:
                 raise CredentialStoreError(str(exc))
     return loaded
@@ -963,6 +1065,24 @@ def credential_store_error() -> str | None:
     except CredentialStoreError as exc:
         return str(exc)
     return None
+
+
+def created_at_stamp(now: _dt.datetime | None = None) -> str:
+    """The `created_at` value a credential entry carries: when it was minted,
+    in UTC, as `YYYY-MM-DDTHH:MM:SSZ`.
+
+    `mint_credential.py` and `bootstrap_library.py` both write it, so one
+    function keeps one format. Nothing on the read path consults it:
+    `resolve()` ignores the key, so an entry without one, or with a malformed
+    one, authenticates exactly as before. An entry with none reads as minted at
+    an unknown time. The token file's mtime is one value for every entry in it,
+    and a steward handoff on 2026-09-18 misdated Orient's credential by reading
+    it as one entry's age.
+
+    `now` is a naive UTC datetime, the form `bootstrap_library.bootstrap` already
+    holds."""
+    now = now or _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None)
+    return now.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _safe_actor(raw) -> str:
@@ -1094,12 +1214,20 @@ def resolve(authorization: str | None) -> Identity | None:
         grants, withholds = _entry_capabilities(meta, kind, label)
         # Refuses the field on this kind; it is meaningful only on a client.
         _entry_holds_reserved(meta, kind, label, withholds)
+        # Refuses the field on no kind here; `_entry_profile` only refuses
+        # `kind == "approved_client"`, which `resolve()` never reaches on
+        # this branch — this file's entries resolve to `agent`, `system`,
+        # `customer_reader` or `orchestrator`, never a client.
+        profile = _entry_profile(meta, kind, label)
+        # Same reasoning as `profile` immediately above, for `crew`.
+        crew = _entry_crew(meta, kind, label)
     except _BadEntry as exc:
         _log(f"REFUSED a credential in {TOKENS}: {exc}")
         return None
     return Identity(actor=_safe_actor(meta.get("name", "unknown")), kind=kind,
                     products=_safe_products(meta.get("products", [])),
-                    grants=grants, withholds=withholds)
+                    grants=grants, withholds=withholds, profile=profile,
+                    crew=crew)
 
 
 def authorized(ident: Identity, capability: str) -> bool:

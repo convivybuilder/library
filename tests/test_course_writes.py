@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import datetime, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -50,7 +51,7 @@ def db_path(tmp_path):
     conn.executescript("""
         CREATE TABLE issue_items (
             id TEXT PRIMARY KEY, product TEXT, title TEXT, body TEXT, refs TEXT,
-            severity TEXT, state TEXT, claimed_by TEXT, claimed_at TEXT,
+            severity TEXT, state TEXT, claimed_by TEXT, claimed_by_crew TEXT, claimed_at TEXT,
             resolution TEXT, resolved_by TEXT, resolved_at TEXT, outcome_note TEXT,
             once_key TEXT, created_by TEXT, created_at TEXT, run_id TEXT,
             type TEXT, created_by_kind TEXT, needs TEXT, park_reason TEXT,
@@ -58,7 +59,7 @@ def db_path(tmp_path):
             parent_id TEXT, topics TEXT, maturity TEXT, specification TEXT,
             definition_of_done TEXT, prerequisites TEXT,
             model_choice TEXT, model_reason TEXT, model_set_by_client TEXT,
-            model_acting_human TEXT, model_set_at TEXT, found_during TEXT, item_key TEXT);
+            model_acting_human TEXT, model_set_at TEXT, found_during TEXT, item_key TEXT, short_description TEXT);
         CREATE TABLE issue_item_key_counters (
             scope_kind TEXT, scope_id TEXT, next_value INTEGER,
             PRIMARY KEY (scope_kind, scope_id));
@@ -1442,6 +1443,35 @@ def test_retiring_a_corrupted_row_reports_the_anomaly_to_the_archives(
     assert sigs[0]["product"] == "vivy"
     assert json.loads(sigs[0]["meta"])["prior_status"] == "archived"
     assert course["id"] in sigs[0]["body"]
+
+
+def test_the_anomaly_signal_carries_a_produced_at_since_can_bound_on(
+        client, db_path):
+    """CQ·207: `produced_at` used to be stored `None` on this kind, which
+    `GET /signals?since=` never matches (`_since_clause`'s own docstring). A
+    bound just before the retirement finds the row; a bound just after it
+    does not — the shape that breaks again if the write site reverts to
+    `None`."""
+    course = _make(client)
+    conn = sqlite3.connect(db_path)
+    conn.execute("UPDATE courses SET status = 'archived' WHERE id = ?",
+                 (course["id"],))
+    conn.commit()
+    conn.close()
+    before = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    assert _supersede(client, course).status_code == 200
+    after = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    since_before = client.get(
+        "/signals?kind=course_status_anomaly_retired&since=" + before,
+        headers=_h()).json()
+    assert len(since_before["signals"]) == 1
+    assert since_before["signals"][0]["produced_at"] is not None
+
+    since_after = client.get(
+        "/signals?kind=course_status_anomaly_retired&since=" + after,
+        headers=_h()).json()
+    assert since_after["signals"] == []
 
 
 def test_an_ordinary_retirement_reports_no_anomaly(client, db_path):

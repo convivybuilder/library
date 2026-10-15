@@ -32,6 +32,11 @@ import store
 
 AGENT = "agent-token-vivy"
 WIDE = "agent-token-wide"
+NOREF = "agent-token-noref"
+# Every token this file mints carries no `profile`, so this is what `_identify`
+# resolves AGENT and WIDE to for `_call_slip_grant`'s purposes: unbound,
+# `_persona_model`'s scope check a no-op (issue_01M35QG0VANA5P1XE3PH6A7PS4).
+UNBOUND = identity.Identity(actor="vivy-agent", kind="agent")
 
 
 def _ts(**delta):
@@ -46,7 +51,7 @@ def client(tmp_path, monkeypatch, vector_index, ledger_tables):
     conn.executescript("""
         CREATE TABLE issue_items (
             id TEXT PRIMARY KEY, product TEXT, title TEXT, body TEXT, refs TEXT,
-            severity TEXT, state TEXT, claimed_by TEXT, claimed_at TEXT,
+            severity TEXT, state TEXT, claimed_by TEXT, claimed_by_crew TEXT, claimed_at TEXT,
             resolution TEXT, resolved_by TEXT, resolved_at TEXT, outcome_note TEXT,
             once_key TEXT UNIQUE, created_by TEXT, created_at TEXT, run_id TEXT,
             type TEXT, created_by_kind TEXT, needs TEXT, park_reason TEXT,
@@ -54,7 +59,7 @@ def client(tmp_path, monkeypatch, vector_index, ledger_tables):
             parent_id TEXT, topics TEXT, maturity TEXT, specification TEXT,
             definition_of_done TEXT, prerequisites TEXT,
             model_choice TEXT, model_reason TEXT, model_set_by_client TEXT,
-            model_acting_human TEXT, model_set_at TEXT, found_during TEXT, item_key TEXT);
+            model_acting_human TEXT, model_set_at TEXT, found_during TEXT, item_key TEXT, short_description TEXT);
         CREATE TABLE issue_item_key_counters (
             scope_kind TEXT, scope_id TEXT, next_value INTEGER,
             PRIMARY KEY (scope_kind, scope_id));
@@ -62,7 +67,7 @@ def client(tmp_path, monkeypatch, vector_index, ledger_tables):
             id INTEGER PRIMARY KEY AUTOINCREMENT, item_id TEXT, actor TEXT,
             from_state TEXT, to_state TEXT, at TEXT, note TEXT);
         CREATE TABLE issue_leases (
-            id TEXT PRIMARY KEY, root_id TEXT, taken_for TEXT, holder TEXT,
+            id TEXT PRIMARY KEY, root_id TEXT, taken_for TEXT, holder TEXT, holder_crew TEXT,
             run_id TEXT, taken_at TEXT, heartbeat_at TEXT, released_at TEXT,
             release_reason TEXT, released_by TEXT, note TEXT);
         CREATE UNIQUE INDEX ix_live_root ON issue_leases (root_id)
@@ -70,7 +75,7 @@ def client(tmp_path, monkeypatch, vector_index, ledger_tables):
         CREATE TABLE lease_refusals (
             id TEXT PRIMARY KEY, at TEXT, requested_item_id TEXT, product TEXT,
             requester TEXT, actor TEXT, blocking_lease_id TEXT,
-            blocking_root_id TEXT, blocking_holder TEXT, blocks_by TEXT);
+            blocking_root_id TEXT, blocking_holder TEXT, blocks_by TEXT, blocking_taken_for TEXT);
         CREATE TABLE call_slips (
             id TEXT PRIMARY KEY, item_id TEXT, product TEXT, claim_owner_label TEXT,
             issued_at TEXT, expires_at TEXT, grant_json TEXT);
@@ -111,6 +116,8 @@ def client(tmp_path, monkeypatch, vector_index, ledger_tables):
     tokens.write_text(json.dumps({
         AGENT: {"name": "vivy-agent", "products": ["vivy"]},
         WIDE: {"name": "wide-agent", "products": ["*"]},
+        NOREF: {"name": "noref-agent", "products": ["vivy"],
+                "withholds": ["reference.read"]},
     }))
     # The vec0 index, because the write routes reach it: an item or signal
     # created here is embedded after its commit, and a revision drops its
@@ -743,7 +750,7 @@ def test_model_is_a_labelled_placeholder_not_a_real_resolution(client):
 # --- resolving `model` (issue_01M12NE12WF9V0721WSHH34A2W) ---------------------
 
 
-def _agent_index(tmp_path, monkeypatch, docs):
+def _agent_index(tmp_path, monkeypatch, docs, body="the agent's body"):
     """A knowledge index holding `docs`, each `(id, project, extra)`, shaped
     like the real one (`frontmatter_extra` included, agent-platform#517), and
     pointed at by `reference.INDEX_DB` for the rest of the test. `extra` is a
@@ -764,7 +771,7 @@ def _agent_index(tmp_path, monkeypatch, docs):
             "topics, audience, last_reviewed, updated_at, body, body_hash, "
             "frontmatter_extra) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (doc_id, f"{doc_id}.md", "agent", project, doc_id, "current",
-             "[]", "[]", "2026-08-01", "2026-08-02", "the agent's body",
+             "[]", "[]", "2026-08-01", "2026-08-02", body,
              "deadbeef", None if extra is None else json.dumps(extra)))
     conn.commit()
     conn.close()
@@ -1063,8 +1070,9 @@ def test_the_grant_carries_exactly_the_slip_id_and_no_other_undecided_field(
     boolean, neither of which is bearer-shaped, and it exists so an empty
     `docs` can be told apart from a bundle that could not be read. `slip_id`
     remains the only allowlisted bearer-shaped value."""
-    assert set(libapp._call_slip_grant(None, "slip_placeholder")) == {
-        "slip_id", "persona_md", "docs", "bundle", "model", "budget", "limits"}
+    assert set(libapp._call_slip_grant(UNBOUND, None, "slip_placeholder")) == {
+        "slip_id", "persona_md", "persona_resolved", "persona_unresolved_reason",
+        "docs", "bundle", "model", "budget", "limits"}
 
 
 @pytest.mark.parametrize("persona", [None, "coder"])
@@ -1118,7 +1126,7 @@ def test_the_checkout_response_carries_nothing_beyond_the_base_fields_and_the_gr
     extra = {} if persona is None else {"persona": persona}
     body = _co(client, "task_a", **extra).json()
     assert set(body) - {"item", "lease", "policy", "claimed", "adjacency"} == set(
-        libapp._call_slip_grant(None, "slip_placeholder"))
+        libapp._call_slip_grant(UNBOUND, None, "slip_placeholder"))
 
 
 @pytest.mark.parametrize("persona", [None, "coder"])
@@ -1154,7 +1162,7 @@ def test_the_served_grant_matches_what_the_builder_returned(
     monkeypatch.setattr(reference, "INDEX_DB", tmp_path / "no-such-index.db")
     extra = {} if persona is None else {"persona": persona}
     body = _co(client, "task_a", **extra).json()
-    expected = libapp._call_slip_grant(persona, body["slip_id"])
+    expected = libapp._call_slip_grant(UNBOUND, persona, body["slip_id"])
     assert {k: body[k] for k in expected} == expected
 
 
@@ -1176,7 +1184,8 @@ def test_the_slip_stores_exactly_the_grant_checkout_served(
     stored = call_slips.grant_of(row)
     assert stored is not None
     assert stored == {k: body[k] for k in stored}
-    assert set(stored) == set(libapp._call_slip_grant(persona, body["slip_id"]))
+    assert set(stored) == set(
+        libapp._call_slip_grant(UNBOUND, persona, body["slip_id"]))
 
 
 def test_claim_mints_no_slip_and_so_stores_no_grant(client):
@@ -1316,3 +1325,151 @@ def test_a_checkout_that_races_a_concurrent_resolve_is_rolled_back(client,
     assert [(e["from_state"], e["to_state"]) for e in events] == [
         ("open", "fixed")], "checkout's overwrite was recorded too"
     assert len(leases) == 0, "the losing checkout still left a lease behind"
+
+
+def test_a_refusal_records_the_item_the_blocking_lease_was_taken_for(client):
+    """A leaf leases its parent, so `blocking_root_id` is the epic for a sibling
+    and for the very same item alike. `blocking_taken_for` tells them apart
+    (issue_01M0RCF408K7TBE0N9VP224MGA)."""
+    _co(client, "task_a", owner="session-1")
+    _co(client, "task_b", owner="session-2")
+    # The same item: session-1's lease on the epic, taken for task_b, refuses
+    # session-3 asking for task_b itself once the claim is cleared.
+    conn = _db()
+    conn.execute("UPDATE issue_leases SET taken_for = 'task_b'")
+    conn.commit()
+    conn.close()
+    _co(client, "task_b", owner="session-3")
+    conn = _db()
+    rows = conn.execute("SELECT requested_item_id, blocking_root_id, "
+                        "blocking_taken_for FROM lease_refusals ORDER BY at, id"
+                        ).fetchall()
+    conn.close()
+    assert [tuple(r) for r in rows] == [
+        ("task_b", "top_epic", "task_a"),
+        ("task_b", "top_epic", "task_b"),
+    ]
+
+
+# --- `persona_md` is the resolved definition (issue_01M4XEEPQ37JFM3SE1493WDHVG)
+
+
+def test_the_placeholder_text_is_unchanged_byte_for_byte():
+    """agentctl's interim roster fallback matches this exact text
+    (issue_01M4XEHK9FRVRRMFGH6C80BC6T), so it is a wire contract until the
+    Bosun reads `persona_resolved` instead."""
+    assert libapp._persona_md("coder") == (
+        "# coder\n\nPersona content is not resolved yet — no persona storage "
+        "or registry exists. This is a placeholder pinning the call slip's "
+        "shape ahead of it.")
+
+
+def test_a_resolved_persona_serves_its_definitions_body(
+        client, tmp_path, monkeypatch):
+    _agent_index(tmp_path, monkeypatch,
+                 [("agent-platform/agents/coder", "agent-platform",
+                   {"model": "sonnet"})],
+                 body="# coder\n\nYou write the change.")
+    body = _co(client, "task_a", persona="coder").json()
+    assert body["persona_md"] == "# coder\n\nYou write the change."
+    assert body["persona_resolved"] is True
+    assert body["persona_unresolved_reason"] is None
+    assert body["model"] == "sonnet"
+
+
+def test_the_ambiguity_tiebreak_picks_the_body_and_the_model_from_one_document(
+        client, tmp_path, monkeypatch):
+    """The agent-platform copy wins the tiebreak, and its body arrives beside
+    its own model pin rather than another copy's."""
+    index = tmp_path / "agent-index.db"
+    _agent_index(tmp_path, monkeypatch,
+                 [("svc-coder/agents/reviewer", "svc-coder", {"model": "opus"}),
+                  ("agent-platform/agents/reviewer", "agent-platform",
+                   {"model": "sonnet"})])
+    conn = sqlite3.connect(index)
+    conn.execute("UPDATE docs SET body = 'body of ' || project")
+    conn.commit()
+    conn.close()
+    body = _co(client, "task_a", persona="reviewer").json()
+    assert body["persona_md"] == "body of agent-platform"
+    assert body["model"] == "sonnet"
+
+
+@pytest.mark.parametrize("persona,docs,reason", [
+    (None, [], "no_persona"),
+    ("no-such-agent", [("agent-platform/agents/coder", "agent-platform", {})],
+     "unresolved"),
+    ("reviewer", [("svc-coder/agents/reviewer", "svc-coder", {}),
+                  ("svc-planner/agents/reviewer", "svc-planner", {})],
+     "unresolved"),
+])
+def test_an_unresolved_persona_keeps_the_placeholder_and_says_why(
+        client, tmp_path, monkeypatch, persona, docs, reason):
+    _agent_index(tmp_path, monkeypatch, docs)
+    extra = {} if persona is None else {"persona": persona}
+    body = _co(client, "task_a", **extra).json()
+    assert body["persona_md"] == libapp._persona_md(persona)
+    assert body["persona_resolved"] is False
+    assert body["persona_unresolved_reason"] == reason
+
+
+def test_an_unreadable_index_keeps_the_placeholder_and_says_so(
+        client, tmp_path, monkeypatch):
+    corrupt = tmp_path / "corrupt-index.db"
+    corrupt.write_bytes(b"not a sqlite database")
+    monkeypatch.setattr(reference, "INDEX_DB", corrupt)
+    r = _co(client, "task_a", persona="coder")
+    assert r.status_code == 200
+    assert r.json()["persona_md"] == libapp._persona_md("coder")
+    assert r.json()["persona_resolved"] is False
+    assert r.json()["persona_unresolved_reason"] == "index_unreadable"
+
+
+@pytest.mark.parametrize("empty", ["", "   \n", None])
+def test_a_definition_with_no_body_is_not_served_as_resolved(
+        client, tmp_path, monkeypatch, empty):
+    _agent_index(tmp_path, monkeypatch,
+                 [("agent-platform/agents/coder", "agent-platform",
+                   {"model": "sonnet"})], body=empty)
+    body = _co(client, "task_a", persona="coder").json()
+    assert body["persona_md"] == libapp._persona_md("coder")
+    assert body["persona_resolved"] is False
+    assert body["persona_unresolved_reason"] == "unresolved"
+
+
+def test_redemption_returns_the_resolved_definition_checkout_served(
+        client, tmp_path, monkeypatch):
+    """The slip stores the grant at mint, so the Individuator redeeming it
+    gets the same definition the checkout response carried."""
+    _agent_index(tmp_path, monkeypatch,
+                 [("agent-platform/agents/coder", "agent-platform",
+                   {"model": "sonnet"})],
+                 body="# coder\n\nYou write the change.")
+    body = _co(client, "task_a", persona="coder").json()
+    conn = _db()
+    stored = conn.execute("SELECT grant_json FROM call_slips WHERE id = ?",
+                          (body["slip_id"],)).fetchone()
+    conn.close()
+    grant = json.loads(stored[0])
+    assert grant["persona_md"] == "# coder\n\nYou write the change."
+    assert grant["persona_resolved"] is True
+    assert grant["persona_unresolved_reason"] is None
+
+
+def test_a_caller_without_reference_read_gets_no_definition(
+        client, tmp_path, monkeypatch):
+    """`GET /reference/documents/{id}` refuses a credential that withholds
+    `reference.read`, and checkout needs only `item.claim`, so the grant must
+    not hand that credential the body the document route would refuse. It
+    gets the answer a persona nothing carries gets."""
+    _agent_index(tmp_path, monkeypatch,
+                 [("agent-platform/agents/coder", "agent-platform",
+                   {"model": "sonnet"})],
+                 body="# coder\n\nYou write the change.")
+    r = _co(client, "task_a", token=NOREF, persona="coder")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["persona_md"] == libapp._persona_md("coder")
+    assert body["persona_resolved"] is False
+    assert body["persona_unresolved_reason"] == "unresolved"
+    assert "You write the change." not in r.text

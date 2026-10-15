@@ -373,6 +373,12 @@ def run() -> int:
 
     if cp.returncode == 0:
         clear_failed_target()
+        # **A SUCCESSFUL INSTALL'S OUTPUT IS LOGGED TOO**, because the
+        # installer warns without failing on a problem the service survives
+        # (a console script that will not run after the swap, CQ·111), and
+        # this process is its only reader. Dropping it on exit 0 made every
+        # such warning invisible.
+        print(cp.stdout + cp.stderr, end="")
         print(f"library-deploy-watch: bin/library-install succeeded for {target}")
         return 0
 

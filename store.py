@@ -32,6 +32,8 @@ import time
 from pathlib import Path
 from urllib.parse import quote
 
+import projects
+
 # WRITES ARE OFF UNLESS SAID OTHERWISE, and this is the same reasoning that makes
 # `connect()` open `mode=ro`: the shadow is enforced by the connection rather than
 # by a promise. §4 requires that Orient still owns writes for the whole read-only
@@ -1019,6 +1021,11 @@ MAX_DEDUP_KEY = 300
 # a protocol version, not a wording fix.
 MAX_TITLE = 300
 MAX_ITEM_TEXT = 100_000
+# The label a route or a rail draws when a title will not fit
+# (issue_01M0XR0QSMKBSGBYD49CPTJ37E). 25 is the operator's own figure, from
+# reviewing Deck's waypoint ribbon. Over it is refused at the write routes, as
+# `title` is, because a clipped label is one its author never saw.
+MAX_SHORT_DESCRIPTION = 25
 ITEM_TYPE_EPIC = "epic"
 # `feature` is GONE, not merely ungated (the operator, 2026-08-19,
 # issue_01M0EEPS591VQHYEBJY7NGF4C3). Every use it had was either the ARCH-403
@@ -1162,7 +1169,8 @@ KIND_ALLOWED_CHARS = frozenset(map(chr, range(0x20, 0x7F)))
 ITEM_INSERT_COLUMNS = ("id", "product", "title", "body", "refs", "severity",
                        "state", "type", "created_by", "created_by_kind",
                        "needs", "parent_id", "found_during", "topics",
-                       "prerequisites", "once_key", "item_key")
+                       "prerequisites", "once_key", "item_key",
+                       "short_description")
 
 # **THE SHORT, STABLE KEY A PERSON TYPES** (issue_01M2P5CBY5JY8SK5W344CV82AE)
 # — `E9` for an epic, `E9·4` for a sub-item of it, `CQ·63` for a correction (an
@@ -1427,6 +1435,9 @@ def insert_item(row: dict, can_return_existing, claim_for,
         now = _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None)
         values = dict(row)
         values["created_at"] = now.isoformat(" ")
+        # Optional item content: `POST /items` always passes it, the direct
+        # callers in `test_alembic_baseline.py` do not, and absent means NULL.
+        values.setdefault("short_description", None)
         # **A NON-EPIC WITH NO PARENT GETS ITS PRODUCT'S CORRECTIONS QUEUE,
         # NEVER A BARE NULL** (`library/specs/one-home-per-work-item`, PR 2).
         # `mint_item_key` would mint the same `CQ·n` either way — its own
@@ -1552,6 +1563,20 @@ def parse_timestamp(value):
     if parsed.tzinfo is not None:
         parsed = parsed.astimezone(_dt.timezone.utc).replace(tzinfo=None)
     return parsed.isoformat(" ")
+
+
+def produced_now() -> str:
+    """`produced_at` for a signal the Library writes about its own activity,
+    rather than one it ingests on a caller's behalf: the moment of the call,
+    in the exact stored shape `_since_clause` (app.py) compares against.
+
+    `parse_timestamp` exists for a caller-supplied value; this is its
+    counterpart for a row with no caller to supply one. A signal built with
+    `produced_at: None` here never matches `GET /signals?since=`, and sorts
+    after every dated row under `order=produced_at`
+    (issue_01M4V78Z2CW5RJD7WJ4PHN2YJ6).
+    """
+    return _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None).isoformat(" ")
 
 
 def insert_signal(row: dict, can_return_existing, *,
@@ -2397,7 +2422,8 @@ ITEM_COLUMNS = (
     "run_id, type, created_by_kind, needs, park_reason, unpark_condition, "
     "parked_at, parent_id, found_during, topics, maturity, specification, "
     "definition_of_done, prerequisites, model_choice, model_reason, "
-    "model_set_by_client, model_acting_human, model_set_at, item_key"
+    "model_set_by_client, model_acting_human, model_set_at, item_key, "
+    "short_description"
 )
 
 
@@ -2862,6 +2888,10 @@ def item_dict(row: sqlite3.Row, *, claim, prerequisites) -> dict:
         "url": f"/engineering/issues/{row['id']}",
         "product": row["product"],
         "title": row["title"],
+        # The author's label for a surface with no room for `title`, at most
+        # MAX_SHORT_DESCRIPTION characters, or None. A reader draws its own
+        # fallback from `title` when it is None.
+        "short_description": row["short_description"],
         "body": row["body"],
         "type": row["type"],
         "state": row["state"],
@@ -3612,6 +3642,23 @@ class DisproportionateSpend(ValueError):
         self.basis_micro = basis_micro
 
 
+class DedupKeyTaken(ValueError):
+    """`dedup_key` matches a `ledger_entries` row filed against a different
+    ledger.
+
+    `dedup_key` is unique across the whole table, not per ledger (CQ·107), so
+    a collision here names another project's entry — one this caller's own
+    scope does not cover. Carries only the key itself, nothing read from the
+    matched row, so the route has nothing of another ledger's entry to leak
+    into its 409.
+    """
+
+    def __init__(self, dedup_key: str):
+        super().__init__(
+            "dedup_key is already used by an entry this report cannot replay")
+        self.dedup_key = dedup_key
+
+
 def report_ceiling_micro(ledger_row) -> tuple[int, str, int | None]:
     """The largest single report this ledger admits, and what that number was
     computed from: `(ceiling_micro, basis, basis_micro)`.
@@ -3692,6 +3739,18 @@ def _day_shape_ok(day) -> bool:
     return (day[4] == "-" and day[7] == "-"
             and all(part.isascii() and part.isdigit()
                     for part in (day[:4], day[5:7], day[8:])))
+
+
+def ledger_scope_name(product: str) -> str:
+    """The registry project a product string names, for comparing two
+    product spellings as one ledger scope — `projects.resolve(product)`
+    when the registry knows it, `product` unchanged otherwise (an unknown
+    name or an unreadable registry), the same fail-open contract
+    `projects.resolve` itself documents. `app.py`'s ledger routes resolve
+    before they ever reach a write; this is for `record_spend`'s one
+    comparison that still has to happen inside this module, against
+    `issue_items.product`, which nothing here normalizes."""
+    return projects.resolve(product) or product
 
 
 def live_ledger(conn, scope_kind: str, scope_id: str):
@@ -3816,10 +3875,19 @@ def record_spend(row: dict) -> tuple[bool, dict, str | None]:
     """Append one spend entry and move the day's total, atomically.
 
     Returns `(idempotent, entry, crossed)` — `idempotent` True when
-    `dedup_key` matched a row that already existed, in which case the total is
-    NOT moved again and the stored row is returned unchanged. `crossed` is
-    which threshold (`warn`, `soft_cap`, `hard_cap`) this entry newly crossed,
-    or None — always None when idempotent, since nothing new happened.
+    `dedup_key` matched a row already filed against THIS SAME `ledger_id`, in
+    which case the total is NOT moved again and the stored row is returned
+    unchanged. `crossed` is which threshold (`warn`, `soft_cap`, `hard_cap`)
+    this entry newly crossed, or None — always None when idempotent, since
+    nothing new happened.
+
+    **A `dedup_key` match on a DIFFERENT ledger raises `DedupKeyTaken`
+    instead of replaying it** (CQ·107). `dedup_key` is unique across the
+    whole table, not per ledger, so a caller scoped to one project could
+    otherwise post a spend whose key collides with another project's entry
+    and read that entry's id, day, amount and lane back under its own
+    `ledger_id`. `DedupKeyTaken` carries only the key, nothing from the
+    matched row.
 
     **`row["lane"]` MAY BE `None`, `"gateway"` OR `"subscription"`, and only
     `"subscription"` skips the day's total** (issue_01M35QG5NA13JE8FQVM9XET4HD).
@@ -3907,6 +3975,15 @@ def record_spend(row: dict) -> tuple[bool, dict, str | None]:
                 (dedup_key,)).fetchone()
             if existing is not None:
                 conn.rollback()
+                # dedup_key IS UNIQUE ACROSS THE WHOLE TABLE, NOT PER LEDGER
+                # (CQ·107), so a match naming a different ledger is not a
+                # replay of this caller's own report — it is another
+                # project's entry, and this caller's scope does not cover
+                # it. Raising with nothing read from `existing` is what
+                # keeps the route from answering with that entry's id, day,
+                # amount or lane.
+                if existing["ledger_id"] != row["ledger_id"]:
+                    raise DedupKeyTaken(dedup_key)
                 return True, dict(existing), None
         # **THE PROPORTIONATE BOUND IS CHECKED HERE, INSIDE THE TRANSACTION AND
         # AFTER THE DEDUP SHORT-CIRCUIT ABOVE** (reviewer, PR #50 round 3).
@@ -3956,10 +4033,22 @@ def record_spend(row: dict) -> tuple[bool, dict, str | None]:
             # answer a missing id gets — keeps an out-of-scope item id
             # indistinguishable from a nonexistent one (security review,
             # PR #167 round 1).
+            #
+            # **COMPARED BY LEDGER SCOPE, NOT BY THE RAW STRING.** `row
+            # ["product"]` is the entry's resolved project (`app.py`'s
+            # `report_spend`), but `issue_items.product` is not normalized —
+            # a work item may still be filed under a repository name. Two
+            # spellings of the same project are still "the entry's own
+            # product" for this check; `ledger_scope_name` resolves both
+            # sides through the same registry `app.py`'s ledger routes use,
+            # so the fold that moved every ledger onto its project did not
+            # also break the one thing this join exists to verify.
             item = conn.execute(
-                "SELECT type, parent_id FROM issue_items "
-                "WHERE id = ? AND product = ?",
-                (item_id, row["product"])).fetchone()
+                "SELECT type, parent_id, product FROM issue_items WHERE id = ?",
+                (item_id,)).fetchone()
+            if item is not None and (ledger_scope_name(item["product"])
+                                     != ledger_scope_name(row["product"])):
+                item = None
             if item is not None:
                 if item["type"] == ITEM_TYPE_EPIC:
                     epic_id = item_id
@@ -4025,6 +4114,11 @@ def record_spend(row: dict) -> tuple[bool, dict, str | None]:
                 (dedup_key,)).fetchone()
             if won is None:
                 raise
+            # SAME CROSS-LEDGER CHECK AS THE PRE-CHECK ABOVE — the row that
+            # won the race is exactly as capable of naming another project's
+            # entry as one the pre-check matched.
+            if won["ledger_id"] != row["ledger_id"]:
+                raise DedupKeyTaken(dedup_key)
             return True, dict(won), None
         conn.commit()
         # `after_micro` MATCHES WHAT WAS ACTUALLY WRITTEN ABOVE, not simply

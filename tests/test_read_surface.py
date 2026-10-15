@@ -74,7 +74,7 @@ def _build_client(tmp_path, monkeypatch):
     conn.executescript("""
         CREATE TABLE issue_items (
             id TEXT PRIMARY KEY, product TEXT, title TEXT, body TEXT, refs TEXT,
-            severity TEXT, state TEXT, claimed_by TEXT, claimed_at TEXT,
+            severity TEXT, state TEXT, claimed_by TEXT, claimed_by_crew TEXT, claimed_at TEXT,
             resolution TEXT, resolved_by TEXT, resolved_at TEXT, outcome_note TEXT,
             once_key TEXT, created_by TEXT, created_at TEXT, run_id TEXT, type TEXT,
             created_by_kind TEXT, needs TEXT, park_reason TEXT,
@@ -82,7 +82,7 @@ def _build_client(tmp_path, monkeypatch):
             parent_id TEXT, topics TEXT, maturity TEXT, specification TEXT,
             definition_of_done TEXT, prerequisites TEXT,
             model_choice TEXT, model_reason TEXT, model_set_by_client TEXT,
-            model_acting_human TEXT, model_set_at TEXT, found_during TEXT, item_key TEXT);
+            model_acting_human TEXT, model_set_at TEXT, found_during TEXT, item_key TEXT, short_description TEXT);
         CREATE TABLE issue_item_key_counters (
             scope_kind TEXT, scope_id TEXT, next_value INTEGER,
             PRIMARY KEY (scope_kind, scope_id));
@@ -101,7 +101,7 @@ def _build_client(tmp_path, monkeypatch):
             status TEXT, version INTEGER, created_by TEXT, created_at TEXT,
             updated_by TEXT, updated_at TEXT);
         CREATE TABLE issue_leases (
-            id TEXT PRIMARY KEY, root_id TEXT, taken_for TEXT, holder TEXT,
+            id TEXT PRIMARY KEY, root_id TEXT, taken_for TEXT, holder TEXT, holder_crew TEXT,
             run_id TEXT, taken_at TEXT, heartbeat_at TEXT, released_at TEXT,
             release_reason TEXT, released_by TEXT, note TEXT);
         CREATE UNIQUE INDEX ix_live_root ON issue_leases (root_id)
@@ -109,7 +109,7 @@ def _build_client(tmp_path, monkeypatch):
         CREATE TABLE lease_refusals (
             id TEXT PRIMARY KEY, at TEXT, requested_item_id TEXT, product TEXT,
             requester TEXT, actor TEXT, blocking_lease_id TEXT,
-            blocking_root_id TEXT, blocking_holder TEXT, blocks_by TEXT);
+            blocking_root_id TEXT, blocking_holder TEXT, blocks_by TEXT, blocking_taken_for TEXT);
         CREATE TABLE signals (
             id TEXT PRIMARY KEY, source TEXT, stream TEXT, kind TEXT, actor TEXT,
             ingested_by TEXT, product TEXT, refs TEXT, body TEXT, meta TEXT,
@@ -1213,6 +1213,28 @@ def test_signal_facets_applies_since(client):
     body = client.get("/signals/facets?kind=changelog&since=2026-10-12T00:00:00Z",
                       headers=_h()).json()
     assert body["total"] == 1
+
+
+def test_produced_now_matches_the_stored_shape_since_compares_against(client):
+    """CQ·207: the four write sites that stamp their own `produced_at`
+    (`app._signal_course_status_anomaly` and the others) use `store.
+    produced_now()` rather than `None`, and this is what ties that helper's
+    output to `_since_clause`'s own contract — naive UTC text, seconds
+    precision when there are no microseconds, `.%f` appended only when
+    there are."""
+    stamp = store.produced_now()
+    parsed = _dt.datetime.strptime(stamp, "%Y-%m-%d %H:%M:%S.%f" if "." in stamp
+                                   else "%Y-%m-%d %H:%M:%S")
+    # Round-trips through `_since_clause`'s own bound shape: a bound equal to
+    # the stamp itself is an inclusive match.
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE t (produced_at TEXT)")
+    conn.execute("INSERT INTO t VALUES (?)", (stamp,))
+    assert conn.execute(
+        "SELECT 1 FROM t WHERE produced_at >= ?", (stamp,)).fetchone() is not None
+    conn.close()
+    assert abs((_dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None)
+               - parsed).total_seconds()) < 5
 
 
 def test_signals_refuses_an_unrecognised_parameter(client):

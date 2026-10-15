@@ -474,7 +474,12 @@ async def lifespan(_: FastAPI):
           f"{'ENABLED' if store.WRITES_ENABLED else 'disabled — read-only shadow'}",
           file=sys.stderr)
     print(f"library: {identity.describe_credentials()}", file=sys.stderr)
-    ok, why = vectors.available(store.DB_PATH)
+    # `_semantic_search_readiness`, not a bare `vectors.available()`: this is
+    # also the readiness check's first run, seeding `_readiness_cache` before
+    # `_readiness_refresh_loop` starts and before any request can arrive, so
+    # `health()` never finds the cache empty on a real deploy. One call does
+    # both jobs rather than checking readiness twice at boot.
+    ok, why = _semantic_search_readiness()
     print(f"library: semantic search {'ready' if ok else 'UNAVAILABLE — ' + why}",
           file=sys.stderr)
     # `LIBRARY_COLD_DB` itself is REQUIRED (refused above, at this module's own
@@ -489,6 +494,7 @@ async def lifespan(_: FastAPI):
           f"{'ENFORCED' if store.MERGE_ADMISSION_ENFORCED else 'STUBBED (always approves)'}",
           file=sys.stderr)
     watcher = asyncio.create_task(_restart_watcher())
+    readiness_refresher = asyncio.create_task(_readiness_refresh_loop())
     try:
         yield
     finally:
@@ -498,8 +504,13 @@ async def lifespan(_: FastAPI):
         # avoid, not a functional requirement — the process is exiting either
         # way.
         watcher.cancel()
+        readiness_refresher.cancel()
         try:
             await watcher
+        except asyncio.CancelledError:
+            pass
+        try:
+            await readiness_refresher
         except asyncio.CancelledError:
             pass
 
@@ -1523,20 +1534,38 @@ SIGNAL_ORDER_CLAUSES = {
 
 
 # `/health` needs semantic search's CURRENT readiness, not the boot-time snapshot
-# `lifespan` already prints. On 2026-08-24 this repo's `.venv` was deleted out
-# from under the running process; `vectors.available()` started returning False
-# on every call, and `GET /signals/search` refused with 503 for twenty minutes
+# `lifespan` logs once. On 2026-08-24 this repo's `.venv` was deleted out from
+# under the running process; `vectors.available()` started returning False on
+# every call, and `GET /signals/search` refused with 503 for twenty minutes
 # while `/health` kept answering ready, because it read no signal at all. A
 # watchdog polling only `/health` reported the service up the whole time.
 #
-# **CACHED, with a TTL rather than checked on every call.** `vectors.available()`
+# **CACHED, with a TTL, and refreshed off the request path.** `vectors.available()`
 # opens a fresh SQLite connection and runs a query, so a watchdog polling
-# `/health` every second would turn a liveness probe into steady database load.
-# A cache is correct HERE specifically because the bug this fixes is staleness
-# measured in a DAY (one boot-time line that never re-ran); staleness bounded to
-# a few seconds is a different thing and a real fault still surfaces within one
-# TTL.
+# `/health` every second would turn a liveness probe into steady database load
+# if it recomputed per call — and, measured 2026-08-26 against the running
+# service, that recompute itself took 2.8-4.3s in service against single-digit
+# milliseconds out of process, which made `/health` itself an intermittent false
+# "down" for any caller with a timeout under that. `_readiness_refresh_loop`
+# recomputes on this cadence from a background task instead, so `health()` only
+# ever reads whatever `_readiness_cache` already holds — see there, and see
+# `_readiness_snapshot`. A cache is correct HERE specifically because the bug
+# this fixes is staleness measured in a DAY (one boot-time line that never
+# re-ran); staleness bounded to a few seconds is a different thing and a real
+# fault still surfaces within one TTL.
 _READINESS_TTL_SECONDS = 15
+
+# **A DEAD OR STUCK REFRESHER MUST NOT FREEZE `ready: true` FOREVER** — that is
+# the 2026-08-24 failure above, recurring in a new shape: instead of "the
+# boot-time snapshot never re-runs", it would be "the background loop that
+# replaced it stopped running". `_readiness_snapshot` answers not-ready once
+# the cache is older than this bound, so a refresher that is stuck or dead
+# surfaces as down rather than reporting a ready that nothing is checking
+# anymore. Three TTL windows: enough slack that one missed cycle to ordinary
+# lock contention (see `_READINESS_CONNECT_TIMEOUT_SECONDS` below) does not
+# flip a healthy service to not-ready, while still catching a refresher that
+# is genuinely gone within 45s rather than never.
+_READINESS_STALE_AFTER_SECONDS = 3 * _READINESS_TTL_SECONDS
 
 # **THE WORST CASE IS SECONDS, NOT MILLISECONDS, and it is bounded per busy-wait,
 # not per call.** Once `store.connect_rw` has switched the database to WAL
@@ -1548,64 +1577,90 @@ _READINESS_TTL_SECONDS = 15
 # recompute hits it at two independent points: opening the connection (which
 # also loads the `vec0` extension) and then running the `SELECT COUNT(*)`. So
 # this value bounds each wait, not the recompute as a whole — the worst case for
-# one call is closer to 2x this number, about 2 seconds. Still far better than
-# the 5-10s a caller could see before this budget existed, and worth eating an
-# occasional false "not ready" on real contention rather than tying up a
-# threadpool thread for that long on a route that exists to say whether the
-# service is healthy.
+# one call is closer to 2x this number, about 2 seconds. That cost now lands on
+# `_readiness_refresh_loop`'s own threadpool call, off the request path
+# entirely, rather than tying up a caller's request for that long — worth
+# eating an occasional false "not ready" on real contention either way, on a
+# background cycle rather than in front of anyone.
 _READINESS_CONNECT_TIMEOUT_SECONDS = 1.0
 
 _readiness_cache: tuple[float, bool, str] | None = None
 
 
-def _readiness_cache_hit() -> tuple[bool, str] | None:
-    """The cached `(ready, reason)` if the TTL hasn't elapsed, else `None`.
+def _readiness_snapshot() -> tuple[bool, str]:
+    """The readiness `(ready, reason)` the background refresh loop last
+    computed — a pure read of `_readiness_cache`, no I/O, safe to call
+    directly on the event loop.
 
     Reads `_readiness_cache` into a local exactly once and indexes the local
-    from there — safe to call directly on the event loop, no lock, no I/O.
-    Reading the global separately per field would reopen the torn-read hazard
-    this exists to close: each attribute access compiles to its own
+    from there. Reading the global separately per field would reopen the
+    torn-read hazard this closes: each attribute access compiles to its own
     `LOAD_GLOBAL`, and a recompute on another thread can rebind the name
     between any two of them, handing a caller a `ready` from one generation
     paired with a `reason` from another that never coexisted.
+
+    **Two cases answer `False` rather than passing through whatever is
+    cached, or isn't, because a stale or absent `True` would be exactly the
+    2026-08-24 failure this design exists to end:**
+
+    - `_readiness_cache` is `None`. In a running deploy this cannot happen —
+      ASGI does not route a request to this process until `lifespan`'s
+      startup has returned, and startup seeds the cache before it returns —
+      but a test, or any other caller that drives `health()` without running
+      `lifespan`, can reach this, and it must get a defined answer rather
+      than an `AttributeError` on an unpacked `None`.
+    - The cached entry is older than `_READINESS_STALE_AFTER_SECONDS`. That
+      means `_readiness_refresh_loop` has missed several cycles or stopped
+      running outright, and nothing has actually checked readiness in that
+      window — see `_READINESS_STALE_AFTER_SECONDS` for why that must not
+      report a frozen `ready: true`.
     """
     cache = _readiness_cache
-    if cache is not None and time.monotonic() < cache[0]:
-        return cache[1], cache[2]
-    return None
+    if cache is None:
+        return False, "readiness has not been checked yet"
+    checked_at, ready, reason = cache
+    if time.monotonic() - checked_at > _READINESS_STALE_AFTER_SECONDS:
+        return False, "the readiness cache is stale; the background refresh may be stuck or dead"
+    return ready, reason
 
 
 def _semantic_search_readiness() -> tuple[bool, str]:
-    """`vectors.available()`, cached for `_READINESS_TTL_SECONDS`.
+    """Recompute readiness from `vectors.available()` and rebind
+    `_readiness_cache` to the result, stamped with the time of this check.
 
     **Must never raise.** `/health` is the liveness probe; a probe that can 500
     or hang is worse than no probe at all, so any exception here becomes a
     not-ready answer naming the exception type rather than propagating.
 
-    **Runs on a threadpool worker, not the event loop** — `health()` awaits this
-    through `run_in_threadpool` on a cache miss, because `vectors.connect()` can
+    **Called from exactly two places, never from the request path.**
+    `_readiness_refresh_loop` calls this on its `_READINESS_TTL_SECONDS`
+    cadence, through `run_in_threadpool`, because `vectors.connect()` can
     block on SQLite's lock wait for up to `_READINESS_CONNECT_TIMEOUT_SECONDS`
-    twice over, and that must never stall every other in-flight request. A cache
-    hit is handled by `health()` itself, on the event loop, before this function
-    is ever called — see there.
+    twice over, and that must never stall the loop that keeps every other
+    request's readiness answer warm. `lifespan` also calls this once,
+    directly on the event loop at startup, to seed the cache before the
+    first request can arrive — see there. `health()` itself never calls
+    this; it only reads whatever `_readiness_cache` already holds, through
+    `_readiness_snapshot`.
 
-    **No lock guards `_readiness_cache`, and that is still correct off the event
-    loop.** The only write is `_readiness_cache = (...)`, one name rebind to a
-    fully-built, immutable tuple; CPython's GIL makes that rebind atomic, and
-    `_readiness_cache_hit`'s single local binding makes every read see either
-    the old tuple or the new one, whole, never a mix of fields from both. Two
-    threads racing past the TTL boundary at once can both recompute and both
-    call `vectors.available()` redundantly — wasted work, not a torn read — and
-    the cache converges on the next read either way.
+    **No lock guards `_readiness_cache`, and that is still correct off the
+    event loop.** The only write is `_readiness_cache = (...)`, one name
+    rebind to a fully-built, immutable tuple; CPython's GIL makes that
+    rebind atomic, and `_readiness_snapshot`'s single local binding makes
+    every read see either the old tuple or the new one, whole, never a mix
+    of fields from both. The two callers above never run concurrently with
+    each other — the refresh loop sleeps before its first tick specifically
+    so it cannot race the startup seed — so there is not even a redundant
+    write to converge on here, unlike when callers on the request path could
+    race each other past the TTL boundary.
 
-    Not ready is logged here, once per recomputation rather than once per
-    request, so a genuine fault reaches the service log without a healthy
-    service writing a line on every cache miss.
+    Not ready is logged here, once per recomputation. Recomputation now
+    happens once per `_READINESS_TTL_SECONDS`, from the refresh loop, rather
+    than once per cache miss on the request path, so this is still a fault
+    reaching the service log on its own schedule rather than a healthy
+    service writing a line on every request.
     """
     global _readiness_cache
-    hit = _readiness_cache_hit()
-    if hit is not None:
-        return hit
     now = time.monotonic()
     try:
         ready, reason = vectors.available(
@@ -1614,8 +1669,45 @@ def _semantic_search_readiness() -> tuple[bool, str]:
         ready, reason = False, f"readiness check raised {type(exc).__name__}"
     if not ready:
         print(f"library: semantic search not ready — {reason}", file=sys.stderr)
-    _readiness_cache = (now + _READINESS_TTL_SECONDS, ready, reason)
+    _readiness_cache = (now, ready, reason)
     return ready, reason
+
+
+async def _readiness_refresh_loop() -> None:
+    """Recompute semantic-search readiness on `_READINESS_TTL_SECONDS`
+    cadence, so `_readiness_cache` is never more than one cycle stale and
+    `health()` never recomputes on a caller's request path. See
+    `_semantic_search_readiness` for what gets rebound and why that is safe
+    with no lock.
+
+    **Sleeps before its first check, rather than checking then sleeping**,
+    because `lifespan` already performs the first check directly, to seed
+    the cache before any request can arrive. Checking again immediately
+    here would be a redundant recompute racing nothing.
+
+    Runs as a background task started in `lifespan` and cancelled on
+    shutdown, exactly like `_restart_watcher` beside it; never touches the
+    request path.
+
+    **Must never die.** A task that raises escapes `asyncio.create_task`
+    silently — Python logs "Task exception was never retrieved" once and the
+    task simply stops running. `_readiness_cache` would then freeze at
+    whatever it last held, aging past `_READINESS_STALE_AFTER_SECONDS` and
+    reporting not-ready forever rather than resuming — the dead-refresher
+    case `_READINESS_STALE_AFTER_SECONDS` exists to catch only works if
+    something is still around to have gone stale from checking at all.
+    `_semantic_search_readiness` already turns an exception from the check
+    itself into a not-ready result rather than raising; this catches
+    anything else so the loop keeps running regardless of what the check
+    does.
+    """
+    while True:
+        await asyncio.sleep(_READINESS_TTL_SECONDS)
+        try:
+            await run_in_threadpool(_semantic_search_readiness)
+        except Exception as exc:  # noqa: BLE001 — this loop must never die
+            print(f"library: readiness refresh loop raised "
+                  f"{type(exc).__name__} — continuing", file=sys.stderr)
 
 
 @app.get("/health")
@@ -1626,9 +1718,18 @@ async def health(request: Request):
     which is what a client needs BEFORE it can form a valid request.
 
     **`semantic_search.ready` is not the same fact `lifespan` logs at boot.**
-    That line is true once, at process start; this is checked (through a short
-    cache) on every call, which is the difference the 2026-08-24 incident turned
-    on.
+    That line is true once, at process start; this reads `_readiness_cache`,
+    which `_readiness_refresh_loop` keeps warm on a fixed cadence for as long
+    as the process runs — the difference the 2026-08-24 incident turned on.
+
+    **Never recomputes here, on the caller's own request.** Measured
+    2026-08-26 against the running service, a caller-pays recompute took
+    2.8-4.3s in service against single-digit milliseconds measuring the same
+    check out of process — an intermittent false "down" for any watchdog with
+    a shorter timeout, on the one route whose entire job is answering that
+    question correctly. This route only ever reads whatever
+    `_readiness_snapshot` returns; see there for what it answers before the
+    first refresh completes and when the cache has gone stale.
 
     **`commit` is the git commit this PROCESS loaded, and is absent when it
     could not be resolved.** It is stamped at import rather than read per
@@ -1667,15 +1768,11 @@ async def health(request: Request):
     ones, and the lowest-trust `agent` credential kind resolves here with no role
     check. This route now follows the precedent it cites: the boolean is public,
     the reason goes to the log, and `_semantic_search_readiness` prints it there
-    when a recheck finds the service not ready.
+    when the background refresh finds the service not ready.
     """
     if (err := _reject_unknown_params(request, set())):
         return err
-    hit = _readiness_cache_hit()
-    if hit is not None:
-        ready, _ = hit
-    else:
-        ready, _ = await run_in_threadpool(_semantic_search_readiness)
+    ready, _ = _readiness_snapshot()
     semantic_search = {"ready": ready}
     body = {"status": "ok", "protocol": {"current": protocol.CURRENT,
                                          "supported": list(protocol.SUPPORTED)},
@@ -1869,15 +1966,11 @@ async def list_items(request: Request):
         where += " AND product = ?"
         params.append(product)
     if (type_ := request.query_params.get("type")):
-        # **REFUSED RATHER THAN SILENTLY EMPTY**, matching `needs` just below. A
-        # work item carries no type but `epic`, so a filter naming anything
-        # else — a dropped type among them — could only ever match a closed
-        # row that kept what it closed with (or nothing at all); refusing says
-        # so instead of a caller reading an empty page as "no matches in
-        # scope".
-        if type_ not in store.ITEM_TYPES:
-            return refusals.refuse(400, f"type {type_!r} is not a known type",
-                                   supported=sorted(store.ITEM_TYPES))
+        # **NOT VALIDATED, matching the contract's DEFAULT clause** (§3.2 of
+        # projects/platform/contracts/library-protocol.md): omitting `type`
+        # already returns every type, so no caller needs a sentinel, and an
+        # unknown value is answered with whatever rows carry it — usually an
+        # empty page — rather than refused.
         where += " AND type = ?"
         params.append(type_)
     # **`needs` WAS DROPPED ON THE FLOOR, which is worse than `claimable` was.**
@@ -3434,7 +3527,7 @@ async def _signal_course_status_anomaly(ident, detail: dict) -> None:
         "meta": json.dumps({"prior_status": detail["prior_status"]}),
         "privacy_class": "internal",
         "dedup_key": None,
-        "produced_at": None,
+        "produced_at": store.produced_now(),
     }
     try:
         await run_in_threadpool(store.insert_signal, row, lambda _ex: False)
@@ -3819,6 +3912,59 @@ def _claim_owner(payload: dict, ident) -> tuple[str | None, JSONResponse | None]
     return store.clip(raw.strip(), store.MAX_ACTOR), None
 
 
+def _row_crew(row, column: str) -> str | None:
+    """`row[column]`, or `None` when `row`'s own schema carries no such
+    column.
+
+    A row from a schema predating this column means exactly what an explicit
+    `NULL` already means to `_crew_mismatch` below: no crew was recorded.
+    That covers every row written before the migration that added the
+    column, and it is also what keeps a test fixture that mirrors the
+    production schema by hand, but was written before this change, resolving
+    rather than raising `IndexError` on `row[column]`.
+    """
+    try:
+        return row[column]
+    except IndexError:
+        return None
+
+
+def _crew_mismatch(ident, recorded_crew: str | None) -> bool:
+    """Whether `ident` is refused from acting on a hold recorded as taken by
+    `recorded_crew` (CQ·10, the operator's ruling of 2026-10-15, comment 5378 on
+    issue_01KZMQCBXQ5KF2DTJCV3A9GMF7).
+
+    **False whenever there is nothing to compare.** No crew was recorded —
+    every hold taken before any credential names a crew, and any taken since
+    by a credential with no crew of its own — keeps today's behaviour
+    exactly: the `owner`-string check downstream of this call still runs.
+    `ident.kind == "approved_client"` also answers False unconditionally: that
+    is the human-attested credential ADR-0026 reserves the live-lease-breaking
+    force path to, and this ruling narrows releases and resolves between
+    AGENT crews, not that reservation.
+
+    **True for a non-human credential whose own crew differs from the
+    recorded one — INCLUDING a credential with no crew at all.** That is the
+    ruling's own wording, and it is what closes the door the `owner` string
+    alone cannot: an attacker who reads the recorded holder's name off the
+    item, a lease listing or a 409 body and asserts it as `owner` matches
+    that string exactly as the real holder would, and this check never reads
+    `owner` at all.
+    """
+    return (recorded_crew is not None
+            and ident.kind != "approved_client"
+            and ident.crew != recorded_crew)
+
+
+def _crew_mismatch_refusal() -> dict:
+    """The 409 body for `_crew_mismatch`. Names neither crew — the ruling's
+    own requirement — so a caller outside the holding crew learns nothing
+    about which crew holds this beyond the bare fact that it is not theirs.
+    """
+    return {"error": "this hold was taken by a credential of a different crew",
+            "reason": "crew_mismatch"}
+
+
 # `CONTROLLED_REFS`/`_strip_controlled_refs` are GONE
 # (issue_01M0ASMCB4F68PF3NJG7BV7K6C). `decision_id` was the one controlled
 # key, stripped from caller-supplied `refs` because `escalate` was its only
@@ -4053,6 +4199,18 @@ def _do_resolve(ident, item_id: str, resolution: str, note, refs, owner):
                         "subtree, which only a human may do; release it first if "
                         "it is yours",
             }
+        # **A CONFLICT WHOSE `holder` STRING MATCHES `owner` IS STILL FOREIGN
+        # WHEN THE CREW DOES NOT** (CQ·10). `foreign` above already refuses
+        # every conflict the owner string alone catches; this is the one it
+        # cannot — an attacker who read a sibling or ancestor lease's real
+        # holder name and typed it back as `owner` passes that filter outright.
+        # Checked after, not folded into the filter above, so the ordinary
+        # "held by" refusal still wins when both are true at once, and this
+        # narrower refusal fires only for the case nothing else catches.
+        for c in conflicts:
+            if (c.lease["holder"] == owner
+                    and _crew_mismatch(ident, _row_crew(c.lease, "holder_crew"))):
+                return 409, _crew_mismatch_refusal()
 
         merged = store._json_or(item["refs"], {})
         if refs:
@@ -4312,8 +4470,21 @@ def _do_reopen(ident, item_id: str, reason: str, owner: str):
                             (item_id,)).fetchone()
         if item is None or not identity.in_scope(ident, item["product"]):
             return 404, {"error": "no such item"}
-        refusal = (_refuse_unless_terminal(item)
-                   or _hold_for_write(conn, ident, item, owner, act="a reopen"))
+        refusal = _refuse_unless_terminal(item)
+        if refusal:
+            return refusal
+        # **THE CREW CHECK RUNS AGAINST THE ITEM'S OWN `claimed_by_crew`,
+        # NOT ONLY `_hold_for_write`'S LEASE** (CQ·10). `/resolve` already
+        # released the lease that would otherwise gate this through
+        # `_hold_for_write`, so by the time an item is terminal there is
+        # usually no live lease left for that check to see.
+        # `claimed_by_crew` survives a resolve — only reopen, release and
+        # `/reconcile-pr` clear it — so it is what an attacker who read
+        # `claimed_by` off this terminal item and typed it back as `owner`
+        # would otherwise walk straight past.
+        if _crew_mismatch(ident, _row_crew(item, "claimed_by_crew")):
+            return 409, _crew_mismatch_refusal()
+        refusal = _hold_for_write(conn, ident, item, owner, act="a reopen")
         if refusal:
             return refusal
         note = store.clip(reason, store.MAX_ITEM_TEXT)
@@ -4325,7 +4496,8 @@ def _do_reopen(ident, item_id: str, reason: str, owner: str):
         refusal = _transition(
             conn, item_id, ident.actor, item["state"], store.ITEM_STATE_OPEN,
             note, resolution=None, resolved_by=None, resolved_at=None,
-            outcome_note=None, claimed_by=None, claimed_at=None)
+            outcome_note=None, claimed_by=None, claimed_at=None,
+            claimed_by_crew=None)
         if refusal:
             return refusal
         conn.commit()
@@ -4561,7 +4733,7 @@ def _do_reconcile_pr(ident, item_id: str, outcome: str, owner: str):
             refusal = _transition(
                 conn, item_id, ident.actor, item["state"],
                 store.ITEM_STATE_OPEN, _PR_RECONCILE_NOTES[outcome],
-                claimed_by=None, claimed_at=None)
+                claimed_by=None, claimed_at=None, claimed_by_crew=None)
             if refusal:
                 return refusal
         conn.commit()
@@ -4596,6 +4768,17 @@ def _digest_prose(value) -> str | None:
     return f"{value[:200]}… ({len(value)} chars, sha256:{digest})"
 
 
+def _full_sha256(value: str | None) -> str | None:
+    """The full sha256 hex digest of a prose field, for a record meant to be
+    COMPARED rather than read (`_digest_prose` above is for the latter, and
+    truncates). `None` and `""` both record as `None`: a missing field and a
+    hash of nothing are different facts, and collapsing them would make "was
+    there text" and "does it match" the same question (CQ·146, ADR-0030)."""
+    if not value:
+        return None
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
 def _validate_prose(payload: dict, field: str):
     """One of ADR-0030's two prose fields off a payload, bounded.
 
@@ -4613,6 +4796,31 @@ def _validate_prose(payload: dict, field: str):
             "error": f"{field} must be at most {store.MAX_ITEM_TEXT} characters",
             "length": len(value)})
     return value, None
+
+
+def _validate_short_description(payload: dict):
+    """An item's short label off a payload, stripped and bounded
+    (issue_01M0XR0QSMKBSGBYD49CPTJ37E).
+
+    Returns `(value, refusal)`. `null`, and a string that is empty once
+    stripped, both clear it. Over `store.MAX_SHORT_DESCRIPTION` is refused with
+    the bound named, the same as an over-long `title`, so the caller learns the
+    limit from the refusal rather than from a label it never wrote.
+    """
+    value = payload.get("short_description")
+    if value is None:
+        return None, None
+    if not isinstance(value, str):
+        return None, (400, {
+            "error": "short_description must be a string, or null to clear it"})
+    value = value.strip()
+    if len(value) > store.MAX_SHORT_DESCRIPTION:
+        return None, (400, {
+            "error": f"short_description must be at most "
+                     f"{store.MAX_SHORT_DESCRIPTION} characters",
+            "length": len(value),
+            "limit": store.MAX_SHORT_DESCRIPTION})
+    return value or None, None
 
 
 def _validate_topics(payload: dict):
@@ -4978,6 +5186,60 @@ def _leave_course(conn, item, ident, why: str):
     return {"course_id": course["id"], "position": index + 1}
 
 
+def _index_before_demotion(conn, course_id: str, item_id: str,
+                           entries: list) -> int | None:
+    """Where a re-approved epic stood before its demotion, or None to append.
+
+    The operator, 2026-10-15 (platform/decisions/0087): a re-approval returns the epic
+    to the position it left from when its last departure from this Course was
+    a demotion, and the Course has changed since only by epics appended at the
+    end. Anything else appends, as a first approval does.
+
+    **READ FROM THE SNAPSHOTS, NOT THE NOTES.** Every course event carries the
+    order it left behind, so the newest snapshot holding the epic is the order
+    just before it left, and the event after that one is the departure. The
+    departure must be a demotion that removed this epic and nothing else, and
+    today's order must begin with the demotion's snapshot unchanged: a removal
+    or reorder of any other epic since moves the neighbours the old index
+    named, so it appends instead of guessing.
+
+    **A NULL `entries` IS SKIPPED, NOT READ AS AN EMPTY COURSE.** Retitle,
+    supersede and waypoint events write NULL to say the order did not move;
+    read as `[]` they look like the epic's departure and suppress the restore
+    (PR 286 review, round 1). An unreadable snapshot appends, since it cannot
+    say where the epic stood.
+
+    Runs inside the approval's transaction, which already holds the write
+    lock, so no reorder can land between this read and the write it informs.
+    """
+    departure = None
+    for row in conn.execute(
+            "SELECT action, entries FROM course_events WHERE course_id = ? "
+            "ORDER BY id DESC", (course_id,)):
+        if row["entries"] is None:
+            continue
+        try:
+            snapshot = json.loads(row["entries"])
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(snapshot, list):
+            return None
+        if item_id not in snapshot:
+            departure = (row["action"], snapshot)
+            continue
+        if departure is None:
+            return None
+        action, after = departure
+        if action != store.COURSE_ACTION_DEMOTED:
+            return None
+        if [e for e in snapshot if e != item_id] != after:
+            return None
+        if entries[:len(after)] != after:
+            return None
+        return snapshot.index(item_id)
+    return None
+
+
 def _lease_root_visible(conn, ident, held) -> bool:
     """Whether the caller may be told anything about the lease blocking it.
 
@@ -5005,14 +5267,17 @@ def _lease_root_visible(conn, ident, held) -> bool:
 
 
 def _fence_holding(conn, item_id: str, *, extra_roots: list | None = None,
-                   ignore_holder: str | None = None):
+                   ignore_holder: str | None = None, ident=None):
     """The live lease whose fence covers `item_id`, or None.
 
     A lease on R fences `subtree_ids(R)`, so the leases covering an item are the
     ones rooted at the item itself or at any of its ancestors. `extra_roots` adds
     the position an item is being MOVED to, which has its own ancestor chain.
     `ignore_holder` skips that holder's leases, for a check that only someone
-    else's lease may fail.
+    else's lease may fail. `ident` is the caller presenting that name: a
+    crewed lease is skipped only for a caller of the same crew (`lease.held_by`,
+    CQ·10), and a call that names a holder without `ident` skips no crewed
+    lease at all.
 
     A DEAD LEASE DOES NOT COUNT. It is the row occupying the root until someone
     reclaims it, and its holder is by definition not watching, so blocking a
@@ -5025,9 +5290,17 @@ def _fence_holding(conn, item_id: str, *, extra_roots: list | None = None,
     for root in dict.fromkeys(roots):
         row = lease.live_lease_on(conn, root)
         if (row is not None and not lease.is_dead(row)
-                and not lease.held_by(row, ignore_holder)):
+                and not lease.held_by(row, ignore_holder, **_crew_of(ident))):
             return row
     return None
+
+
+def _crew_of(ident) -> dict:
+    """The `crew`/`crew_exempt` pair `lease.held_by` judges a holder match
+    with, for `ident` (None when no caller is named)."""
+    if ident is None:
+        return {"crew": None, "crew_exempt": False}
+    return {"crew": ident.crew, "crew_exempt": ident.kind == "approved_client"}
 
 
 def _hold_for_write(conn, ident, item, owner: str, *, act: str):
@@ -5053,13 +5326,22 @@ def _hold_for_write(conn, ident, item, owner: str, *, act: str):
     **IT TAKES THE WRITE LOCK BEFORE LOOKING**, so a checkout cannot commit
     between this check and the caller's write. Every caller reaches here before
     its first write, and the lock is held until the caller commits or closes.
+
+    **A LIVE LEASE RECORDED AS A DIFFERENT CREW'S REFUSES BEFORE THE `owner`
+    STRING IS EVEN COMPARED** (CQ·10). `held["holder"] == owner` passes for
+    an attacker who read the real holder's name off the item or the lease
+    and typed it back — that is the whole defect this ruling closes — so the
+    crew check has to run first, not as a second reason alongside it.
     """
     if not conn.in_transaction:
         conn.execute("BEGIN IMMEDIATE")
     held = _fence_holding(conn, item["id"])
     if held is None:
-        lease.record_write(conn, item, holder=owner, actor=ident.actor, act=act)
+        lease.record_write(conn, item, holder=owner, actor=ident.actor, act=act,
+                           holder_crew=ident.crew)
         return None
+    if _crew_mismatch(ident, _row_crew(held, "holder_crew")):
+        return 409, _crew_mismatch_refusal()
     if held["holder"] == owner:
         return None
     if not _lease_root_visible(conn, ident, held):
@@ -5098,9 +5380,10 @@ async def correct_item(request: Request, item_id: str):
 
     **THIS IS A CORRECTION PATH, NOT A GENERAL EDIT API.** `title`, `body`,
     `state` and `needs` are not editable here; `/revision` is the route for an
-    item's content, and it takes the lease as its authorization. **`product` is
-    immutable everywhere**, and the descendant-count disclosure below depends on
-    that staying true.
+    item's content, and it takes the lease as its authorization. **`product`
+    changes only through `POST /items/{item_id}/product`, which moves the whole
+    subtree**, and the descendant-count disclosure below depends on that staying
+    true.
 
     **`topics` IS HERE RATHER THAN ON `/revision`, AND THE LINE IS CONTENT.** A
     topic is a classification — which area of a product this item belongs to —
@@ -5178,11 +5461,10 @@ async def correct_item(request: Request, item_id: str):
     # target (untyped), not a no-op, so "was `type` sent at all" has to be
     # asked rather than "is the value non-null".
     fields = {name: name in payload for name in
-              ("type", "maturity", "parent_id", "found_during", "specification",
+              ("type", "parent_id", "found_during", "specification",
                "definition_of_done", "topics", "prerequisites")}
     new_type = payload.get("type")
     new_severity = payload.get("severity")
-    new_maturity = payload.get("maturity")
     if new_severity is None and not any(fields.values()):
         return refusals.refuse(
             400, "at least one of type, severity, parent_id, found_during, "
@@ -5197,14 +5479,6 @@ async def correct_item(request: Request, item_id: str):
     err = spec_err or dod_err or topics_err
     if err:
         return JSONResponse(status_code=err[0], content=err[1])
-    if fields["maturity"] and new_maturity is not None:
-        if (not isinstance(new_maturity, str)
-                or new_maturity.strip() not in store.ITEM_MATURITY_SET):
-            return refusals.refuse(
-                400, f"maturity must be one of "
-                     f"{' | '.join(store.ITEM_MATURITIES)}, or null",
-                hint="send null to reset it to 'not yet assessed'")
-        new_maturity = new_maturity.strip()
     if new_type is not None:
         if not isinstance(new_type, str) or new_type.strip() not in store.ITEM_TYPES:
             return refusals.refuse(400, f"type {new_type!r} is not a known type",
@@ -5233,7 +5507,7 @@ async def correct_item(request: Request, item_id: str):
             functools.partial(
                 _do_correct, ident, item_id, payload,
                 {"type": new_type, "severity": new_severity,
-                 "maturity": new_maturity, "specification": new_spec,
+                 "specification": new_spec,
                  "definition_of_done": new_dod, "topics": new_topics}, fields,
                 end_state_unchanged=unchanged, owner=owner))
     except store.WritesDisabled as e:
@@ -5366,6 +5640,14 @@ def _do_correct(ident, item_id: str, payload: dict, new: dict, fields: dict,
     """Returns `(status, body)`."""
     conn = store.connect_rw()
     try:
+        # **THE WRITE LOCK IS TAKEN BEFORE THE READ** (CQ·100). Every gate
+        # below, the approval invariant above all, judges this row. Read
+        # before `_hold_for_write`'s `BEGIN IMMEDIATE`, a concurrent
+        # correction to a different column could commit in between, and both
+        # would decide whether their edit revokes approval against the same
+        # stale row; both UPDATEs land, since they touch different columns,
+        # and `approved` stands over a combination nobody judged.
+        conn.execute("BEGIN IMMEDIATE")
         item = conn.execute("SELECT * FROM issue_items WHERE id = ?",
                             (item_id,)).fetchone()
         if item is None or not identity.in_scope(ident, item["product"]):
@@ -5411,7 +5693,8 @@ def _do_correct(ident, item_id: str, payload: dict, new: dict, fields: dict,
                             "safe until it can be counted"}
             if kids:
                 # THE COUNT IS SAFE TO DISCLOSE because every descendant inherits
-                # its epic's product: `product` is immutable and every edge is
+                # its epic's product: `product` changes only by moving a whole
+                # subtree (`move_item_product`), and every edge is
                 # same-product, at create and at re-parent alike, because both go
                 # through `_validate_parent` with a non-None `product`. A subtree
                 # cannot span products, so the number reveals nothing a caller
@@ -5435,7 +5718,7 @@ def _do_correct(ident, item_id: str, payload: dict, new: dict, fields: dict,
             return conflict[0], conflict[1]
         err = _approval_invariant(
             item, effective_type=effective_type,
-            has_maturity=fields["maturity"], new_maturity=new["maturity"],
+            has_maturity=False, new_maturity=None,
             has_spec=fields["specification"], new_spec=new["specification"],
             has_dod=fields["definition_of_done"],
             new_dod=new["definition_of_done"],
@@ -5528,9 +5811,11 @@ def _do_correct(ident, item_id: str, payload: dict, new: dict, fields: dict,
             # label. It needs Phase 5's per-session token, which makes `holder`
             # verifiable. What this check does stop is the honest mistake: a
             # session moving an item into or out of a fence it does not hold.
+            # Since CQ·10 a crewed lease also needs the caller's crew to match
+            # (`lease.held_by`), so the name alone no longer passes across crews.
             blocker = _fence_holding(
                 conn, item_id, extra_roots=[new_parent] if new_parent else [],
-                ignore_holder=owner)
+                ignore_holder=owner, ident=ident)
             if blocker is not None:
                 # **THE BLOCKING LEASE'S OWN PRODUCT IS CHECKED HERE, NOT ONLY
                 # UPSTREAM** (security-reviewer, PR #11). `_lease_refusal` carries
@@ -5568,7 +5853,8 @@ def _do_correct(ident, item_id: str, payload: dict, new: dict, fields: dict,
                 try:
                     beneath = [c.lease for c in lease.live_conflicts(conn, item_id)
                                if c.blocks_by == "descendant"
-                               and not lease.held_by(c.lease, owner)]
+                               and not lease.held_by(c.lease, owner,
+                                                     **_crew_of(ident))]
                 except lease.SubtreeTooLarge as too_big:
                     return 409, {
                         "error": f"cannot enumerate this subtree: {too_big}",
@@ -5642,7 +5928,6 @@ def _do_correct(ident, item_id: str, payload: dict, new: dict, fields: dict,
         # `severity` above for the same reason: `null` retypes to untyped, a
         # real target rather than an omitted field.
         for name, value in (("type", new_type),
-                            ("maturity", new["maturity"]),
                             ("found_during", new_found_during),
                             ("specification", new["specification"]),
                             ("definition_of_done", new["definition_of_done"])):
@@ -5680,13 +5965,11 @@ def _do_correct(ident, item_id: str, payload: dict, new: dict, fields: dict,
         # would mean refusing on a state the write never produced, or producing
         # one the gate never judged.
         #
-        # An explicit resend of `maturity: approved` does not save it: there is
-        # no gate left to refuse that resend, so demotion has to win on its own
-        # to keep the invariant true. `final_maturity` is what the request would
-        # otherwise leave standing — the caller's value if it sent one, the
-        # item's own otherwise — and it is what `_revokes_approval` judges,
-        # matching what `_approval_invariant` already modelled above.
-        final_maturity = new["maturity"] if fields["maturity"] else item["maturity"]
+        # This route never sets `maturity` (`_refuse_maturity`, above), so the
+        # value standing after this edit is always the item's own, and that is
+        # what `_revokes_approval` judges, matching what `_approval_invariant`
+        # already modelled above.
+        final_maturity = item["maturity"]
         unapproved_by_edit = (
             final_maturity == store.ITEM_MATURITY_APPROVED
             and _revokes_approval(item, effective_type=effective_type,
@@ -5880,11 +6163,24 @@ async def approve_epic(request: Request, item_id: str):
     changes the specification or definition of done still revokes the approval
     (`_revokes_approval`).
 
+    **THE RECORD NAMES WHICH TEXT IT COVERS** (ADR-0030, CQ·146). The `approval`
+    object carries `specification_sha256` and `definition_of_done_sha256`, the
+    full sha256 hex digest of each field as stored in this same transaction —
+    `null` when a field is missing or empty, never the hash of an empty string,
+    so "was anything there" stays a distinct question from "does it match".
+    Comparing a digest recorded here against a fresh hash of the current text is
+    what turns "did the operator approve this" from archaeology over prose into
+    arithmetic. Protocol version 1 only adds response fields within a version
+    (`platform/contracts/library-protocol` §1); a client built before this
+    field existed sees the fields it always saw, plus these two, and ignores
+    them.
+
     Body: `acting_human` (required) and optionally `owner`, which is accepted
     so existing clients do not break and is not used. Returns the item and
     an `approval` record naming the approving client (`approved_by`), the human
     (`acting_human`), the Course and the 1-based `position` the epic took. The
-    same facts are written to the item's thread and to the Course's history.
+    same facts, plus the two digests, are written to the item's thread and to
+    the Course's history where that approval already writes one.
     """
     ident, err = _identify(request)
     if err:
@@ -5952,6 +6248,13 @@ def _do_approve(ident, item_id: str, human: str, owner: str):
             new_spec=None, has_dod=False, new_dod=None)
         if err:
             return err
+        # The full digest of each field AS STORED IN THIS TRANSACTION, so the
+        # record names exactly the text this approval covers (ADR-0030,
+        # CQ·146). Computed once and reused in the response, the thread note
+        # and the Course event below, so the three cannot drift from each
+        # other or from a second read of the row.
+        spec_sha256 = _full_sha256(item["specification"])
+        dod_sha256 = _full_sha256(item["definition_of_done"])
         course = _live_course_of(conn, item["product"])
         if course is None:
             return 409, {
@@ -5981,18 +6284,33 @@ def _do_approve(ident, item_id: str, human: str, owner: str):
                     "error": f"the item is no longer {item['state']}",
                     "hint": "re-read the item and retry against its current "
                             "state"}
+        restored = False
         if not placed:
-            entries.append(item_id)
+            index = _index_before_demotion(conn, course["id"], item_id, entries)
+            if index is None:
+                entries.append(item_id)
+            else:
+                entries.insert(index, item_id)
+                restored = True
             conn.execute(
                 "UPDATE courses SET entries = ?, version = version + 1, "
                 "updated_by = ?, updated_at = ? WHERE id = ?",
                 (json.dumps(entries), ident.actor, now, course["id"]))
+            # `entries` is a typed snapshot of Course membership (a list of
+            # epic ids) read elsewhere as exactly that; it is not a general
+            # payload column, so the digests go in `note`, the free-text
+            # column every other course_events row already narrates into.
             conn.execute(
                 "INSERT INTO course_events (course_id, actor, action, entries, "
                 "note, at) VALUES (?,?,?,?,?,?)",
                 (course["id"], ident.actor, store.COURSE_ACTION_APPROVED,
                  json.dumps(entries),
-                 f"{item_id} approved by {ident.actor} for {human}", now))
+                 f"{item_id} approved by {ident.actor} for {human} "
+                 f"(specification_sha256={spec_sha256 or 'none'}, "
+                 f"definition_of_done_sha256={dod_sha256 or 'none'})"
+                 + (f"; returned to position {entries.index(item_id) + 1}, "
+                    f"where it stood before its demotion" if restored else ""),
+                 now))
         position = entries.index(item_id) + 1
         if newly_approved or not placed:
             conn.execute(
@@ -6001,7 +6319,11 @@ def _do_approve(ident, item_id: str, human: str, owner: str):
                 (item_id, ident.actor, "note", store.clip(
                     f"**Approved** by {ident.actor} for {human}. "
                     f"{'Placed on' if not placed else 'Already on'} Course "
-                    f"{course['id']} at position {position} of {len(entries)}.",
+                    f"{course['id']} at position {position} of {len(entries)}"
+                    f"{', where it stood before its demotion' if restored else ''}"
+                    f".\n\n"
+                    f"specification_sha256: {spec_sha256 or 'none'}\n"
+                    f"definition_of_done_sha256: {dod_sha256 or 'none'}",
                     store.MAX_ITEM_TEXT), None, now))
         conn.commit()
         fresh = conn.execute("SELECT * FROM issue_items WHERE id = ?",
@@ -6014,7 +6336,10 @@ def _do_approve(ident, item_id: str, human: str, owner: str):
             "approval": {"approved_by": ident.actor, "acting_human": human,
                          "course_id": course["id"], "position": position,
                          "course_size": len(entries),
-                         "newly_placed": not placed}}
+                         "newly_placed": not placed,
+                         "restored_position": restored,
+                         "specification_sha256": spec_sha256,
+                         "definition_of_done_sha256": dod_sha256}}
     finally:
         conn.close()
 
@@ -6263,8 +6588,10 @@ def _do_judge_prerequisite(ident, item_id: str, text: str, met: bool,
 # each of these has a route that DOES record it — so the refusal names that route
 # instead of leaving the caller to guess which door it wanted.
 _REVISION_FORBIDDEN = {
-    "product": "product is immutable — the descendant-count disclosure on epic "
-               "retype depends on a subtree never spanning products (ADR-0023)",
+    "product": "a product change moves the whole subtree, so it has its own "
+               "route: POST /items/{item_id}/product. The descendant-count "
+               "disclosure on epic retype depends on a subtree never spanning "
+               "products (ADR-0023)",
     "parent_id": "re-parenting is a correction to where an item sits rather than "
                  "to its content. Use /correct, passing the same owner: your "
                  "own lease never refuses it",
@@ -6310,6 +6637,270 @@ def _briefing(conn, item, ident, *, vectors_unavailable: str | None = None) -> d
             f"UNKNOWN rather than 'no near duplicates'")
 
 
+@app.post("/items/{item_id}/product")
+async def move_item_product(request: Request, item_id: str):
+    """Move a work item, and everything beneath it, to another product
+    (issue_01M0AT44FBFJ7CHP84V027PG7J).
+
+    Body: `product` (a slug, alias, repo name or non-project scope, resolved
+    through the registry as `POST /items` resolves it) and `owner`, the same
+    stable identity `/correct` takes. Needs `item.resolve`, and the caller's
+    scope must cover BOTH products: moving an item into a product the caller
+    cannot see would disclose it there, and moving one out of a product the
+    caller cannot see would take it.
+
+    **THE WHOLE SUBTREE MOVES, IN ONE TRANSACTION, OR NOTHING DOES.** Every
+    parent edge is same-product, which is what keeps the descendant count
+    `/correct` discloses on an epic retype safe: a subtree never spans
+    products. Moving the item alone would break that, so its descendants move
+    with it, and a subtree that cannot be enumerated is refused rather than
+    half-moved.
+
+    **THE MOVED ITEM LEAVES ITS PARENT.** An epic becomes top level in the new
+    product; a work item lands in the new product's corrections queue. Its
+    descendants keep their parent edges, which now all sit in the new product.
+
+    **EACH MOVED ITEM GETS A NEW KEY IN THE NEW PRODUCT** (`_rekey_for_move`),
+    because keys are numbered per product and the old one may already be taken
+    there. The old key is never handed out again in the old product, so a
+    reference to it finds nothing rather than the wrong item, and each item's
+    history records old key and new.
+
+    **REFUSED, BY NAME, WHEN `found_during` WOULD CROSS PRODUCTS.**
+    `found_during` must name an epic in the item's own product, so a move that
+    carries an item away from the epic it names, or carries away an epic that
+    an item left behind names, is refused with those items listed. Correct
+    `found_during` with `/correct` first; clearing it here would lose a fact
+    nobody asked to lose.
+
+    An approved epic in the moved subtree leaves the old product's live
+    Course, recorded in the Course's history, as a demotion records it. It
+    joins no Course in the new product: what that product works on next is
+    its own plan's decision.
+
+    Returns `{item, moved}`, where `moved` lists `{id, old_key, new_key}` for
+    every item that moved.
+    """
+    ident, err = _identify(request)
+    if err:
+        return err
+    if not identity.authorized(ident, "item.resolve"):
+        return refusals.forbidden("item.resolve")
+    try:
+        payload = await request.json()
+    except (ValueError, TypeError):
+        return refusals.refuse(400, "body must be a JSON object")
+    if not isinstance(payload, dict):
+        return refusals.refuse(400, "body must be a JSON object")
+    owner, err = _claim_owner(payload, ident)
+    if err:
+        return err
+    raw = payload.get("product")
+    if not isinstance(raw, str) or not raw.strip():
+        return refusals.refuse(400, "product is required")
+    if len(raw) > store.MAX_IDENT:
+        return refusals.refuse(
+            400, f"product is longer than {store.MAX_IDENT} characters")
+    # The same resolution, and the same narrowed refusal, `POST /items` gives:
+    # see the note there on why the known list is only what this caller may use.
+    product = projects.resolve(raw)
+    if product is None:
+        known = [n for n in projects.known_names()
+                 if identity.in_scope(ident, projects.resolve(n))]
+        return refusals.refuse(
+            400, f"no project or scope named {raw!r}",
+            hint="a slug, alias, repo name or non-project scope resolves; the "
+                 "canonical slug is what gets stored",
+            known=known)
+    if not identity.in_scope(ident, product):
+        return refusals.not_found()
+    try:
+        status, body = await run_in_threadpool(
+            _do_move_product, ident, item_id, product, owner)
+    except store.WritesDisabled as e:
+        return refusals.refuse(503, "the Library is not the write path yet",
+                               hint=str(e))
+    return JSONResponse(status_code=status, content=body)
+
+
+def _do_move_product(ident, item_id: str, product: str, owner: str):
+    """Returns `(status, body)`."""
+    conn = store.connect_rw()
+    try:
+        item = conn.execute("SELECT * FROM issue_items WHERE id = ?",
+                            (item_id,)).fetchone()
+        if item is None or not identity.in_scope(ident, item["product"]):
+            return 404, {"error": "no such item"}
+        if item["state"] in store.ITEM_TERMINAL:
+            return 409, {"error": f"item is {item['state']}; a terminal item is "
+                                  f"a record of what happened and does not move"}
+        if item["product"] == product:
+            return 409, {"error": f"{item_id} is already in {product!r}"}
+        # Takes the write lock before it looks, so nothing can check out a part
+        # of this subtree between the checks below and the move.
+        refusal = _hold_for_write(conn, ident, item, owner, act="a move")
+        if refusal:
+            return refusal[0], refusal[1]
+        try:
+            # Root first, then breadth-first: `_rekey_for_move` needs every
+            # parent keyed before its children.
+            ids = [item_id, *lease.subtree_ids(conn, item_id)]
+        except lease.SubtreeTooLarge as too_big:
+            return 409, {
+                "error": f"cannot enumerate this subtree: {too_big}",
+                "hint": "a move takes the whole subtree or nothing, so it "
+                        "cannot proceed until the subtree can be counted"}
+        # `_hold_for_write` answers for the fence ABOVE the item. A move also
+        # takes everything BELOW it, so a lease another holder has inside the
+        # subtree refuses it too. **THE BLOCKING LEASE'S OWN PRODUCT IS CHECKED
+        # BEFORE ITS HOLDER IS NAMED** (security-reviewer, knowledge#898), as at
+        # every other disclosure site: that every descendant shares the item's
+        # product is the invariant `_lease_root_visible` refuses to lean on.
+        crew = _crew_of(ident)
+        below = [c for c in lease.live_conflicts(
+                     conn, item_id, ignore_holder=owner,
+                     holder_crew=crew["crew"], crew_exempt=crew["crew_exempt"])
+                 if c.blocks_by == "descendant"]
+        if below:
+            held = below[0].lease
+            if not _lease_root_visible(conn, ident, held):
+                return 409, {
+                    "error": f"something beneath {item_id} is held by another "
+                             f"session, and that lease is outside this "
+                             f"identity's scope",
+                    "reason": "held",
+                    "hint": "the hold is real but its holder is not yours to "
+                            "see; wait for it to release"}
+            return 409, {
+                "error": f"something beneath {item_id} is held by "
+                         f"{held['holder']}; a move takes the whole subtree",
+                "reason": "held",
+                "lease": lease.lease_dict(held, conn=conn),
+                "hint": "wait for the holder to release, or move a part of "
+                        "the tree nobody holds"}
+        moving = set(ids)
+        marks = ",".join("?" * len(ids))
+        rows = conn.execute(
+            f"SELECT * FROM issue_items WHERE id IN ({marks})", ids).fetchall()
+        by_id = {r["id"]: r for r in rows}
+        leaving = sorted(r["id"] for r in rows
+                         if r["found_during"] and r["found_during"] not in moving)
+        staying = sorted(r["id"] for r in conn.execute(
+            f"SELECT id FROM issue_items WHERE found_during IN ({marks}) "
+            f"AND id NOT IN ({marks})", [*ids, *ids]))
+        if leaving or staying:
+            return 409, {
+                "error": "found_during would cross products: it must name an "
+                         "epic in the item's own product",
+                "moving_away_from_their_epic": leaving,
+                "left_behind_naming_a_moved_epic": staying,
+                "hint": "correct found_during on these items with /correct "
+                        "first, then move"}
+
+        now = _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None).isoformat(" ")
+        old_product = item["product"]
+        if item["type"] == store.ITEM_TYPE_EPIC:
+            new_parent = None
+        else:
+            # THROUGH `_validate_parent`, with the DESTINATION product, like
+            # every other parent write (`test_invariants`): it is what keeps a
+            # parent edge from crossing products.
+            new_parent, perr = _validate_parent(
+                conn, store.get_or_create_corrections_queue(conn, product),
+                ident=ident, product=product, item_id=item_id,
+                item_type=item["type"])
+            if perr:
+                conn.rollback()
+                return perr[0], perr[1]
+        left_courses = []
+        for row in rows:
+            if row["type"] == store.ITEM_TYPE_EPIC:
+                left = _leave_course(conn, row, ident,
+                                     f"moved from {old_product} to {product}")
+                if left is not None:
+                    left_courses.append({"item_id": row["id"], **left})
+        new_keys = _rekey_for_move(conn, ids, by_id, product, item_id,
+                                   new_parent)
+        moved = []
+        for mid in ids:
+            row = by_id[mid]
+            # Only the moved root changes parent; its descendants keep theirs,
+            # which all move with them.
+            columns = {"product": product, "item_key": new_keys[mid]}
+            parent = row["parent_id"]
+            if mid == item_id:
+                parent = columns["parent_id"] = new_parent
+            sets = ", ".join(f"{c} = ?" for c in columns)
+            conn.execute(f"UPDATE issue_items SET {sets} WHERE id = ?",
+                         [*columns.values(), mid])
+            note = (f"Moved by {ident.actor} from {old_product!r} to "
+                    f"{product!r}; key {row['item_key']!r} → "
+                    f"{new_keys[mid]!r}")
+            if mid == item_id and parent != row["parent_id"]:
+                note += f"; parent {row['parent_id']!r} → {parent!r}"
+            conn.execute(
+                "INSERT INTO issue_events (item_id, actor, from_state, "
+                "to_state, at, note) VALUES (?,?,?,?,?,?)",
+                (mid, ident.actor, row["state"], row["state"], now, note))
+            moved.append({"id": mid, "old_key": row["item_key"],
+                          "new_key": new_keys[mid]})
+        conn.commit()
+        fresh = conn.execute(f"SELECT {store.ITEM_COLUMNS} FROM issue_items "
+                             f"WHERE id = ?", (item_id,)).fetchone()
+        return 200, {
+            "item": store.item_dict(
+                fresh, claim=lease.claim_status(conn, fresh),
+                prerequisites=store.prerequisite_status(
+                    conn, fresh, in_scope=_scope_predicate(ident))),
+            "moved": moved,
+            "left_courses": left_courses}
+    finally:
+        conn.close()
+
+
+def _rekey_for_move(conn, ids, by_id, product: str, root_id: str,
+                    root_parent) -> dict:
+    """The key each item in a moving subtree will carry in `product`.
+
+    Minted as `mint_item_key` would mint them were they filed there today: an
+    epic gets the next `E<n>` of the new product, the moved root, when it is a
+    work item, gets the next `CQ·n` there, and a work item under a moved epic
+    extends that epic's NEW key. Where a sub-item's old key extends its
+    parent's old key (`E9·4` under `E9`), the suffix is kept (`E3·4` under the
+    new `E3`), so the numbers a person knew survive the move; a sub-item filed
+    under another epic and re-parented since carries a suffix from that epic's
+    counter, so it gets the next number of its parent's counter instead, which
+    is never handed out twice.
+
+    `ids` is in `subtree_ids` order, root first and each parent before its
+    children, so a parent's new key exists before a child extends it.
+    """
+    out = {}
+    for mid in ids:
+        row = by_id[mid]
+        parent_id = root_parent if mid == root_id else row["parent_id"]
+        if row["type"] == store.ITEM_TYPE_EPIC:
+            out[mid] = store.mint_item_key(conn, product=product,
+                                           item_type=row["type"],
+                                           parent_id=parent_id)
+            continue
+        parent = by_id.get(parent_id)
+        if parent is None:
+            out[mid] = store.mint_item_key(conn, product=product,
+                                           item_type=row["type"],
+                                           parent_id=None)
+            continue
+        prefix = f"{parent['item_key']}{store.ITEM_KEY_SEPARATOR}"
+        old = row["item_key"] or ""
+        if parent["item_key"] and old.startswith(prefix):
+            out[mid] = f"{out[parent_id]}{store.ITEM_KEY_SEPARATOR}{old[len(prefix):]}"
+        else:
+            n = store._next_item_key_number(conn, store.ITEM_KEY_SCOPE_ITEM,
+                                            parent_id)
+            out[mid] = f"{out[parent_id]}{store.ITEM_KEY_SEPARATOR}{n}"
+    return out
+
+
 @app.post("/items/{item_id}/revision")
 async def revise_item(request: Request, item_id: str):
     """Revise a held item in full — `title` and `body` included.
@@ -6340,7 +6931,8 @@ async def revise_item(request: Request, item_id: str):
     corrected accumulates annotations that contradict it.
 
     Body: `owner` (the same stable per-session identity you checked out as), plus
-    at least one of `title`, `body`, `specification` or `definition_of_done`.
+    at least one of `title`, `short_description`, `body`, `specification` or
+    `definition_of_done`.
     Everything else is refused by name, `maturity` included: an epic is approved
     through `POST /items/{item_id}/approve`.
 
@@ -6396,11 +6988,12 @@ async def revise_item(request: Request, item_id: str):
     if err:
         return err
     has = {name: name in payload for name in
-           ("title", "body", "specification", "definition_of_done", "maturity")}
+           ("title", "short_description", "body", "specification",
+            "definition_of_done")}
     if not any(has.values()):
         return refusals.refuse(
-            400, "at least one of title, body, specification or "
-                 "definition_of_done is required")
+            400, "at least one of title, short_description, body, "
+                 "specification or definition_of_done is required")
     # **`title` IS THE ONE FIELD WITH NO NULL.** An item with no title is
     # unreadable in every list that shows one. `body` may be cleared, the same as
     # the two prose fields: a description that turned out to be wrong is better
@@ -6427,17 +7020,10 @@ async def revise_item(request: Request, item_id: str):
     # cannot drift into accepting different things.
     new_spec, spec_err = _validate_prose(payload, "specification")
     new_dod, dod_err = _validate_prose(payload, "definition_of_done")
-    err = spec_err or dod_err
+    new_short, short_err = _validate_short_description(payload)
+    err = spec_err or dod_err or short_err
     if err:
         return JSONResponse(status_code=err[0], content=err[1])
-    new_maturity = payload.get("maturity")
-    if has["maturity"] and new_maturity is not None:
-        if (not isinstance(new_maturity, str)
-                or new_maturity.strip() not in store.ITEM_MATURITY_SET):
-            return refusals.refuse(
-                400, f"maturity must be one of "
-                     f"{' | '.join(store.ITEM_MATURITIES)}, or null")
-        new_maturity = new_maturity.strip()
     # **NO RETYPE CONFLICT TO CHECK ON THIS ROUTE**: `type` is in
     # `_REVISION_FORBIDDEN` and refused by name above, so a revision cannot
     # change what the item is. `_do_correct` calls `_retype_conflict` after
@@ -6450,8 +7036,8 @@ async def revise_item(request: Request, item_id: str):
         result = await run_in_threadpool(
             functools.partial(
                 _do_revision, ident, item_id, owner, has,
-                {"title": new_title, "body": new_body,
-                 "maturity": new_maturity, "specification": new_spec,
+                {"title": new_title, "short_description": new_short,
+                 "body": new_body, "specification": new_spec,
                  "definition_of_done": new_dod},
                 end_state_unchanged=unchanged))
     except store.WritesDisabled as e:
@@ -6643,28 +7229,34 @@ def _do_revision(ident, item_id: str, owner: str, has: dict, new: dict,
                 "lease": lease.lease_dict(held, conn=conn),
                 "hint": "revise as the holder you checked out as, or wait for "
                         "the holder to release"}, None
+        # **THE CREW CHECK, AFTER THE HOLDER MATCH** (CQ·10; reviewer, PR 287
+        # round 1). A caller that typed the real holder back as `owner` passes
+        # the comparison above, so this route takes the same refusal
+        # `_hold_for_write` gives the other lease-authorized writes.
+        if _crew_mismatch(ident, _row_crew(held, "holder_crew")):
+            return 409, _crew_mismatch_refusal(), None
         # The gates run BEFORE any mutation, the same as every other route here.
         # **`effective_type` IS THE ITEM'S OWN TYPE**, because this route cannot
         # retype: `type` is refused by name above.
         err = _approval_invariant(
             item, effective_type=item["type"],
-            has_maturity=has["maturity"], new_maturity=new["maturity"],
+            has_maturity=False, new_maturity=None,
             has_spec=has["specification"], new_spec=new["specification"],
             has_dod=has["definition_of_done"], new_dod=new["definition_of_done"],
             end_state_unchanged=end_state_unchanged)
         if err:
             return (*err, None)
         changes, columns = [], {}
-        for name in ("title", "body", "maturity", "specification",
+        for name in ("title", "short_description", "body", "specification",
                      "definition_of_done"):
             if has[name] and new[name] != item[name]:
                 changes.append((name, item[name], new[name]))
                 columns[name] = new[name]
         spec_edited = any(f in columns
                           for f in ("specification", "definition_of_done"))
-        # An explicit resend of `maturity: approved` does not save it — see the
-        # matching comment in `_do_correct`.
-        final_maturity = new["maturity"] if has["maturity"] else item["maturity"]
+        # This route never sets `maturity` (`_refuse_maturity`, above), so the
+        # value standing after this edit is always the item's own.
+        final_maturity = item["maturity"]
         unapproved_by_edit = (
             final_maturity == store.ITEM_MATURITY_APPROVED
             and _revokes_approval(item, effective_type=item["type"],
@@ -6951,6 +7543,11 @@ async def checkout_item(request: Request, item_id: str):
     bundle, so returning it an empty one over a live lease would let a
     dispatch individuate nothing and still report success. The refusal costs
     nothing: no lease was taken, and the item is still claimable on the retry.
+    **The same 400 answers a `profile` naming a project/variant other than a
+    bound identity's own** (issue_01M35QG0VANA5P1XE3PH6A7PS4): `profile` is
+    named by the caller and not read from the credential, so without this a
+    bound identity could fill `docs` from any other crew's document set
+    through its own checkout.
 
     **A blocked item is checked out but not claimed** (the operator, 2026-09-12,
     platform/decisions/0079). The lease is taken so the owning crew's co can
@@ -7257,12 +7854,26 @@ def _refuse_on_capped_ledger(conn, product: str):
 _MODEL_NOT_RESOLVED = "model-resolution-not-implemented"
 
 
+# WHY `persona_md` CAME BACK AS A PLACEHOLDER, served beside it as
+# `persona_unresolved_reason` (issue_01M4XEEPQ37JFM3SE1493WDHVG).
+# `PERSONA_UNRESOLVED` deliberately covers three cases a bound caller must not
+# tell apart: no agent document of that name, an ambiguous name, and a
+# document outside the caller's dispatch profile. Distinguishing them would
+# say that a document of that name exists somewhere (security-reviewer,
+# convivy/library#268 round 3).
+PERSONA_NOT_NAMED = "no_persona"
+PERSONA_INDEX_UNREADABLE = "index_unreadable"
+PERSONA_UNRESOLVED = "unresolved"
+
+
 def _persona_md(persona: str | None) -> str:
-    """The call slip's light agent information (ADR-0062) — content rather than
-    an id, which is `persona_md`'s deliberate exception to `docs[]`'s
-    by-id-only rule. There is no persona storage or registry yet (out of
-    scope for issue_01M12NE120JVQT4DV85N8MB7TP), so this is a labelled
-    placeholder a client can already read the shape of, not resolved content.
+    """The placeholder `persona_md` carries when no agent definition resolves.
+
+    **ITS TEXT IS A WIRE CONTRACT UNTIL THE BOSUN READS `persona_resolved`.**
+    agentctl's interim fallback to the roster's definition fires on this exact
+    text (issue_01M4XEHK9FRVRRMFGH6C80BC6T), so changing it would start an
+    unresolved run on a placeholder as its agent definition. Why it did not
+    resolve travels in `persona_unresolved_reason` instead.
     """
     heading = persona or "default"
     return (f"# {heading}\n\n"
@@ -7271,9 +7882,13 @@ def _persona_md(persona: str | None) -> str:
             "shape ahead of it.")
 
 
-def _persona_model(persona: str) -> str | None:
-    """The `model` frontmatter pin of the agent definition `persona` names, or
-    `None` when nothing resolves one.
+def _resolve_persona(ident: identity.Identity,
+                     persona: str | None) -> tuple[sqlite3.Row | None, str | None]:
+    """`(row, None)` for the `kind: agent` document `persona` names, or
+    `(None, reason)` with one of the `PERSONA_*` reasons above.
+
+    **ONE LOOKUP FEEDS BOTH `model` AND `persona_md`**, so the grant can never
+    pin one document's model beside another's definition.
 
     **Same id-suffix match and the same agent-platform preference `agentctl`'s
     `_library_agent` uses** (ARCH-426): every `kind: agent` document is read
@@ -7284,35 +7899,69 @@ def _persona_model(persona: str) -> str | None:
     `agentctl spawn --issue` dispatch that later runs the same persona must
     not be told two different models.
 
+    **THE MATCH RUNS OVER EVERY AGENT DOCUMENT, UNNARROWED, AND ONLY THE
+    RESULT IS THEN CHECKED AGAINST SCOPE** (issue_01M35QG0VANA5P1XE3PH6A7PS4):
+    narrowing the candidate set to `ident`'s profile before the id-suffix
+    match could change which copy the ambiguity tiebreak above prefers, which
+    would disagree with `agentctl`'s own unscoped resolution. A bound identity
+    whose persona resolves outside its profile gets exactly the answer an
+    unresolved persona gets — the same "not yours to see" shape
+    `_bound_scope_clause`'s other callers give a document outside scope.
+
     **A FAILURE HERE MUST NOT COST THE CALLER ITS CHECKOUT**, the same
-    contract `_slip_docs` holds for a profile bundle: this returns `None`
-    rather than raising, and the caller falls back to `_MODEL_NOT_RESOLVED`.
+    contract `_slip_docs` holds for a profile bundle: this returns a reason
+    rather than raising.
     """
+    if not persona:
+        return None, PERSONA_NOT_NAMED
     try:
         conn = reference.connect()
     except reference.ReferenceIndexUnavailable as e:
-        print(f"library: agent model lookup unavailable for {persona!r} — {e}",
+        print(f"library: agent lookup unavailable for {persona!r} — {e}",
               file=sys.stderr)
-        return None
+        return None, PERSONA_INDEX_UNREADABLE
     try:
         rows = conn.execute("SELECT * FROM docs WHERE kind = 'agent'").fetchall()
-    except sqlite3.Error as e:
-        print(f"library: agent model lookup unavailable for {persona!r} — {e}",
+        suffix = f"/agents/{persona}"
+        matches = [r for r in rows if str(r["id"]).endswith(suffix)]
+        if len(matches) > 1:
+            matches = [r for r in matches if r["project"] == "agent-platform"]
+        doc = matches[0] if len(matches) == 1 else None
+        # A BOUND IDENTITY PAYS FOR THE SCOPE CHECK WHETHER OR NOT THE PERSONA
+        # RESOLVED (security-reviewer, #268 round 3). Run only on a match, the
+        # extra control-database read and query made "a document of this name
+        # exists somewhere" measurable in latency, though the body was already
+        # identical. An id no document carries stands in when nothing matched.
+        scope = _bound_scope_clause(ident)
+        if scope is not None:
+            scope_clause, scope_params = scope
+            in_scope = conn.execute(
+                f"SELECT 1 FROM docs WHERE id = ? AND {scope_clause}",
+                [doc["id"] if doc is not None else "", *scope_params]
+            ).fetchone()
+            if in_scope is None:
+                return None, PERSONA_UNRESOLVED
+        if doc is None:
+            return None, PERSONA_UNRESOLVED
+        return doc, None
+    except (sqlite3.Error, FileNotFoundError) as e:
+        print(f"library: agent lookup unavailable for {persona!r} — {e}",
               file=sys.stderr)
-        return None
+        return None, PERSONA_INDEX_UNREADABLE
     finally:
         conn.close()
-    suffix = f"/agents/{persona}"
-    matches = [r for r in rows if str(r["id"]).endswith(suffix)]
-    if len(matches) > 1:
-        matches = [r for r in matches if r["project"] == "agent-platform"]
-    if len(matches) != 1:
+
+
+def _persona_model(doc: sqlite3.Row | None) -> str | None:
+    """The `model` frontmatter pin of a resolved agent definition, or `None`
+    when there is no document or it pins none."""
+    if doc is None:
         return None
-    model = reference.doc_dict(matches[0], body=False).get("model")
+    model = reference.doc_dict(doc, body=False).get("model")
     return model if isinstance(model, str) and model.strip() else None
 
 
-def _call_slip_grant(persona: str | None, slip_id: str,
+def _call_slip_grant(ident: identity.Identity, persona: str | None, slip_id: str,
                      profile_row: dict | None = None,
                      per_run_cap_usd: float | None = None,
                      model_choice: str | None = None) -> dict:
@@ -7322,11 +7971,16 @@ def _call_slip_grant(persona: str | None, slip_id: str,
     additive within protocol version 1 (contract §1): every field below is
     new, and nothing already returned changed shape or meaning.
 
-    **`persona_md`, `docs` and `limits` still pin a SHAPE rather than a
-    resolved value** (issue_01M12NE120JVQT4DV85N8MB7TP) — a client can be
-    built against them before the Library resolves any of them for real.
-    **`model` is resolved** (issue_01M12NE12WF9V0721WSHH34A2W): see
-    `_call_slip_grant_body`'s docstring for the order it is resolved in.
+    **`limits` still pins a SHAPE rather than a resolved value**
+    (issue_01M12NE120JVQT4DV85N8MB7TP). **`model` is resolved**
+    (issue_01M12NE12WF9V0721WSHH34A2W): see `_call_slip_grant_body`'s
+    docstring for the order it is resolved in. **`persona_md` is the body of
+    the agent definition `persona` names** (issue_01M4XEEPQ37JFM3SE1493WDHVG),
+    and `persona_resolved` says whether it is: when it is `false`,
+    `persona_md` is `_persona_md`'s placeholder and `persona_unresolved_reason`
+    says why. A client that predates these two fields sees neither, and a slip
+    minted before them carries neither when redeemed, so a missing
+    `persona_resolved` reads as `false`.
 
     **`slip_id` is the one field that is real.** `_do_checkout` mints and
     persists a row in `call_slips` before calling this, and that id is what
@@ -7381,11 +8035,12 @@ def _call_slip_grant(persona: str | None, slip_id: str,
     constraints are decided yet.
     """
     return {"slip_id": slip_id,
-            **_call_slip_grant_body(persona, profile_row, per_run_cap_usd,
-                                    model_choice)}
+            **_call_slip_grant_body(ident, persona, profile_row,
+                                    per_run_cap_usd, model_choice)}
 
 
-def _call_slip_grant_body(persona: str | None, profile_row: dict | None,
+def _call_slip_grant_body(ident: identity.Identity, persona: str | None,
+                          profile_row: dict | None,
                           per_run_cap_usd: float | None,
                           model_choice: str | None = None) -> dict:
     """Every field of `_call_slip_grant` but `slip_id`: what checkout stores
@@ -7396,9 +8051,10 @@ def _call_slip_grant_body(persona: str | None, profile_row: dict | None,
     `model_choice` — the work item's own `model_choice.model`, read by the
     caller off `issue_items` before this is called, since that table is not
     this function's to query — wins when set; otherwise `persona`'s agent
-    definition's `model` pin, when `persona` names one that resolves
-    (`_persona_model`); otherwise `_MODEL_NOT_RESOLVED`, exactly what every
-    caller saw before either source existed.
+    definition's `model` pin, when `persona` names one that resolves AND
+    falls inside `ident`'s bound dispatch profile (`_resolve_persona`,
+    issue_01M35QG0VANA5P1XE3PH6A7PS4); otherwise `_MODEL_NOT_RESOLVED`,
+    exactly what every caller saw before either source existed.
 
     **`_do_checkout`, this function's one caller, passes `model_choice=None`
     here and applies that half of the order itself, after the call, from
@@ -7408,11 +8064,25 @@ def _call_slip_grant_body(persona: str | None, profile_row: dict | None,
     resolve `model` before the lock is even taken, the same race the write
     lock exists to close."""
     docs, available = _slip_docs(profile_row)
-    model = (model_choice
-             or (persona and _persona_model(persona))
-             or _MODEL_NOT_RESOLVED)
+    doc, unresolved = _resolve_persona(ident, persona)
+    definition = doc["body"] if doc is not None else None
+    if doc is not None and not (isinstance(definition, str) and definition.strip()):
+        # A document with no body has nothing to render; serving it as
+        # resolved would hand the agent an empty definition.
+        definition, unresolved = None, PERSONA_UNRESOLVED
+    if definition is not None and not identity.authorized(ident, "reference.read"):
+        # **A DOCUMENT'S BODY NEEDS `reference.read` HERE TOO**, the capability
+        # `GET /reference/documents/{id}` requires (security-reviewer,
+        # convivy/library#283). Checkout needs only `item.claim`, and a
+        # credential may withhold `reference.read` while keeping it, so without
+        # this the grant would hand out what the document route refuses. The
+        # caller gets the answer a persona nothing carries gets.
+        definition, unresolved = None, PERSONA_UNRESOLVED
+    model = model_choice or _persona_model(doc) or _MODEL_NOT_RESOLVED
     return {
-        "persona_md": _persona_md(persona),
+        "persona_md": definition if definition is not None else _persona_md(persona),
+        "persona_resolved": definition is not None,
+        "persona_unresolved_reason": unresolved if definition is None else None,
         "docs": docs,
         "bundle": {
             "profile": (f"{profile_row['project']}/{profile_row['variant']}"
@@ -7501,6 +8171,20 @@ def _slip_docs(profile_row: dict | None) -> tuple[list[dict], bool]:
     return [{"id": r["id"], "body_sha256": r["body_hash"]} for r in rows], True
 
 
+def _no_such_checkout_profile(project: str, variant: str) -> tuple[int, dict]:
+    """The refusal `/items/{id}/checkout` gives for a `<project>/<variant>`
+    it cannot resolve — a profile the `profiles` table does not hold, AND
+    (issue_01M35QG0VANA5P1XE3PH6A7PS4) a profile a bound identity holds but
+    did not name its own. Shared between the two so the body is byte for
+    byte identical either way, and a bound caller learns nothing about which
+    other profiles exist."""
+    return 400, {
+        "error": f"no profile named {project}/{variant}",
+        "hint": "GET /profiles lists the profiles that exist; a checkout "
+                "naming none omits `profile` and gets an empty bundle",
+    }
+
+
 def _do_checkout(ident, item_id: str, owner: str, run_id, with_lease_body: bool,
                  persona: str | None = None,
                  profile: tuple[str, str] | None = None):
@@ -7554,7 +8238,29 @@ def _do_checkout(ident, item_id: str, owner: str, run_id, with_lease_body: bool,
         # product is claimable and walking the queue would spend one request per
         # item to learn it twenty more times. The refusal that ends a run has to
         # arrive before the refusals that merely redirect it.
-        capped = _refuse_on_capped_ledger(conn, item["product"])
+        #
+        # **RESOLVED TO ITS PROJECT HERE, ONCE** — `issue_items.product` is
+        # not normalized (an item may still be filed under a repository
+        # name), while a ledger's scope now always is, so looking the item
+        # up by its raw `product` would silently miss a cap on the project
+        # that owns it. `_per_run_cap_usd` below reuses this same resolved
+        # value for the same reason; `item["product"]` itself stays
+        # unresolved everywhere else in this function — the call slip's own
+        # scope (`call_slips.mint`'s `product=`) is a different question,
+        # answered by whatever the item itself is filed under.
+        #
+        # **AN UNREADABLE REGISTRY FALLS BACK TO THE RAW `product`, NOT TO A
+        # REFUSAL.** `store.ledger_scope_name` fails open the same way
+        # `projects.resolve` does: admission's own load-bearing default is
+        # that a missing ledger never refuses (see `_refuse_on_capped_ledger`
+        # above), so a checkout must not start failing closed just because
+        # the registry it would resolve through cannot be read — that would
+        # turn an unrelated file-read fault into a fleet-wide admission
+        # outage. Checkout keeps today's behaviour then: it reads whatever
+        # ledger the raw string happens to name, exactly as it did before
+        # this resolution existed.
+        ledger_product = store.ledger_scope_name(item["product"])
+        capped = _refuse_on_capped_ledger(conn, ledger_product)
         if capped:
             return capped
 
@@ -7571,14 +8277,21 @@ def _do_checkout(ident, item_id: str, owner: str, run_id, with_lease_body: bool,
         # ground for refusing the whole request, so it belongs with the other
         # grounds rather than after the mutation it would have to undo.
         if profile is not None:
+            # A BOUND IDENTITY'S CALL-SLIP GRANT MAY ONLY RESOLVE ITS OWN
+            # PROFILE (issue_01M35QG0VANA5P1XE3PH6A7PS4): `profile` here is
+            # named by the caller, not read from `ident`, so without this a
+            # bound credential could check out an item under any other
+            # profile and have `docs` filled from its document set — the
+            # same bypass this issue closes on `POST /bundles`. Checked
+            # before the lookup, so the refusal is identical whether the
+            # named profile belongs to another crew or does not exist at
+            # all, and a bound caller learns nothing about which other
+            # profiles exist.
+            if _bound_profile_mismatch(ident, *profile):
+                return _no_such_checkout_profile(*profile)
             profile_row = crew_profiles.profile_row(conn, *profile)
             if profile_row is None:
-                return 400, {
-                    "error": f"no profile named {profile[0]}/{profile[1]}",
-                    "hint": "GET /profiles lists the profiles that exist; a "
-                            "checkout naming none omits `profile` and gets an "
-                            "empty bundle",
-                }
+                return _no_such_checkout_profile(*profile)
         else:
             profile_row = None
 
@@ -7648,7 +8361,7 @@ def _do_checkout(ident, item_id: str, owner: str, run_id, with_lease_body: bool,
         # holds up no other writer either.
         grant = None
         if with_lease_body:
-            grant = _call_slip_grant_body(persona, profile_row, None, None)
+            grant = _call_slip_grant_body(ident, persona, profile_row, None, None)
 
         # THE LEASE IS TAKEN BEFORE THE CLAIM IS WRITTEN, so a refused checkout
         # leaves the item exactly as it found it. The other way round, a caller
@@ -7656,7 +8369,8 @@ def _do_checkout(ident, item_id: str, owner: str, run_id, with_lease_body: bool,
         # on its way to being told no.
         try:
             held = lease.take(conn, item, holder=owner, actor=ident.actor,
-                              run_id=run_id)
+                              run_id=run_id, holder_crew=ident.crew,
+                              crew_exempt=ident.kind == "approved_client")
         except lease.LeaseConflict as conflict:
             # RECORD THE COLLISION THE FENCE CAUGHT, before the response, because
             # a refusal leaves no other trace anywhere.
@@ -7671,6 +8385,16 @@ def _do_checkout(ident, item_id: str, owner: str, run_id, with_lease_body: bool,
             # closed with every test still green (reviewer, PR #12).
             return 409, _lease_refusal(
                 conflict, visible=_lease_root_visible(conn, ident, conflict.lease))
+        except lease.CrewMismatch:
+            # **A LIVE LEASE WHOSE `holder` STRING MATCHES `owner` BUT IS
+            # RECORDED AS A DIFFERENT CREW'S** (CQ·10) — the one case
+            # `lease.LeaseConflict` above cannot catch, because `lease.take`'s
+            # own conflict scan treats a matching `holder` string as this
+            # caller's own. Nothing was written: the raise happens before
+            # `take`'s insert or update, under the same lock, so a plain
+            # rollback is enough.
+            conn.rollback()
+            return 409, _crew_mismatch_refusal()
         except lease.SubtreeTooLarge as too_big:
             # The fence could not be enumerated, so its extent is unknown.
             # Refusing is the only safe answer: proceeding would take a lease
@@ -7769,10 +8493,10 @@ def _do_checkout(ident, item_id: str, owner: str, run_id, with_lease_body: bool,
         # the write lock, so nothing committed after can be missed.
         blocked_sql, blocked_params = store.blocked_clause()
         cur = conn.execute(
-            "UPDATE issue_items SET state = ?, claimed_by = ?, claimed_at = ? "
-            "WHERE id = ? AND state = ? AND NOT " + blocked_sql,
-            (store.ITEM_STATE_CLAIMED, owner, now.isoformat(" "), item_id, prev,
-             *blocked_params))
+            "UPDATE issue_items SET state = ?, claimed_by = ?, claimed_at = ?, "
+            "claimed_by_crew = ? WHERE id = ? AND state = ? AND NOT " + blocked_sql,
+            (store.ITEM_STATE_CLAIMED, owner, now.isoformat(" "), ident.crew,
+             item_id, prev, *blocked_params))
         if cur.rowcount != 1:
             conn.rollback()
             fresh = conn.execute("SELECT * FROM issue_items WHERE id = ?",
@@ -7823,8 +8547,11 @@ def _do_checkout(ident, item_id: str, owner: str, run_id, with_lease_body: bool,
             # is read where no `PUT /ledgers` can commit between the read and
             # the mint. The reads before `lease.take()` are autocommit, each
             # its own snapshot, so reading it there could store a cap a human
-            # had already changed.
-            grant["budget"]["cap_usd"] = _per_run_cap_usd(conn, product)
+            # had already changed. `ledger_product` (resolved above, before
+            # the capped-ledger refusal) is reused rather than resolving
+            # `product` a second time — the two are the same item, read
+            # before the same lock.
+            grant["budget"]["cap_usd"] = _per_run_cap_usd(conn, ledger_product)
             # **`model_choice` IS RE-READ HERE TOO, OFF `locked`, UNDER THE
             # SAME WRITE LOCK** (security-reviewer, convivy/library#249).
             # `locked` is the row `lease.take()` already holds the lock on
@@ -7983,8 +8710,19 @@ def _do_redeem(ident, slip_id: str, protocol_version: int):
         # hash, model, budget and limits, so the Individuator renders the agent
         # from this answer alone. Additive within protocol version 1: the
         # card's fields are unchanged and `grant` is new.
-        return 200, {**library_cards.card_dict(card),
-                     "grant": call_slips.grant_of(redeemed)}
+        grant = call_slips.grant_of(redeemed)
+        # **THE REDEEMER NEEDS `reference.read` FOR THE DEFINITION'S BODY**
+        # (security-reviewer, convivy/library#283), as the checkout caller did
+        # when it was minted: a slip may be redeemed by another credential,
+        # gated on `token.redeem` alone. Without it the body is replaced by the
+        # placeholder, under the default heading because the slip does not
+        # keep the persona's name.
+        if (grant and grant.get("persona_resolved")
+                and not identity.authorized(ident, "reference.read")):
+            grant = {**grant, "persona_md": _persona_md(None),
+                     "persona_resolved": False,
+                     "persona_unresolved_reason": PERSONA_UNRESOLVED}
+        return 200, {**library_cards.card_dict(card), "grant": grant}
     finally:
         conn.close()
 
@@ -8039,10 +8777,14 @@ async def issue_bundle(request: Request):
     for an item that does not exist or is not the caller's to see, one wording
     for both. 422 when the request names something that does not exist: an
     agent that is not on the roster, or a `<project>/<variant>` with no
-    profile. 409 when the Reference Room cannot honour it: a document the
-    profile selects is not `current`, an audience filter matches nothing, or
-    the agent's definition is absent. **None of the 409s degrades
-    to a smaller bundle**; see `bundles.py`.
+    profile. **A bound identity naming a project/variant other than its own
+    gets the same 422** (issue_01M35QG0VANA5P1XE3PH6A7PS4): the agent role
+    carries `bundle.issue`, and without this a bound credential could issue a
+    bundle under any other profile and read its documents, the exact bypass
+    the binding exists to close. 409 when the Reference Room cannot honour
+    it: a document the profile selects is not `current`, an audience filter
+    matches nothing, or the agent's definition is absent. **None of the 409s
+    degrades to a smaller bundle**; see `bundles.py`.
     """
     ident, err = _identify(request)
     if err:
@@ -8090,6 +8832,21 @@ async def issue_bundle(request: Request):
     return JSONResponse(status_code=status, content=body)
 
 
+def _no_such_profile(project: str, variant: str) -> "bundles.BundleRefused":
+    """The refusal `POST /bundles` gives for a `<project>/<variant>` it
+    cannot issue against — a profile the `profiles` table does not hold, AND
+    (issue_01M35QG0VANA5P1XE3PH6A7PS4) a profile a bound identity holds but
+    did not name its own. Shared between the two so the body is byte for
+    byte identical either way, and a bound caller learns nothing about which
+    other profiles exist."""
+    return bundles.BundleRefused(
+        422, f"no profile {project}/{variant}",
+        hint="GET /profiles lists the profiles that exist; the "
+             "profile project is the item's product, or the "
+             "repository named",
+        project=project, variant=variant)
+
+
 def _do_issue_bundle(ident, agent: str, item_id, repo, variant: str):
     conn = store.connect_rw()
     try:
@@ -8111,6 +8868,15 @@ def _do_issue_bundle(ident, agent: str, item_id, repo, variant: str):
             project, scope_kind = product, bundles.SCOPE_ITEM
         else:
             project, scope_kind = repo, bundles.SCOPE_REPO
+        # A BOUND IDENTITY MAY ISSUE AGAINST ITS OWN PROFILE ONLY
+        # (issue_01M35QG0VANA5P1XE3PH6A7PS4): the agent role carries
+        # `bundle.issue`, so without this a bound credential could request a
+        # bundle under any OTHER profile and read its documents, which is
+        # exactly the binding's point to prevent. Checked before the reload
+        # and lookup below, so a mismatch costs no extra work and answers
+        # the identical refusal a nonexistent profile gets.
+        if _bound_profile_mismatch(ident, project, variant):
+            raise _no_such_profile(project, variant)
         # A bundle is issued against the profile the checkout holds now, so the
         # reload runs before this request reads it. It runs after the roster and
         # scope refusals above, so a refused caller cannot make the Library
@@ -8118,12 +8884,7 @@ def _do_issue_bundle(ident, agent: str, item_id, repo, variant: str):
         profile_sync.refresh()
         profile = crew_profiles.profile_row(conn, project, variant)
         if profile is None:
-            raise bundles.BundleRefused(
-                422, f"no profile {project}/{variant}",
-                hint="GET /profiles lists the profiles that exist; the "
-                     "profile project is the item's product, or the "
-                     "repository named",
-                project=project, variant=variant)
+            raise _no_such_profile(project, variant)
         with reference.reading() as index_conn:
             rows = bundles.resolve_bundle(profile, agent, index_conn)
         token_id, expires_at = bundles.mint(
@@ -8157,12 +8918,17 @@ async def redeem_bundle(request: Request):
     stale. Agent documents also carry `model`, `tools` and `trigger`.
 
     **Refusals.** 404 for a token that does not exist or is not the caller's to
-    see. 409 for a token already redeemed, one that has expired, or one whose
-    named documents no longer match the Reference Room: each such document is
-    listed with `id`, `reason` (`missing`, `not-current` or `changed`) and what
-    the token named. **The last case does not consume the token**, because
-    nothing was served; it will keep refusing until the Reference Room agrees
-    with the token again, or it expires. Ask for a new one.
+    see — **including a token minted under a project/variant other than a
+    bound identity's own** (issue_01M35QG0VANA5P1XE3PH6A7PS4): the token
+    names the documents, so redeeming one issued under another profile would
+    hand a bound credential exactly what the binding withholds from every
+    other route, the same 404 either way. 409 for a token already redeemed,
+    one that has expired, or one whose named documents no longer match the
+    Reference Room: each such document is listed with `id`, `reason`
+    (`missing`, `not-current` or `changed`) and what the token named. **The
+    last case does not consume the token**, because nothing was served; it
+    will keep refusing until the Reference Room agrees with the token again,
+    or it expires. Ask for a new one.
 
     **This route carries no identity claim, and that is why it does not run
     `credential_binding.redemption_binding_holds`.** It exchanges a token for
@@ -8198,8 +8964,18 @@ def _do_redeem_bundle(ident, token_id: str):
     conn = store.connect_rw()
     try:
         row = bundles.get(conn, token_id)
-        if row is None or (row["product"] is not None
-                           and not identity.in_scope(ident, row["product"])):
+        # A BOUND IDENTITY MAY REDEEM ONLY A TOKEN ISSUED UNDER ITS OWN
+        # PROFILE (issue_01M35QG0VANA5P1XE3PH6A7PS4): this route carries no
+        # identity claim on the token itself — any `bundle.redeem` holder may
+        # present any token id — so without this a bound credential handed,
+        # or guessing, a token minted under another crew's profile would
+        # redeem that crew's documents. The same 404 a nonexistent or
+        # out-of-scope token gets, so presenting one leaks nothing about
+        # which other profiles a bundle was issued under.
+        if (row is None or (row["product"] is not None
+                            and not identity.in_scope(ident, row["product"]))
+                or _bound_profile_mismatch(ident, row["project"],
+                                           row["variant"])):
             return 404, {"error": "no such bundle token"}
         if row["redeemed_at"] is not None:
             return 409, {"error": "this bundle token has already been redeemed",
@@ -8325,6 +9101,16 @@ def _do_release(ident, item_id: str, owner: str):
             # epic until then. `release_for` is scoped to the lease taken for
             # this item by this holder, the same scope the claimed release has,
             # and an open item with no such lease keeps the refusal it had.
+            #
+            # **THE CREW CHECK RUNS BEFORE `release_for`, on the same scope**
+            # (CQ·10): `release_for`'s own guard compares `holder` strings
+            # only, so an attacker who read this lease's real holder off it
+            # and typed it back as `owner` would otherwise pass straight
+            # through.
+            existing = lease.live_lease_on(conn, lease.root_id_for(conn, item))
+            if (existing is not None and existing["taken_for"] == item_id
+                    and _crew_mismatch(ident, _row_crew(existing, "holder_crew"))):
+                return 409, _crew_mismatch_refusal()
             released = lease.release_for(conn, item, holder=owner,
                                          actor=ident.actor)
             if released is None:
@@ -8339,6 +9125,12 @@ def _do_release(ident, item_id: str, owner: str):
         if item["state"] not in (store.ITEM_STATE_CLAIMED,
                                  store.ITEM_STATE_PR_OPEN):
             return 409, {"error": f"not claimed (state {item['state']})"}
+        # **THE CREW CHECK RUNS BEFORE THE `owner` STRING COMPARISON**
+        # (CQ·10), for the same reason `_hold_for_write` orders them that
+        # way: an attacker who read `claimed_by` off this item and typed it
+        # back as `owner` passes the string check below outright.
+        if _crew_mismatch(ident, _row_crew(item, "claimed_by_crew")):
+            return 409, _crew_mismatch_refusal()
         if item["claimed_by"] != owner:
             return 409, {"error": f"claim held by {item['claimed_by']}"}
         released = lease.release_for(conn, item, holder=owner, actor=ident.actor)
@@ -8775,6 +9567,9 @@ async def create_item(request: Request):
     if topics_err:
         return JSONResponse(status_code=topics_err[0], content=topics_err[1])
     topics = new_topics or []
+    short_description, sd_err = _validate_short_description(payload)
+    if sd_err:
+        return JSONResponse(status_code=sd_err[0], content=sd_err[1])
     refs = payload.get("refs") or {}
     if not isinstance(refs, dict):
         return refusals.refuse(400, "refs must be an object")
@@ -8805,6 +9600,7 @@ async def create_item(request: Request):
         "id": f"issue_{store.new_ulid()}",
         "product": product,
         "title": store.clip(payload["title"], store.MAX_TITLE),
+        "short_description": short_description,
         "body": store.clip(payload.get("body", ""), store.MAX_ITEM_TEXT),
         "refs": json.dumps(refs),
         "topics": json.dumps(topics),
@@ -11129,6 +11925,76 @@ def _audience_clause() -> str:
     return reference.audience_clause(1, expr="d.audience")
 
 
+def _bound_scope_clause(ident: identity.Identity, *, alias: str = ""
+                        ) -> tuple[str, list] | None:
+    """`(clause, params)` ready to AND into a Reference Room query, testing
+    whether a `docs` row (optionally `alias`-prefixed) falls inside `ident`'s
+    bound dispatch profile — or `None` when `ident` carries no binding at
+    all, the signal to every caller below that it must not narrow its query
+    (issue_01M35QG0VANA5P1XE3PH6A7PS4).
+
+    **OPENS THE CONTROL DATABASE ONLY WHEN A BINDING IS PRESENT.** No
+    credential minted before this existed carries one, so this costs every
+    existing caller nothing — not a connection, not a query — and the
+    contract stays additive under Library-Protocol 1.
+
+    **ONE FUNCTION FOR EVERY `/reference/*` ROUTE AND THE REFERENCE HALF OF
+    `GET /search`**, so the ceiling a profile draws cannot read differently
+    through one door than another — the exact failure mode
+    `crew_profiles.resolve` vs. a second hand-written evaluator would risk,
+    which `crew_profiles.bound_scope` avoids by construction (same
+    `_rule_clause` either way).
+    """
+    if ident.profile is None:
+        return None
+    conn = store.connect()
+    try:
+        return crew_profiles.bound_scope(conn, ident, alias=alias)
+    finally:
+        conn.close()
+
+
+def _scoped_doc_row(conn: sqlite3.Connection, ident: identity.Identity,
+                    doc_id: str, *, columns: str = "*"):
+    """One `docs` row by id, or `None` when it does not exist OR falls
+    outside `ident`'s bound dispatch profile — the same body, byte for byte,
+    so a caller cannot tell the two apart (issue_01M35QG0VANA5P1XE3PH6A7PS4):
+    a document outside the scope IS a document that does not exist, to
+    every caller bound to that scope.
+    """
+    where, params = "id = ?", [doc_id]
+    scope = _bound_scope_clause(ident)
+    if scope is not None:
+        scope_clause, scope_params = scope
+        where += f" AND {scope_clause}"
+        params += scope_params
+    return conn.execute(f"SELECT {columns} FROM docs WHERE {where}",
+                        params).fetchone()
+
+
+def _bound_profile_mismatch(ident: identity.Identity, project: str,
+                            variant: str) -> bool:
+    """True when `ident` carries a dispatch-profile binding that names a
+    different `<project>/<variant>` than the one given.
+
+    **FOR A ROUTE THAT RESOLVES A PROFILE THE REQUEST NAMES, not a route that
+    reads `docs` directly** (issue_01M35QG0VANA5P1XE3PH6A7PS4): `GET
+    /profiles/{project}/{variant}`, `POST /bundles`, `POST /bundles/redeem`
+    and `/items/{id}/checkout`'s call-slip grant each take a project and
+    variant from the request (or, for redeem, from the bundle token already
+    minted against one) and resolve that NAMED profile rather than filtering
+    `docs` by `ident`'s own — `_bound_scope_clause` ANDs a ceiling into a
+    query over `docs` and has nothing to AND into a `profiles` lookup keyed
+    on the caller's own choice of project and variant. A bound identity
+    naming its own profile is unaffected; naming any other gets the same
+    refusal the route gives a profile that does not exist, so it learns
+    nothing about what else exists. An unbound identity (`ident.profile is
+    None`) is never mismatched, matching every credential minted before this
+    existed.
+    """
+    return ident.profile is not None and ident.profile != f"{project}/{variant}"
+
+
 # `binds_crews`, `binds_agents` and `binds_topics` — an `instruction-block`
 # document's selector fields (issue_01M2MC21YAWT2V61QWSM247VRX). Fixed rather
 # than read from the request, so `_selector_clause` below never builds SQL
@@ -11233,6 +12099,16 @@ async def search_reference(request: Request):
         # promise that; BM25 has no window, so a filter here is exact.
         where.append(_audience_clause())
         params.append(audience)
+    # **THE BOUND PROFILE IS A CEILING, ANDED IN LAST** — a caller's own
+    # `kind`/`project`/`status`/`audience` filter only narrows within it,
+    # never widens past it (issue_01M35QG0VANA5P1XE3PH6A7PS4). Every
+    # existing credential carries no binding and this adds nothing to its
+    # query.
+    scope = _bound_scope_clause(ident, alias="d")
+    if scope is not None:
+        scope_clause, scope_params = scope
+        where.append(scope_clause)
+        params.extend(scope_params)
     clause = (" AND " + " AND ".join(where)) if where else ""
     with reference.reading() as conn:
         total = conn.execute(
@@ -11556,6 +12432,17 @@ async def search_all(request: Request):
                 placeholders = ",".join("?" * len(reference.DEFAULT_STATUSES))
                 where.append(f"d.status IN ({placeholders})")
                 params.extend(reference.DEFAULT_STATUSES)
+                # THE BOUND PROFILE IS A CEILING HERE TOO
+                # (issue_01M35QG0VANA5P1XE3PH6A7PS4), the same clause `GET
+                # /reference/search` ANDs in — this merge calls the same
+                # query-building code that route does, which is what keeps
+                # the two from ever disagreeing about what a bound
+                # credential may see.
+                scope = _bound_scope_clause(ident, alias="d")
+                if scope is not None:
+                    scope_clause, scope_params = scope
+                    where.append(scope_clause)
+                    params.extend(scope_params)
                 clause = " AND " + " AND ".join(where)
                 with reference.reading() as conn:
                     rows = conn.execute(
@@ -11803,6 +12690,14 @@ async def reference_topics(request: Request):
         return refusals.forbidden("reference.read")
     if (err := _reject_unknown_params(request, set())):
         return err
+    # **THE BOUND PROFILE IS A CEILING ON WHICH DOCUMENTS' TOPICS COUNT HERE**
+    # (issue_01M35QG0VANA5P1XE3PH6A7PS4), ANDed into the inner subquery below
+    # — unaliased, matching that subquery's own bare `docs` — so a topic
+    # that exists only on a document outside the bound profile is absent
+    # rather than counted. `None` (no binding) adds nothing to the query.
+    scope = _bound_scope_clause(ident)
+    scope_sql = f" AND {scope[0]}" if scope is not None else ""
+    scope_params = scope[1] if scope is not None else []
     with reference.reading() as conn:
         # **`json_valid` GUARDS THE JOIN, for the same reason the audience
         # filter below carries one** (security-reviewer, PR #47). A single row
@@ -11827,10 +12722,10 @@ async def reference_topics(request: Request):
             "(SELECT topics FROM docs WHERE status IN "
             f"({','.join('?' * len(reference.DEFAULT_STATUSES))}) "
             "AND (CASE WHEN json_valid(topics) "
-            "THEN json_type(topics) = 'array' ELSE 0 END)) "
+            f"THEN json_type(topics) = 'array' ELSE 0 END){scope_sql}) "
             "d, json_each(d.topics) je "
             "GROUP BY je.value ORDER BY n DESC, topic",
-            list(reference.DEFAULT_STATUSES)).fetchall()
+            [*reference.DEFAULT_STATUSES, *scope_params]).fetchall()
     return {"topics": [{"topic": r["topic"], "documents": r["n"]} for r in rows],
             "count": len(rows)}
 
@@ -11918,6 +12813,14 @@ async def list_reference_documents(request: Request):
     if (audience := request.query_params.get("audience")):
         where.append(_audience_clause())
         params.append(audience)
+    # THE BOUND PROFILE IS A CEILING, ANDED IN LAST (issue_01M35QG0VANA5P1XE3PH6A7PS4):
+    # a caller's own filters only narrow within it. `None` (no binding) adds
+    # nothing to the query, matching every credential that exists today.
+    scope = _bound_scope_clause(ident, alias="d")
+    if scope is not None:
+        scope_clause, scope_params = scope
+        where.append(scope_clause)
+        params.extend(scope_params)
     with reference.reading() as conn:
         # THE COLUMN IS CHECKED BEFORE THE CLAUSE IS BUILT, because naming a
         # column the table lacks is a PARSE error: an index predating
@@ -11987,11 +12890,11 @@ async def reference_checkout_status(doc_id: str, request: Request):
         return err
     doc_id = store.clip(doc_id, store.MAX_DOC_ID)
     with reference.reading() as conn:
-        found = conn.execute("SELECT id FROM docs WHERE id = ?",
-                             [doc_id]).fetchone()
+        found = _scoped_doc_row(conn, ident, doc_id, columns="id")
     # 404 ON AN UNINDEXED ID, matching `get_reference_document` and the checkout
     # POST. Answering `checkout: null` for a document that does not exist would
-    # report "free" for something nobody can ever take.
+    # report "free" for something nobody can ever take. An id outside the
+    # caller's bound profile answers the identical 404, never this status.
     if found is None:
         return refusals.not_found()
     conn = store.connect()
@@ -12019,9 +12922,11 @@ async def get_reference_document(doc_id: str, request: Request):
     if (err := _reject_unknown_params(request, set())):
         return err
     with reference.reading() as conn:
-        row = conn.execute("SELECT * FROM docs WHERE id = ?", [doc_id]).fetchone()
+        row = _scoped_doc_row(conn, ident, doc_id)
     # 404 rather than 403, matching every other read on this service: a 403 would
-    # confirm the document exists to an identity that may not know it does.
+    # confirm the document exists to an identity that may not know it does. A
+    # document outside the caller's bound dispatch profile answers the exact
+    # same 404 as one that does not exist (issue_01M35QG0VANA5P1XE3PH6A7PS4).
     if row is None:
         return refusals.not_found()
     return reference.doc_dict(row, body=True)
@@ -12370,10 +13275,12 @@ async def checkout_reference_document(doc_id: str, request: Request):
                  "its own tokens")
     doc_id = store.clip(doc_id, store.MAX_DOC_ID)
     with reference.reading() as conn:
-        found = conn.execute("SELECT id FROM docs WHERE id = ?",
-                             [doc_id]).fetchone()
+        found = _scoped_doc_row(conn, ident, doc_id, columns="id")
     # 404 rather than 403, matching `get_reference_document`: a 403 would
-    # confirm the document exists to an identity that may not know it does.
+    # confirm the document exists to an identity that may not know it does. A
+    # document outside the caller's bound dispatch profile answers the same
+    # 404 rather than a lease on a document it may never read
+    # (issue_01M35QG0VANA5P1XE3PH6A7PS4).
     if found is None:
         return refusals.not_found()
     try:
@@ -12667,6 +13574,13 @@ async def list_profiles(request: Request):
     `crew_profiles.profiles()` leaves the column out of its query rather
     than trusting this route to drop it from the response, so there is one
     place this guarantee lives rather than two that could drift apart.
+
+    **A bound identity sees only its own profile here**
+    (issue_01M35QG0VANA5P1XE3PH6A7PS4), the listing counterpart of the
+    refusal `GET /profiles/{project}/{variant}` gives it for any other: a
+    bound caller learns nothing about which other profiles exist, and
+    `count` counts only what it is served. An unbound identity lists every
+    profile, as before.
     """
     ident, err = _identify(request)
     if err:
@@ -12681,6 +13595,8 @@ async def list_profiles(request: Request):
         rows = crew_profiles.profiles(conn)
     finally:
         conn.close()
+    rows = [row for row in rows if not _bound_profile_mismatch(
+        ident, row["project"], row["variant"])]
     return {"profiles": rows, "count": len(rows)}
 
 
@@ -12726,6 +13642,14 @@ async def resolve_profile(project: str, variant: str, request: Request):
     two into one 404 would make "nobody has written this profile yet" and
     "this profile's rules are simply too narrow today" indistinguishable to
     a caller deciding whether to write one.
+
+    **A bound identity naming any profile but its own gets the same 404**
+    (issue_01M35QG0VANA5P1XE3PH6A7PS4): this route resolves the profile the
+    request names, not `ident`'s own, so a credential bound to one crew's
+    profile could otherwise read another's resolved document set — exactly
+    the bundle.issue-shaped bypass the binding exists to close. The check
+    runs before the profile lookup, so a bound caller cannot tell "not mine"
+    from "does not exist" by timing either.
     """
     ident, err = _identify(request)
     if err:
@@ -12734,6 +13658,8 @@ async def resolve_profile(project: str, variant: str, request: Request):
         return refusals.forbidden("roster.read")
     if (err := _reject_unknown_params(request, set())):
         return err
+    if _bound_profile_mismatch(ident, project, variant):
+        return refusals.not_found()
     await run_in_threadpool(profile_sync.refresh)
     conn = store.connect()
     try:
@@ -14494,6 +15420,11 @@ async def list_ledgers(request: Request):
                       f"({','.join('?' * len(names))})")
             params += names
     if (scope_id := request.query_params.get("scope_id")):
+        # A FILTER MAY STILL NAME A REPOSITORY — every stored `scope_id` is
+        # now the resolved project (see `_refuse_unbookable_product`), so a
+        # caller filtering by the repository it knows gets resolved the same
+        # way rather than matching nothing.
+        scope_id = store.ledger_scope_name(scope_id)
         where += " AND scope_id = ?"
         params.append(scope_id)
     conn = store.connect()
@@ -14548,10 +15479,12 @@ def _optional_amount(payload: dict, field: str):
 
 
 async def _refuse_unbookable_product(product: str):
-    """The refusal for a ledger product that is unregistered, private or a
-    black box, or None when the product may carry a ledger. Called by
-    `POST /ledger-entries` and `PUT /ledgers`, the two routes that create a
-    ledger row (issue_01M4PMVGGFVGDGBSJBTFA2T3RP, ADR-0043).
+    """`(refusal, resolved_scope)` for a ledger product: a refusal when it is
+    unregistered, private or a black box, with `resolved_scope` then `None`;
+    otherwise `(None, resolved_scope)`, the registry's canonical project slug
+    for `product`. Called by `POST /ledger-entries` and `PUT /ledgers`, the
+    two routes that create a ledger row (issue_01M4PMVGGFVGDGBSJBTFA2T3RP,
+    ADR-0043).
 
     Without it, `ensure_live_ledger` made a ledger for any string, so an
     `agent` credential scoped "*" could book spend to a black-box crew with
@@ -14565,13 +15498,16 @@ async def _refuse_unbookable_product(product: str):
     **An unregistered product is refused too, which `create_signal` does
     not do.** A ledger is a project's (`store.LEDGER_SCOPES`), so a name the
     registry does not know has no ledger, and ADR-0043's Ask is a black box
-    with no registry entry at all, which only this refusal walls. Every live
-    ledger's scope resolved when this landed (2026-10-12, eleven scopes, none
-    private), so no reporter loses spend to it.
+    with no registry entry at all, which only this refusal walls.
 
-    The scope is still stored as the caller spelled it, never the resolved
-    slug: live ledgers are keyed `agent-platform` and `selector-backend`, and
-    canonicalizing would split each into a second, uncapped ledger.
+    **The scope is now stored and looked up as the resolved project slug,
+    never the caller's own spelling.** Every one of the 12 live ledgers on
+    2026-10-13 was keyed by a repository instead — `agent-platform` and
+    `selector-backend` among them — because canonicalizing used to split a
+    repository's spend into a second, uncapped ledger beside the project's.
+    The migration folding every repository-keyed ledger into its project
+    ships in the same change as this resolution, so the split this comment
+    used to warn about is the thing being fixed rather than a risk still open.
 
     One 404 for all three, the same one the scope check returns, so neither
     route is an oracle for which crews are black boxes.
@@ -14584,17 +15520,17 @@ async def _refuse_unbookable_product(product: str):
                  "crew cannot be told apart from an ordinary one, and no "
                  "ledger is written",
             hint="retry once the registry at the configured path is "
-                 "readable again")
+                 "readable again"), None
     resolved = projects.resolve(product)
     if not resolved:
-        return refusals.not_found()
+        return refusals.not_found(), None
     names = {product.casefold(), resolved.strip().casefold()}
     if names & (private | crew_names):
-        return refusals.not_found()
+        return refusals.not_found(), None
     registered = await run_in_threadpool(store.black_box_registration_crews)
     if names & registered:
-        return refusals.not_found()
-    return None
+        return refusals.not_found(), None
+    return None, resolved
 
 
 @app.put("/ledgers")
@@ -14669,9 +15605,21 @@ async def grant_ledger(request: Request):
             400, f"scope_id is longer than {store.MAX_LEDGER_SCOPE_ID} characters")
     if scope_kind == "project" and not identity.in_scope(ident, scope_id):
         return refusals.not_found()
-    refused = await _refuse_unbookable_product(scope_id)
+    refused, resolved_scope_id = await _refuse_unbookable_product(scope_id)
     if refused is not None:
         return refused
+    # STORED UNDER THE RESOLVED PROJECT, never the caller's own spelling —
+    # `_refuse_unbookable_product`'s docstring carries the reasoning and the
+    # migration that moved every existing ledger onto this rule.
+    scope_id = resolved_scope_id
+    # **THE SCOPE IS CHECKED AGAIN ON THE LEDGER THIS WRITES.** The check
+    # above runs on the caller's spelling, before the registry is consulted,
+    # so an out-of-scope caller learns nothing from it. A project's ledger
+    # carries every repository folded into it, so a grant naming one
+    # repository must not set caps for the others (security review,
+    # library#270 round 1).
+    if scope_kind == "project" and not identity.in_scope(ident, scope_id):
+        return refusals.not_found()
     # DOLLARS ON THE WIRE, MICRO-DOLLARS IN THE STORE. The caller speaks the
     # unit a human types; the column holds the exact integer a refusal is
     # computed from. Converting here rather than asking every caller to means
@@ -14756,7 +15704,7 @@ async def _signal_ledger_threshold_crossed(ledger, day: str, total_micro: int,
                             "total_usd": total_micro / 1_000_000}),
         "privacy_class": "internal",
         "dedup_key": f"ledger-threshold:{ledger['id']}:{day}:{threshold}",
-        "produced_at": None,
+        "produced_at": store.produced_now(),
     }
     try:
         await run_in_threadpool(store.insert_signal, row, lambda _ex: False)
@@ -14875,9 +15823,20 @@ async def report_spend(request: Request):
     if not identity.in_scope(ident, product):
         return refusals.not_found()
 
-    refused = await _refuse_unbookable_product(product)
+    refused, resolved_product = await _refuse_unbookable_product(product)
     if refused is not None:
         return refused
+    # THE LEDGER THIS BOOKS AGAINST IS THE PROJECT'S, never the repository
+    # the caller happened to report — see `_refuse_unbookable_product`'s
+    # docstring. The scope is checked twice. The check above runs on the
+    # caller's spelling, before the registry is consulted, so an out-of-scope
+    # caller learns nothing from it. This one runs on the ledger the spend
+    # lands on, which carries every repository folded into the project, so
+    # a grant naming one repository cannot move the others' total (security
+    # review, library#270 round 1).
+    product = resolved_product
+    if not identity.in_scope(ident, product):
+        return refusals.not_found()
 
     source = payload.get("source")
     if not isinstance(source, str) or source not in store.LEDGER_SOURCES:
@@ -14964,6 +15923,13 @@ async def report_spend(request: Request):
             basis=e.basis,
             basis_usd=e.basis_micro / 1_000_000 if e.basis_micro is not None else None,
             maximum_single_report_usd=e.ceiling_micro / 1_000_000)
+    except store.DedupKeyTaken as e:
+        # NOTHING OF THE MATCHED ROW IN THIS BODY (CQ·107): `e` carries only
+        # the key, so there is nothing here to leak from the other ledger's
+        # entry — no id, day, usd, lane or ledger_id of it.
+        return refusals.refuse(
+            409, str(e),
+            hint="send a different dedup_key for this report")
     except ValueError as e:
         return refusals.refuse(400, str(e))
     conn = store.connect()
@@ -15229,6 +16195,11 @@ async def list_ledger_entries(request: Request):
     where += scope
     params += scope_params
     if (product := request.query_params.get("product")):
+        # RESOLVED THE SAME WAY `GET /ledgers`' `scope_id` filter is: every
+        # stored `product` is now the resolved project, so a caller
+        # filtering by a repository name gets resolved rather than matching
+        # nothing.
+        product = store.ledger_scope_name(product)
         where += " AND product = ?"
         params.append(product)
     day = request.query_params.get("day")
@@ -15391,7 +16362,7 @@ def _record_merge_signal(ident: identity.Identity, *, source: str, repo: str,
                             "requester": requester, **extra_meta}),
         "privacy_class": "internal",
         "dedup_key": None,
-        "produced_at": None,
+        "produced_at": store.produced_now(),
     }
     try:
         store.insert_signal(row, lambda _existing: False)
@@ -15889,7 +16860,7 @@ def _record_review_signal(ident: identity.Identity, *, record: dict,
         "meta": json.dumps({}),
         "privacy_class": "internal",
         "dedup_key": f"review_record:{record['id']}:v{record['version']}",
-        "produced_at": None,
+        "produced_at": store.produced_now(),
     }
     try:
         status, out = store.insert_signal(row, lambda _existing: True)

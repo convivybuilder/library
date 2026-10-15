@@ -439,7 +439,7 @@ def test_the_fingerprint_reads_through_sqlalchemys_driver(tmp_path):
 
 def library_db_file(path):
     conn = sqlite3.connect(path)
-    conn.execute("CREATE TABLE issue_items (id TEXT PRIMARY KEY)")
+    conn.execute("CREATE TABLE issue_items (id TEXT PRIMARY KEY, short_description TEXT)")
     conn.commit()
     conn.close()
     return path

@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -280,6 +281,28 @@ def test_a_double_post_of_one_review_yields_one_record_one_signal(client, facts)
 
     assert record_count(store.DB_PATH) == 1
     assert signal_count(store.DB_PATH) == 1
+
+
+def test_the_review_signal_carries_a_produced_at_since_can_bound_on(
+        client, facts):
+    """CQ·207: `produced_at` used to be stored `None` on this kind, which
+    `GET /signals?since=` never matches (`_since_clause`'s own docstring). A
+    bound just before the post finds the row; a bound just after it does
+    not — the shape that breaks again if the write site reverts to `None`."""
+    facts[RUN] = _run_verified_facts()
+    before = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    created = post(client, run_id=RUN)
+    assert created.status_code == 201, created.text
+    after = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    since_before = client.get(
+        "/signals?kind=review_record&since=" + before, headers=_h()).json()
+    assert len(since_before["signals"]) == 1
+    assert since_before["signals"][0]["produced_at"] is not None
+
+    since_after = client.get(
+        "/signals?kind=review_record&since=" + after, headers=_h()).json()
+    assert since_after["signals"] == []
 
 
 def test_the_linked_signal_is_findable_through_search(client, facts):

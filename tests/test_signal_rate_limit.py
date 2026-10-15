@@ -179,6 +179,13 @@ def test_concurrent_submissions_from_one_actor_never_admit_more_than_the_limit(
 def test_the_refusal_names_the_limit_the_window_and_retry_after(client, monkeypatch):
     monkeypatch.setattr(store, "SIGNAL_RATE_LIMIT", 1)
     monkeypatch.setattr(store, "SIGNAL_RATE_WINDOW_SECONDS", 60)
+    # **BOTH POSTS SEE ONE CLOCK READING**, or `retry_after` is 59 whenever
+    # the second lands more than a second after the first, as it did on
+    # library#248's CI. The route's own call is wrapped rather than
+    # `time.monotonic` frozen, which the test client's event loop also reads.
+    real_check = store.check_signal_rate_limit
+    monkeypatch.setattr(store, "check_signal_rate_limit",
+                        lambda actor: real_check(actor, now=1000.0))
     first = client.post("/signals", json=_body(), headers=_h())
     assert first.status_code == 201
     r = client.post("/signals", json=_body(), headers=_h())

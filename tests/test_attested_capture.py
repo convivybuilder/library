@@ -63,11 +63,11 @@ def client(tmp_path, monkeypatch):
             dedup_key TEXT PRIMARY KEY, signal_id TEXT NOT NULL);
         CREATE TABLE issue_items (
             id TEXT PRIMARY KEY, product TEXT, title TEXT, type TEXT,
-            state TEXT, parent_id TEXT);
+            state TEXT, parent_id TEXT, short_description TEXT);
         CREATE TABLE lease_refusals (
             id TEXT PRIMARY KEY, at TEXT, requested_item_id TEXT, product TEXT,
             requester TEXT, actor TEXT, blocking_lease_id TEXT,
-            blocking_root_id TEXT, blocking_holder TEXT, blocks_by TEXT);
+            blocking_root_id TEXT, blocking_holder TEXT, blocks_by TEXT, blocking_taken_for TEXT);
         CREATE TABLE black_box_registrations (
             id INTEGER PRIMARY KEY, crew TEXT NOT NULL UNIQUE,
             model TEXT NOT NULL, gateway TEXT NOT NULL,
@@ -415,3 +415,19 @@ def test_the_blocked_flag_and_the_named_fields_are_mutually_exclusive(client):
     for row in _refusals(client, token=AGENT).json()["refusals"]:
         named = "blocking_holder" in row
         assert named != row.get("blocked", False), row
+
+
+def test_a_refusal_says_which_item_the_blocking_crew_asked_for(client):
+    """`blocking_taken_for` answers whether the two crews wanted the same item
+    (issue_01M0RCF408K7TBE0N9VP224MGA), and is withheld with the other blocker
+    fields when the blocking subtree is outside the caller's scope."""
+    conn = sqlite3.connect(store.DB_PATH)
+    conn.execute("UPDATE lease_refusals SET blocking_taken_for = "
+                 "requested_item_id WHERE id IN ('ref_1', 'ref_3')")
+    conn.commit()
+    conn.close()
+    rows = {x["id"]: x for x in _refusals(client, token=AGENT).json()["refusals"]}
+    assert rows["ref_1"]["blocking_taken_for"] == "issue_a"
+    assert rows["ref_2"]["blocking_taken_for"] is None
+    assert "blocking_taken_for" not in rows["ref_3"]
+    assert rows["ref_3"]["blocked"] is True
