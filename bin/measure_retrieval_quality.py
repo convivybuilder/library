@@ -28,7 +28,7 @@ Usage:
     bin/measure_retrieval_quality.py --compare BEFORE.json AFTER.json
 
 `--url` defaults to `LIBRARY_URL`, then `http://127.0.0.1:8100` — the same
-fallback `bin/ci_result_fetch.py` uses. `--token` defaults to
+fallback the retired `bin/ci_result_fetch.py` used. `--token` defaults to
 `LIBRARY_TOKEN`. Neither is read from a state file: unlike the CI fetcher,
 this script has no cursor and nothing scheduled ever runs it, so there is no
 unattended caller a file-based fallback would serve.

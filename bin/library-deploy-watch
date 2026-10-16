@@ -43,7 +43,7 @@ minted the same way `~/.library/ci-fetch-token` was —
 `mint_credential.py --file agents --name library_deploy_watch --out
 ~/.library/deploy-watch-token` — an `agent`-role credential, which already
 holds `signal.create` (identity.py's `ROLE_CAPS`). The POST and 429-retry
-handling below are a deliberate copy of `bin/ci_result_fetch.py`'s own
+handling below are a deliberate copy of the retired `bin/ci_result_fetch.py`'s own
 `post_signal`/`_retry_after_seconds`, not a shared import: that file's own
 module docstring gives the reason for duplicating `install-library`'s
 helpers rather than importing them, and the same reasoning applies here —
@@ -75,7 +75,7 @@ DEPLOY_DIR = Path.home() / ".local" / "deploy" / "library"
 DEPLOYED_COMMIT_FILE = DEPLOY_DIR / "DEPLOYED_COMMIT"
 
 # STATE, NOT CONFIGURATION SHIPPED WITH THE CODE (platform/decisions/0059
-# rule 3), matching bin/ci_result_fetch.py's own STATE_DIR: the failed-target
+# rule 3), matching the retired bin/ci_result_fetch.py's own STATE_DIR: the failed-target
 # marker and the credential both outlive any one deploy, and an atomic
 # install swap replaces ~/.local/deploy/library wholesale, which would
 # destroy either if it lived there.
@@ -106,7 +106,7 @@ NETWORK_TIMEOUT_S = 120
 # refusal fired, bounded rather than unbounded.
 TAIL_MAX_CHARS = 4000
 
-# Same shape and same bound as bin/ci_result_fetch.py's own constants, for
+# Same shape and same bound as the retired bin/ci_result_fetch.py's own constants, for
 # the identical reason (see that file's module docstring): ten retries at up
 # to five minutes each is far above one rate-gate window's reset, while still
 # bounding one POST's pathological case to under an hour.
@@ -200,7 +200,7 @@ def save_failed_target(target: str, exit_code: int) -> None:
     is even attempted, so a failed POST (the server itself may be down; see
     the module docstring) still leaves the suppression in place rather than
     retrying the installer every tick. Atomic (temp file, then `os.replace`),
-    matching `bin/ci_result_fetch.py`'s own `save_cursor`/`save_status`, for
+    matching the retired `bin/ci_result_fetch.py`'s own `save_cursor`/`save_status`, for
     the same reason: a process killed mid-write must never leave this file
     holding a truncated JSON fragment that a later `load_failed_target` reads
     as "nothing has ever failed."""
@@ -239,7 +239,7 @@ def load_token() -> str:
 
 
 def _retry_after_seconds(e: urllib.error.HTTPError) -> int:
-    """A deliberate copy of `bin/ci_result_fetch.py`'s own
+    """A deliberate copy of the retired `bin/ci_result_fetch.py`'s own
     `_retry_after_seconds` — see that file for the exact incident (an
     uncaught `OverflowError` on a hostile or broken `Retry-After: inf`) this
     shape exists to avoid."""
@@ -267,7 +267,7 @@ def _retry_after_seconds(e: urllib.error.HTTPError) -> int:
 def post_signal(payload: dict, token: str) -> str:
     """POST one signal. Returns `'created'` | `'duplicate'` | `'conflict'` |
     `'error:<code-or-exception-name>'` — a deliberate copy of
-    `bin/ci_result_fetch.py`'s own `post_signal`, including its 429 retry
+    the retired `bin/ci_result_fetch.py`'s own `post_signal`, including its 429 retry
     (see that file's module docstring for the livelock a bare post-failure
     count used to cause)."""
     req = urllib.request.Request(

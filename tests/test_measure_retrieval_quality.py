@@ -4,7 +4,7 @@ issue_01M35R58Q5QEJ3J0PT387TWM18).
 
 No network anywhere in this file. `search` is the one I/O seam and is
 either monkeypatched at the `urllib.request.urlopen` level (to pin its real
-status/error handling, matching `test_ci_result_fetch.py`'s own
+status/error handling, matching the retired `test_ci_result_fetch.py`'s own
 `test_post_signal_*` tests) or replaced wholesale by a stub `searcher`
 passed into `run_questions`/`main`. Every scoring function is pure and
 tested directly against hand-built id lists, never against the live
@@ -152,7 +152,7 @@ def test_run_questions_handles_a_response_with_no_signals_key():
 
 # --- search(): real urllib/HTTPError semantics, no FakeServer ---------------
 #
-# Matches test_ci_result_fetch.py's own post_signal tests: urlopen is
+# Matches the retired test_ci_result_fetch.py's own post_signal tests: urlopen is
 # monkeypatched, but search()'s own status/error handling runs for real.
 
 class _FakeResponse:

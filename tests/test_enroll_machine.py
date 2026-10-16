@@ -32,7 +32,7 @@ def db(tmp_path, monkeypatch):
             revoked_at TEXT,
             note TEXT,
             created_at TEXT NOT NULL,
-            custody TEXT NOT NULL CHECK (custody IN ('hardware', 'file'))
+            custody TEXT NOT NULL CHECK (custody IN ('hardware', 'file', 'root-file'))
         );
         CREATE TABLE signing_certificates (
             id INTEGER PRIMARY KEY,
@@ -153,3 +153,11 @@ def test_revoke_refuses_while_writes_are_disabled(db, monkeypatch):
 def test_a_command_is_required(db):
     with pytest.raises(SystemExit):
         enroll_machine.main([])
+
+
+def test_issue_accepts_root_file_custody(db):
+    """The Individuator's daemon key: software, readable only by root
+    (platform/decisions/0092)."""
+    assert enroll_machine.main(
+        ["issue", MACHINE, FP, NOT_AFTER, "--custody", "root-file"]) == 0
+    assert _rows(db)[0]["custody"] == "root-file"

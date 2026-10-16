@@ -16,7 +16,7 @@ import Foundation
 ///       and the only thing about the root the Library ever holds.
 ///
 ///   root-ca sign --machine <name> --kind client|server --csr <path> \
-///       --custody hardware|file --root-cert <path> --out leaf.crt
+///       --custody hardware|file|root-file --root-cert <path> --out leaf.crt
 ///       Verifies the CSR's self-signature, prints the SHA-256 of the
 ///       requesting public key for the operator to compare against the
 ///       requesting machine's own screen, then asks the Secure Enclave to
@@ -236,6 +236,15 @@ func issueLeaf(
 
 // MARK: - sign
 
+/// The leaf custodies `sign` accepts, spelled exactly as
+/// `machine_registry.CUSTODY_VALUES` spells them, because the value is passed
+/// through verbatim to the `enroll_machine.py issue --custody` command printed
+/// below. It is not written into the certificate. `root-file` is the
+/// Individuator's root-held software key (platform/decisions/0092);
+/// library#290 added it to the registry and missed this list.
+/// `tests/test_root_ca_custody.py` pins the two sets equal.
+let leafCustodyValues = ["hardware", "file", "root-file"]
+
 func runSign(_ args: [String]) throws {
     var p = ArgParser(args)
     let days = try parseDays(p.value(for: "--days"), default: 90) // platform/decisions/0066 Handoff: 90-day machine certificates
@@ -251,8 +260,8 @@ func runSign(_ args: [String]) throws {
     case "server": kind = .server
     default: throw CLIError("--kind must be client or server, not \(kindRaw.debugDescription)", exitCode: 2)
     }
-    guard let custody = p.value(for: "--custody"), custody == "hardware" || custody == "file" else {
-        throw CLIError("sign requires --custody hardware|file — this is the LEAF key's " +
+    guard let custody = p.value(for: "--custody"), leafCustodyValues.contains(custody) else {
+        throw CLIError("sign requires --custody \(leafCustodyValues.joined(separator: "|")) — this is the LEAF key's " +
             "custody, not the root's, and enroll_machine.py takes it as a required " +
             "argument for the same reason: it must be typed by a human on this attended " +
             "path, never inferred or defaulted (platform/decisions/0066)", exitCode: 2)

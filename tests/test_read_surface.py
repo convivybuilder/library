@@ -2019,7 +2019,7 @@ def test_pr_state_ci_from_another_product_is_not_joined(client):
 
 def test_pr_state_ci_captured_is_keyed_on_repo_not_product(client):
     """`vivy` covers two repos (`convivy/vivy` and
-    `convivy/vivy-ownerrez-sandbox-tools`, per `bin/ci_result_fetch.py`'s
+    `convivy/vivy-ownerrez-sandbox-tools`, per `ci_tracked.py`'s
     `TRACKED`), and only `convivy/vivy` has ever had a `test-result` row.
     The sandbox repo's PR must read `ci_captured: false` — a captured
     sibling under the same product must not leak into it — while the
@@ -2098,7 +2098,7 @@ def test_pr_state_ci_customer_class_row_stays_walled(client):
     assert privileged["ci_captured"] is True
 
 
-# --- ci-capture: is bin/ci_result_fetch.py actually hearing back? -------------
+# --- ci-capture: are CI results reaching the Archives for every tracked pair? --
 
 
 def _ci_tracked(*pairs):
@@ -2108,18 +2108,16 @@ def _ci_tracked(*pairs):
 
 
 @pytest.fixture
-def ci_capture(client, monkeypatch, tmp_path):
-    """`ci_result_fetch.TRACKED`/`NOT_CAPTURED`/`STATUS_FILE` pinned to a
-    small, test-owned fixture, so a `GET /signals/ci-capture` test never
-    depends on this machine's real tracked-repo list or its real status
-    file."""
-    monkeypatch.setattr(libapp.ci_result_fetch, "TRACKED", _ci_tracked(
+def ci_capture(client, monkeypatch):
+    """`ci_tracked.TRACKED`/`NOT_CAPTURED` pinned to a small, test-owned
+    fixture, so a `GET /signals/ci-capture` test never depends on this
+    machine's real tracked-repo list."""
+    monkeypatch.setattr(libapp.ci_tracked, "TRACKED", _ci_tracked(
         ("convivy/vivy", "ci.yml", "vivy"),
         ("convivy/hollis", "ci.yml", "vivy"),
     ))
-    monkeypatch.setattr(libapp.ci_result_fetch, "NOT_CAPTURED", {})
-    monkeypatch.setattr(libapp.ci_result_fetch, "STATUS_FILE",
-                        tmp_path / "ci-fetch-status.json")
+    monkeypatch.setattr(libapp.ci_tracked, "NOT_CAPTURED", {})
+    monkeypatch.setattr(libapp.ci_tracked, "NOT_CAPTURED_BY_NAME", {})
     return client
 
 
@@ -2148,7 +2146,7 @@ def test_ci_capture_counts_each_workflow_of_one_repo_separately(
     workflow with none is `never_captured` even though its sibling on the
     same repo has some. **Fails on the pre-fix code**, which counted by
     repo alone and gave both pairs the `ci.yml` row."""
-    monkeypatch.setattr(libapp.ci_result_fetch, "TRACKED", _ci_tracked(
+    monkeypatch.setattr(libapp.ci_tracked, "TRACKED", _ci_tracked(
         ("convivy/vivy", "ci.yml", "vivy"),
         ("convivy/vivy", "e2e-stage-smoke.yml", "vivy"),
     ))
@@ -2168,66 +2166,26 @@ def test_ci_capture_counts_each_workflow_of_one_repo_separately(
         "e2e-stage-smoke.yml"]
 
 
-def test_ci_capture_quiet_this_run_is_distinct_from_never_captured(ci_capture):
-    """A repo that HAS captured signals before, whose last fetch returned
-    zero runs, is `quiet_this_run` — a different, far less worrying state
-    than a repo with no captured signal at all."""
+def test_ci_capture_keeps_the_retired_fetcher_s_fields_at_their_absent_values(
+        ci_capture):
+    """The four fields that read `bin/ci_result_fetch.py`'s status file stay
+    in the response under Library-Protocol 1, fixed at the values a client
+    received whenever that file was missing (issue_01M2XGCSGYW6F0QEZAQ0VKN7CQ),
+    even for a pair that has captured rows."""
     conn = _conn()
-    _insert_test_result(conn, "sig_cap_quiet", "vivy",
-                        commit="sha-cap-quiet", conclusion="success",
+    _insert_test_result(conn, "sig_cap_retired_fields", "vivy",
+                        commit="sha-cap-retired", conclusion="success",
                         run_url="https://github.com/convivy/vivy/actions/runs/2",
                         ingested_at=_window_safe_ts(1))
     conn.commit()
     conn.close()
-    libapp.ci_result_fetch.save_status({
-        "run_started": "2026-10-01T00:00:00Z",
-        "run_finished": "2026-10-01T00:00:05Z",
-        "pairs": {
-            "convivy/vivy#ci.yml": {
-                "repo": "convivy/vivy", "workflow_file": "ci.yml",
-                "outcome": "ok", "reason": None,
-                "runs_returned": 0, "signals_written": 0},
-        },
-    })
-    body = ci_capture.get("/signals/ci-capture", headers=_h()).json()
-    assert {t["repo"] for t in body["quiet_this_run"]} == {"convivy/vivy"}
-    assert {t["repo"] for t in body["never_captured"]} == {"convivy/hollis"}
-
-
-def test_ci_capture_unreadable_last_run_names_its_reason_other_pairs_still_recorded(
-        ci_capture):
-    """A pair that raised on the last run appears in `unreadable_last_run`
-    with its reason; the other pair in the same run is still reported
-    normally."""
-    libapp.ci_result_fetch.save_status({
-        "run_started": "2026-10-01T00:00:00Z",
-        "run_finished": "2026-10-01T00:00:05Z",
-        "pairs": {
-            "convivy/vivy#ci.yml": {
-                "repo": "convivy/vivy", "workflow_file": "ci.yml",
-                "outcome": "error", "reason": "gh api ...: boom",
-                "runs_returned": None, "signals_written": 0},
-            "convivy/hollis#ci.yml": {
-                "repo": "convivy/hollis", "workflow_file": "ci.yml",
-                "outcome": "ok", "reason": None,
-                "runs_returned": 3, "signals_written": 3},
-        },
-    })
-    body = ci_capture.get("/signals/ci-capture", headers=_h()).json()
-    unreadable = {t["repo"]: t for t in body["unreadable_last_run"]}
-    assert set(unreadable) == {"convivy/vivy"}
-    assert unreadable["convivy/vivy"]["last_fetch"]["reason"] == "gh api ...: boom"
-    tracked_by_repo = {t["repo"]: t for t in body["tracked"]}
-    assert tracked_by_repo["convivy/hollis"]["last_fetch"]["outcome"] == "ok"
-    assert tracked_by_repo["convivy/hollis"]["last_fetch"]["runs_returned"] == 3
-
-
-def test_ci_capture_missing_status_file_is_absent_and_every_last_fetch_is_null(
-        ci_capture):
     resp = ci_capture.get("/signals/ci-capture", headers=_h())
     assert resp.status_code == 200
     body = resp.json()
     assert body["status_file"] == {"state": "absent"}
+    assert body["quiet_this_run"] == []
+    assert body["unreadable_last_run"] == []
+    assert len(body["tracked"]) == 2
     assert all(t["last_fetch"] is None for t in body["tracked"])
 
 
@@ -2238,28 +2196,10 @@ def test_ci_capture_refuses_any_parameter(ci_capture):
     assert resp.json()["supported"] == []
 
 
-def test_ci_capture_unparseable_status_file_is_also_absent_not_a_500(ci_capture):
-    libapp.ci_result_fetch.STATUS_FILE.write_text("{not json")
-    resp = ci_capture.get("/signals/ci-capture", headers=_h())
-    assert resp.status_code == 200
-    assert resp.json()["status_file"] == {"state": "absent"}
-
-
-def test_ci_capture_present_status_file_names_its_finish_time(ci_capture):
-    libapp.ci_result_fetch.save_status({
-        "run_started": "2026-10-01T00:00:00Z",
-        "run_finished": "2026-10-01T00:00:05Z",
-        "pairs": {},
-    })
-    body = ci_capture.get("/signals/ci-capture", headers=_h()).json()
-    assert body["status_file"] == {
-        "state": "present", "run_finished": "2026-10-01T00:00:05Z"}
-
-
 def test_ci_capture_lists_a_repo_deck_draws_that_is_neither_tracked_nor_explained(
         ci_capture, monkeypatch):
     monkeypatch.setattr(
-        libapp.ci_result_fetch, "deck_tracked_repos",
+        libapp.ci_tracked, "deck_tracked_repos",
         lambda: [{"repo": "convivy/vivy", "product": "vivy"},
                  {"repo": "convivy/mystery", "product": "vivy"}])
     body = ci_capture.get("/signals/ci-capture", headers=_h()).json()
@@ -2268,10 +2208,10 @@ def test_ci_capture_lists_a_repo_deck_draws_that_is_neither_tracked_nor_explaine
 
 def test_ci_capture_does_not_list_a_not_captured_repo_as_untracked(
         ci_capture, monkeypatch):
-    monkeypatch.setattr(libapp.ci_result_fetch, "NOT_CAPTURED",
+    monkeypatch.setattr(libapp.ci_tracked, "NOT_CAPTURED",
                         {"convivy/signals": "no GitHub Actions workflows"})
     monkeypatch.setattr(
-        libapp.ci_result_fetch, "deck_tracked_repos",
+        libapp.ci_tracked, "deck_tracked_repos",
         lambda: [{"repo": "convivy/vivy", "product": "vivy"},
                  {"repo": "convivy/signals", "product": "vivy"}])
     body = ci_capture.get("/signals/ci-capture", headers=_h()).json()
@@ -2280,8 +2220,25 @@ def test_ci_capture_does_not_list_a_not_captured_repo_as_untracked(
         {"repo": "convivy/signals", "reason": "no GitHub Actions workflows"}]
 
 
+def test_ci_capture_resolves_a_by_name_not_captured_entry_to_its_full_name(
+        ci_capture, monkeypatch):
+    """A `NOT_CAPTURED_BY_NAME` entry takes the owner `deck_tracked_repos()`
+    gives it, is reported under that full name, and keeps that repository
+    out of `untracked`."""
+    monkeypatch.setattr(libapp.ci_tracked, "NOT_CAPTURED_BY_NAME",
+                        {"side-project": "404 from the GitHub API"})
+    monkeypatch.setattr(
+        libapp.ci_tracked, "deck_tracked_repos",
+        lambda: [{"repo": "convivy/vivy", "product": "vivy"},
+                 {"repo": "example-owner/side-project", "product": "vivy"}])
+    body = ci_capture.get("/signals/ci-capture", headers=_h()).json()
+    assert body["untracked"] == []
+    assert body["not_captured"] == [
+        {"repo": "example-owner/side-project", "reason": "404 from the GitHub API"}]
+
+
 @pytest.fixture
-def ci_capture_multi_product(client, monkeypatch, tmp_path):
+def ci_capture_multi_product(client, monkeypatch):
     """Every list `GET /signals/ci-capture` returns, carrying repos from TWO
     products — `AGENT` is scoped to `vivy` alone (see `_build_client`), so a
     fixture with every tracked, untracked and not-captured repo under that
@@ -2294,17 +2251,18 @@ def ci_capture_multi_product(client, monkeypatch, tmp_path):
     not yield at all, so its product cannot be determined — shown only to
     the wildcard caller.
     """
-    monkeypatch.setattr(libapp.ci_result_fetch, "TRACKED", _ci_tracked(
+    monkeypatch.setattr(libapp.ci_tracked, "TRACKED", _ci_tracked(
         ("convivy/vivy", "ci.yml", "vivy"),
         ("convivy/constance", "ci.yml", "constance"),
     ))
-    monkeypatch.setattr(libapp.ci_result_fetch, "NOT_CAPTURED", {
+    monkeypatch.setattr(libapp.ci_tracked, "NOT_CAPTURED", {
         "convivy/signals-vivy": "no GitHub Actions workflows",
         "convivy/signals-constance": "no GitHub Actions workflows",
         "convivy/orphan": "404 from the GitHub API",
     })
+    monkeypatch.setattr(libapp.ci_tracked, "NOT_CAPTURED_BY_NAME", {})
     monkeypatch.setattr(
-        libapp.ci_result_fetch, "deck_tracked_repos",
+        libapp.ci_tracked, "deck_tracked_repos",
         lambda: [
             {"repo": "convivy/vivy", "product": "vivy"},
             {"repo": "convivy/constance", "product": "constance"},
@@ -2313,8 +2271,6 @@ def ci_capture_multi_product(client, monkeypatch, tmp_path):
             {"repo": "convivy/signals-vivy", "product": "vivy"},
             {"repo": "convivy/signals-constance", "product": "constance"},
         ])
-    monkeypatch.setattr(libapp.ci_result_fetch, "STATUS_FILE",
-                        tmp_path / "ci-fetch-status.json")
     return client
 
 

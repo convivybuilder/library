@@ -25,6 +25,13 @@ leaves the row in hot alone, or in both files — never in neither — and the
 next pass's `id NOT IN (SELECT id FROM cold.signals)` on step 1 skips a row
 already copied, so a resumed pass does not re-copy it.
 
+**Step 2's `BEGIN IMMEDIATE` is retried on `SQLITE_BUSY`** (`_begin_immediate`,
+issue_01M504BG7VGE2AFXSYAHH9PDFX) — `main` is a live database `app.py`'s own
+routes are concurrently writing while a pass runs, and a `BEGIN IMMEDIATE`
+that loses the race for the write lock once, under load, is ordinary
+writer-vs-writer contention the busy handler already waited out, not a case
+worth crashing the whole pass over.
+
 **No blob moves, and no vector moves.** Vectors stay in `vectors.db`
 (clause 7 already moved them off the hot file); blobs are already outside
 both database files in the content-addressed store. A moved row keeps its
@@ -44,6 +51,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import sqlite3
 import sys
 
 import store
@@ -64,6 +72,66 @@ MOVE_BATCH_BYTE_BUDGET = 20_000_000
 # `discard_sweep.SWEEP_BATCH_SIZE` use, kept as a familiar, conservative
 # starting point.
 MOVE_BATCH_ROWS = 500
+
+# How many times `_execute_retrying_busy` tries a write (a batch's
+# `BEGIN IMMEDIATE`) before the pass fails — the same constant and the same
+# measurement `discard_sweep.BEGIN_ATTEMPTS` is built on: under fsync load, a
+# `BEGIN IMMEDIATE` against a lock held throughout was refused after 11.0s to
+# 12.0s on a 5s timeout, with no other writer (20 samples, measured locally,
+# `discard_sweep.py`). SQLite's busy handler gives up once the sleeps it
+# requested add up to the timeout, not once that much wall time has passed,
+# so a single attempt can run well past `store.BUSY_TIMEOUT_MS` under load.
+# Each attempt gets a fresh timeout, and the lock can be free by the next one.
+BEGIN_ATTEMPTS = 3
+
+
+def _execute_retrying_busy(conn, sql: str, params=()) -> sqlite3.Cursor:
+    """`conn.execute`, retried on a `SQLITE_BUSY` refusal, which the `& 0xFF`
+    mask reads as every `SQLITE_BUSY_*` extended code too. A refused statement
+    changes nothing, so a retry repeats no work; every other error raises at
+    once.
+
+    **Duplicated from `discard_sweep.py` rather than shared, deliberately**
+    (the same reason `_ruled_kinds` above is its own copy) — the two modules
+    have no third one to share it through without introducing a dependency
+    neither otherwise needs."""
+    for attempt in range(1, BEGIN_ATTEMPTS + 1):
+        try:
+            return conn.execute(sql, params)
+        except sqlite3.OperationalError as e:
+            # `getattr`, not a bare attribute read: a real SQLite failure
+            # always carries `sqlite_errorcode`, but an injected,
+            # hand-constructed `OperationalError` (`tests/
+            # test_archives_cold_tier_reads.py`'s crash-safety fixture)
+            # does not, and that must raise at once rather than crash on a
+            # missing attribute while deciding whether to retry.
+            code = getattr(e, "sqlite_errorcode", None)
+            busy = code is not None and code & 0xFF == sqlite3.SQLITE_BUSY
+            if not busy or attempt == BEGIN_ATTEMPTS:
+                raise
+
+
+def _begin_immediate(conn) -> None:
+    """`BEGIN IMMEDIATE`, retried on a `SQLITE_BUSY` refusal. A refused
+    `BEGIN` opens no transaction, so a retry repeats nothing the batch has
+    already done. Takes the write lock on every attached file, `cold`
+    included.
+
+    **This is the fix for issue_01M504BG7VGE2AFXSYAHH9PDFX.** A loaded CI
+    runner's `move` pass raised `database is locked` under a concurrent
+    writer on `main`, without recording which statement raised. Under
+    amplified contention, with the busy timeout shrunk to make it visible,
+    every lock error the move side raised came from this `BEGIN IMMEDIATE`
+    in `_move_batch`'s step 2, as a plain `SQLITE_BUSY` after the timeout
+    ran out: never from step 1's `INSERT ... SELECT`, and never
+    `SQLITE_BUSY_SNAPSHOT` or `SQLITE_BUSY_RECOVERY` (convivy/library#291).
+    That CI hit this same statement is inferred from that, not observed. That is
+    ordinary writer-vs-writer contention the busy handler already tried and
+    failed to clear in one attempt, not a case SQLite skips the handler for,
+    so a second attempt — on a fresh timeout, once the other writer's
+    transaction has had a chance to finish — is the fix `discard_sweep.py`
+    already established for the identical shape."""
+    _execute_retrying_busy(conn, "BEGIN IMMEDIATE")
 
 
 def _cutoff(window_days: int) -> str:
@@ -139,8 +207,9 @@ def _move_batch(conn, ids: list[str]) -> None:
     # delete, in the same transaction so the key leaves hot and enters the
     # registry in one commit. Both clauses repeat "AND id IN (SELECT id
     # FROM cold.signals)" so only a row whose cold copy is durably
-    # committed is ever removed from hot.
-    conn.execute("BEGIN IMMEDIATE")
+    # committed is ever removed from hot. Retried on SQLITE_BUSY — see
+    # `_begin_immediate`.
+    _begin_immediate(conn)
     conn.execute(
         f"INSERT INTO cold_dedup_keys (dedup_key, signal_id) "
         f"SELECT dedup_key, id FROM main.signals "
@@ -218,8 +287,10 @@ def _restore_batch(conn, ids: list[str]) -> None:
 
     # Step 1: BEGIN IMMEDIATE on main — the hot insert (skipping ids
     # already there) and the registry delete, in one transaction so the hot
-    # row and its dedup_key uniqueness return together.
-    conn.execute("BEGIN IMMEDIATE")
+    # row and its dedup_key uniqueness return together. Retried on
+    # SQLITE_BUSY, for the same reason `_move_batch`'s own BEGIN IMMEDIATE
+    # is — see `_begin_immediate`.
+    _begin_immediate(conn)
     conn.execute(
         f"INSERT INTO main.signals ({cols}) "
         f"SELECT {cols} FROM cold.signals "

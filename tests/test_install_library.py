@@ -2720,7 +2720,7 @@ def test_a_matching_template_with_no_record_writes_the_record(seed_repo, home):
 # docstring: they read the real, checked-in templates directly (same as
 # test_launchd_plist.py, test_cold_tier_plist.py and
 # test_cert_expiry_check_plist.py already do), because the thing under test
-# is the renderer's behavior on those specific four files, not the
+# is the renderer's behavior on those specific three files, not the
 # installer's deploy-from-a-repo path a fixture repo exists to isolate. -----
 
 LAUNCHD_DIR = Path(__file__).resolve().parent.parent / "launchd"
@@ -2731,14 +2731,13 @@ PLIST_HOME_PLACEHOLDER = "@@LIBRARY_HOME@@"
     "com.convivy.library.plist",
     "com.convivy.library.cold-tier.plist",
     "com.convivy.library.cert-expiry-check.plist",
-    "com.convivy.library.ci-result-fetch.plist",
 ])
 def test_render_plist_matches_a_literal_substitution_of_the_home_placeholder(plist_name):
     """`--internal-render-plist` is install-library's own hidden entry point
     for the substitution the real install path runs on every plist it
     writes (the real install compares and writes rendered content only,
     never the raw template). Here it is run, against a fixed,
-    synthetic home, directly on each of the four checked-in templates and
+    synthetic home, directly on each of the three checked-in templates and
     checked against the simplest possible independent oracle: a plain
     `str.replace` of that same template's own text, for that same home —
     what the current file's content literally is for that home, with no

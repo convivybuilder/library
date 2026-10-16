@@ -37,7 +37,7 @@ def db(tmp_path, monkeypatch):
             revoked_at TEXT,
             note TEXT,
             created_at TEXT NOT NULL,
-            custody TEXT NOT NULL CHECK (custody IN ('hardware', 'file'))
+            custody TEXT NOT NULL CHECK (custody IN ('hardware', 'file', 'root-file'))
         );
         CREATE INDEX ix_machine_certificates_lookup
             ON machine_certificates (machine, fingerprint_sha256);
@@ -490,3 +490,15 @@ def test_revoke_takes_the_write_lock_before_it_reads(db, monkeypatch):
         f"was {seen[0]!r}")
     assert any(s.startswith("SELECT") for s in seen[1:]), (
         "the read must still happen, after the lock")
+
+
+def test_re_enrolling_with_root_file_revokes_the_hardware_row(db):
+    """The Individuator, 2026-10-15: enrolled with a Secure Enclave key the
+    daemon cannot sign with, then re-enrolled with a root-held software key.
+    The hardware row must not stay active beside it."""
+    machine_registry.issue(MACHINE, FP_A, NOT_AFTER, "hardware")
+    machine_registry.issue(MACHINE, FP_B, NOT_AFTER, "root-file")
+    rows = {r["fingerprint_sha256"]: r for r in _rows(db)}
+    assert rows[FP_A]["status"] == "revoked"
+    assert rows[FP_B]["status"] == "active"
+    assert rows[FP_B]["custody"] == "root-file"

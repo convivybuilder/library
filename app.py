@@ -53,10 +53,10 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 import adjacency
-import bin.ci_result_fetch as ci_result_fetch
 import blobs
 import bundles
 import call_slips
+import ci_tracked
 import credential_binding
 import crew_profiles
 import crew_registry
@@ -10910,7 +10910,7 @@ def _repo_run_url_like(repo: str) -> str:
 
     `%` and `_`, `LIKE`'s own wildcards, are escaped first so a repo name
     that happened to contain either matches itself literally rather than as
-    a wildcard — no name in `bin/ci_result_fetch.py`'s `TRACKED` does today,
+    a wildcard — no name in `ci_tracked.TRACKED` does today,
     but nothing about `meta.repo` or `refs.run_url` guarantees that stays
     true.
     """
@@ -10924,11 +10924,12 @@ def _pr_ci_for_page(conn, rows, scope: str, scope_params: list,
     return, joined on `refs.commit` against the PR's own `meta.head_sha` —
     one bounded batch for the whole page, not one query per PR.
 
-    `bin/ci_result_fetch.py`'s `signal_from_run` is the only writer: `kind =
-    'test-result'`, `source = 'ci'`, `refs.commit` the run's head sha,
+    The Bosun's `ci-result-capture` is the writer (the retired
+    `bin/ci_result_fetch.py` wrote the same shape): `kind = 'test-result'`,
+    `source = 'ci'`, `refs.commit` the run's head sha,
     `refs.conclusion`/`refs.workflow`/`refs.run_url` the fields this returns.
     It writes no `repo` field — `product` is the only stored grouping, and
-    `TRACKED` in that file maps more than one repo to several products
+    `ci_tracked.TRACKED` maps more than one repo to several products
     (`vivy`, `selector`, `library`, `convivy-orient`, `svc` each cover two).
     `refs.run_url` is the only place a repo survives: GitHub's `html_url`,
     carried verbatim, always has the shape
@@ -11294,7 +11295,7 @@ def _ci_capture_stats(conn, product: str, repo: str, workflow_file: str,
     predicate_params = ["test-result", product]
     params = [*predicate_params, *predicate_params, *scope_params,
              *wall_params, _repo_run_url_like(repo),
-             ci_result_fetch.workflow_slug(workflow_file)]
+             ci_tracked.workflow_slug(workflow_file)]
     row = conn.execute(
         f"SELECT COUNT(*) AS n, "
         "MAX(COALESCE(produced_at, ingested_at)) AS last_at "
@@ -11307,8 +11308,8 @@ def _ci_capture_stats(conn, product: str, repo: str, workflow_file: str,
 
 @app.get("/signals/ci-capture")
 async def ci_capture_report(request: Request):
-    """Whether `bin/ci_result_fetch.py` is actually hearing back from
-    GitHub for every repository it is supposed to — issue_01M2PERXQA76N5TAYZRFS4AVRN.
+    """Whether CI results are reaching the Archives for every repository
+    the Library tracks — issue_01M2PERXQA76N5TAYZRFS4AVRN.
 
     **REGISTERED BEFORE `/signals/{signal_id}`, and that ordering is
     load-bearing** — the same trap `facets`, `acks`, `pr-state` and
@@ -11323,32 +11324,34 @@ async def ci_capture_report(request: Request):
     the Library, in any run); `quiet_this_run` is "tracked, asked, got nothing this
     run" on a repo that HAS captured signals before — a different, far
     less worrying state. `TRACKED`, `NOT_CAPTURED` and
-    `deck_tracked_repos()` are single-sourced in `bin/ci_result_fetch.py`
-    and imported from here, never copied.
+    `deck_tracked_repos()` are single-sourced in `ci_tracked.py`.
 
     `tracked` carries every `TRACKED` pair's `repo`, `workflow_file`,
     `product`, all-time `test_result_count` and `last_test_result_at`
     (via `_ci_capture_stats`, scoped and walled on the same terms as
-    `pr_state_latest`'s own CI join), and `last_fetch` — that pair's own
-    entry from `bin/ci_result_fetch.py`'s status file
-    (`ci_result_fetch.load_status()`), or `null` when the file is absent,
-    unparseable, or simply has no entry for this pair yet.
-    `never_captured`, `quiet_this_run` and `unreadable_last_run` are each a
-    filtered view of the same `tracked` rows, not a second query.
+    `pr_state_latest`'s own CI join). `never_captured` is a filtered view
+    of the same `tracked` rows, not a second query.
+
+    **Four fields read the retired fetcher's status file and are now
+    fixed** (issue_01M2XGCSGYW6F0QEZAQ0VKN7CQ): every `last_fetch` is
+    `null`, `quiet_this_run` and `unreadable_last_run` are empty, and
+    `status_file` is `{"state": "absent"}`. Library-Protocol 1 is additive,
+    so they stay in the response with the values a client already received
+    whenever `bin/ci_result_fetch.py`'s status file was missing. The Bosun's
+    `ci-result-capture` keeps no status the Library can read.
 
     `untracked` names every repo `deck_tracked_repos()` yields that
-    `TRACKED` does not track and `NOT_CAPTURED` does not explain — the
-    same startup check `bin/ci_result_fetch.py`'s own `main()` already
-    prints to stderr, read back here for a caller with no access to that
-    log. `not_captured` is `NOT_CAPTURED` itself, `{repo, reason}` per
-    entry.
+    `TRACKED` does not track and `NOT_CAPTURED` does not explain.
+    `not_captured` is `ci_tracked.not_captured()`, `{repo, reason}` per
+    entry: `NOT_CAPTURED` plus `NOT_CAPTURED_BY_NAME` under the full names
+    the registry gives those repositories.
 
     **Every list is filtered to the caller's own products, the same
     `identity.in_scope` test `_scope_clause` compiles to SQL elsewhere** —
     this route has no single `WHERE` to carry it, since `TRACKED`,
     `NOT_CAPTURED` and `deck_tracked_repos()` are Python constants, not
-    rows. `tracked` (and so `never_captured`, `quiet_this_run` and
-    `unreadable_last_run`, each a view of it) drops a `TRACKED` entry
+    rows. `tracked` (and so `never_captured`, a view of it) drops a
+    `TRACKED` entry
     whose `product` is out of scope before it is ever queried.
     `untracked` drops a `deck_tracked_repos()` entry the same way, by its
     own `product`. `not_captured` has none of its own — `NOT_CAPTURED`
@@ -11375,9 +11378,6 @@ async def ci_capture_report(request: Request):
     scope, scope_params = _scope_clause(ident)
     wall, wall_params = _customer_wall(ident)
 
-    status = ci_result_fetch.load_status()
-    last_fetch_by_key = (status or {}).get("pairs", {})
-
     # **OFF THE EVENT LOOP** (CQ·76), for the reason `signal_facets` gives:
     # one aggregate per `TRACKED` pair, about 95ms per call on 2026-10-12.
     def _read():
@@ -11389,7 +11389,7 @@ async def ci_capture_report(request: Request):
                     503, f"the archive tier is unavailable: {reason}")
 
             tracked = []
-            for entry in ci_result_fetch.TRACKED:
+            for entry in ci_tracked.TRACKED:
                 repo, workflow_file, product = (
                     entry["repo"], entry["workflow_file"], entry["product"])
                 if not identity.in_scope(ident, product):
@@ -11403,8 +11403,7 @@ async def ci_capture_report(request: Request):
                     "product": product,
                     "test_result_count": count,
                     "last_test_result_at": store._iso(last_at),
-                    "last_fetch": last_fetch_by_key.get(
-                        f"{repo}#{workflow_file}"),
+                    "last_fetch": None,
                 })
         finally:
             conn.close()
@@ -11415,45 +11414,32 @@ async def ci_capture_report(request: Request):
         return refusal
 
     never_captured = [t for t in tracked if t["test_result_count"] == 0]
-    quiet_this_run = [
-        t for t in tracked
-        if t["test_result_count"] > 0 and t["last_fetch"]
-        and t["last_fetch"].get("outcome") == "ok"
-        and t["last_fetch"].get("runs_returned") == 0]
-    unreadable_last_run = [
-        t for t in tracked
-        if t["last_fetch"] and t["last_fetch"].get("outcome") == "error"]
 
-    tracked_repos = {e["repo"] for e in ci_result_fetch.TRACKED}
+    tracked_repos = {e["repo"] for e in ci_tracked.TRACKED}
     try:
-        deck_repos = ci_result_fetch.deck_tracked_repos()
+        deck_repos = ci_tracked.deck_tracked_repos()
     except Exception:
-        # Matches `bin/ci_result_fetch.py`'s own `main()`: an unreadable or
-        # malformed registry costs this one section, never the whole route.
+        # An unreadable or malformed registry costs this one section, never
+        # the whole route.
         deck_repos = []
+    no_ci = ci_tracked.not_captured(deck_repos)
     untracked = [d for d in deck_repos
                  if d["repo"] not in tracked_repos
-                 and d["repo"] not in ci_result_fetch.NOT_CAPTURED
+                 and d["repo"] not in no_ci
                  and identity.in_scope(ident, d["product"])]
     repo_to_product = {d["repo"]: d["product"] for d in deck_repos}
     not_captured = [{"repo": repo, "reason": why}
-                    for repo, why in ci_result_fetch.NOT_CAPTURED.items()
+                    for repo, why in no_ci.items()
                     if identity.in_scope(ident, repo_to_product.get(repo))]
-
-    if status is None:
-        status_file = {"state": "absent"}
-    else:
-        status_file = {"state": "present",
-                       "run_finished": status.get("run_finished")}
 
     return {
         "tracked": tracked,
         "never_captured": never_captured,
-        "quiet_this_run": quiet_this_run,
-        "unreadable_last_run": unreadable_last_run,
+        "quiet_this_run": [],
+        "unreadable_last_run": [],
         "untracked": untracked,
         "not_captured": not_captured,
-        "status_file": status_file,
+        "status_file": {"state": "absent"},
     }
 
 

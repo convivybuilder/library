@@ -234,11 +234,11 @@ if [ "${1:-}" = "--internal-launchctl-env-pairs" ]; then
 fi
 
 # Not part of the public interface either (usage() does not list it) — lets
-# an operator render one of the four plists this script never installs
-# itself (cold-tier, cert-expiry-check, ci-result-fetch, deploy-watch — each
+# an operator render one of the three plists this script never installs
+# itself (cold-tier, cert-expiry-check, deploy-watch — each
 # one's header points here) before copying it to ~/Library/LaunchAgents by
 # hand, and lets tests exercise the real renderer directly rather than a
-# reimplementation of it. From the deploy area, for one of the first three
+# reimplementation of it. From the deploy area, for one of the first two
 # (deploy-pinned, so the deploy area's own copy is the one that matters):
 #
 #   bin/install-library --internal-render-plist \

@@ -2,7 +2,7 @@
 `test_cold_tier_plist.py` runs for its own sibling: deploy-pinned, not a
 kept-alive server, state paths outside the deploy area.
 
-`cert_expiry_check.py` differs from `ci_result_fetch.py` in the same
+`cert_expiry_check.py` differs from the retired `ci_result_fetch.py` in the same
 load-bearing way `cold_tier.py` does: it opens `LIBRARY_DB` directly through
 `store.py` and writes through `store.insert_signal` rather than posting over
 HTTP, so this plist also needs the database configuration the service's own

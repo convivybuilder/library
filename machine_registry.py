@@ -34,7 +34,21 @@ import sqlite3
 
 import store
 
-CUSTODY_VALUES = frozenset({"hardware", "file"})
+# How a machine's private key is held, as the operator attests at issuance:
+#
+# - `hardware`: a non-exportable Secure Enclave or TPM key.
+# - `file`: a software key in a file the operator account can read, so any
+#   agent running as that account can read it too.
+# - `root-file`: a software key in a file only root can read
+#   (platform/decisions/0092). A launchd daemon cannot use the Secure Enclave
+#   on macOS, so the Individuator's daemon holds one of these, and no agent
+#   runs as root. It gives up export resistance against someone who already
+#   has root on the machine.
+#
+# The registry records the attestation and serves it from machine verify;
+# which custodies a client accepts (the Bosun's session registration, for
+# one) is that client's decision, never this module's.
+CUSTODY_VALUES = frozenset({"hardware", "file", "root-file"})
 STATUS_ACTIVE = "active"
 STATUS_REVOKED = "revoked"
 

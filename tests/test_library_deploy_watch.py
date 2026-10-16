@@ -9,7 +9,7 @@ subprocess against a real git repository. `bin/library-deploy-watch` has no
 shell-specific semantics the way `bin/library-install` (`/bin/sh`) does, so
 unlike `tests/test_library_install.py` it does not need a subprocess
 harness to exercise its own parsing — the same reason
-`tests/test_ci_result_fetch.py` tests `post_signal`/`_retry_after_seconds`
+the retired `tests/test_ci_result_fetch.py` tested `post_signal`/`_retry_after_seconds`
 by calling them directly against a faked `urllib.request.urlopen`, never a
 real socket. This also means `run()`'s own decision logic (whether to
 install, whether to suppress a repeat failure) is tested without ever
@@ -22,7 +22,7 @@ extension (matching `bin/library-install`'s own convention for the
 installer it triggers) — Python's default finder only recognizes `.py`/
 `.pyc` suffixes, so a bare `import library_deploy_watch` would not find it.
 `HOME` is set before each load, since `DEPLOY_DIR`/`STATE_DIR` are both
-resolved from it at module-load time (matching `bin/ci_result_fetch.py`'s
+resolved from it at module-load time (matching the retired `bin/ci_result_fetch.py`'s
 own `STATE_DIR` idiom) — never a real `~/.local/deploy/library` or a real
 `~/.library`.
 """
@@ -130,7 +130,7 @@ def test_load_token_raises_when_neither_is_set(watch):
         watch.load_token()
 
 
-# --- post_signal: same mapping bin/ci_result_fetch.py's own post_signal
+# --- post_signal: same mapping the retired bin/ci_result_fetch.py's own post_signal
 # uses, against a faked urllib.request.urlopen — never a real socket. ------
 
 
@@ -174,7 +174,7 @@ def test_post_signal_maps_a_500_to_error_with_the_code(watch, monkeypatch):
 
 
 def test_post_signal_retries_a_429_then_succeeds(watch, monkeypatch):
-    """The livelock fix `bin/ci_result_fetch.py`'s own `post_signal` carries
+    """The livelock fix the retired `bin/ci_result_fetch.py`'s own `post_signal` carried
     — a 429 is retried in place, not reported as a failure."""
     calls = {"n": 0}
 
@@ -211,7 +211,7 @@ def test_retry_after_seconds_falls_back_for_a_non_finite_header(watch):
 
 
 # --- post_failure_signal: the payload shape, and the fixed-body/refs-carries
-# -the-detail rule bin/ci_result_fetch.py's own post_signal and
+# -the-detail rule the retired bin/ci_result_fetch.py's own post_signal and
 # convivy-orient/deploy_watch.py's post_failure_signal both follow. ---------
 
 

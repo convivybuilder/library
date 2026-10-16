@@ -16,7 +16,7 @@ is checked whether or not any registry row names it.
 
 **Writes directly to `LIBRARY_DB` through `store.insert_signal`, the same
 shape `retire_decisions.py` uses, rather than posting over HTTP the way
-`bin/ci_result_fetch.py` does.** This job runs on the machine that serves the
+the retired `bin/ci_result_fetch.py` did.** This job runs on the machine that serves the
 Library and reads the Library's own TLS directory — there is no remote actor
 here for an HTTP round trip to authenticate, only a local process that
 already has the database open.
@@ -46,7 +46,7 @@ from pathlib import Path
 # `store` and its siblings sit at the repo root — `pytest.ini`'s own
 # `pythonpath = . bin` solves the same problem for the test run; a script
 # invoked directly (as launchd does) has no pytest.ini to read it from, so
-# it adds the root itself, matching `bin/ci_result_fetch.py`'s own pattern.
+# it adds the root itself, matching the retired `bin/ci_result_fetch.py`'s own pattern.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import machine_identity  # noqa: E402

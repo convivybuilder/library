@@ -1,9 +1,9 @@
 """The cold-tier mover's launchd template — the same shape of check
-`test_ci_result_fetch.py` runs for its own plist, since this one is a
+the retired `test_ci_result_fetch.py` ran for its own plist, since this one is a
 poll of the same kind: deploy-pinned, not a kept-alive server, state paths
 outside the deploy area.
 
-`cold_tier.py` differs from `ci_result_fetch.py` in one load-bearing way:
+`cold_tier.py` differs from the retired `ci_result_fetch.py` in one load-bearing way:
 it opens `LIBRARY_DB` and `LIBRARY_COLD_DB` directly through `store.py`
 rather than posting over HTTP, so this plist also needs the same database
 configuration the service's own plist deploys. A value that diverged from

@@ -13,8 +13,10 @@ Mapped to the build plan's own sections:
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
+import traceback
 
 import pytest
 
@@ -262,6 +264,91 @@ def test_a_single_row_over_the_budget_still_moves_whole(db, monkeypatch):
     assert _cold_exists("sig_big")
 
 
+# Known SQLITE_BUSY / SQLITE_LOCKED extended codes, for naming the code in a
+# lock error's evidence — Python's sqlite3 module gives the raw int only.
+_EXTENDED_ERROR_NAMES = {
+    5: "SQLITE_BUSY",
+    5 | (1 << 8): "SQLITE_BUSY_RECOVERY",
+    5 | (2 << 8): "SQLITE_BUSY_SNAPSHOT",
+    5 | (3 << 8): "SQLITE_BUSY_TIMEOUT",
+    6: "SQLITE_LOCKED",
+    6 | (1 << 8): "SQLITE_LOCKED_SHAREDCACHE",
+    6 | (2 << 8): "SQLITE_LOCKED_VTAB",
+}
+
+
+def _errorname(code) -> str:
+    return _EXTENDED_ERROR_NAMES.get(code, f"UNKNOWN({code})")
+
+
+def _journal_modes(main_path, cold_path) -> dict:
+    """PRAGMA journal_mode of both files, read on fresh connections — never
+    on a connection that just raised, since that connection may already be
+    unusable. Part of a lock error's evidence (issue_01M504BG7VGE2AFXSYAHH9PDFX):
+    a failure naming only "database is locked" cannot say whether `cold` had
+    already been switched to WAL by the move pass's own `attach_cold` when
+    the race started."""
+    modes = {}
+    for label, path in (("main", main_path), ("cold", cold_path)):
+        try:
+            c = sqlite3.connect(path, timeout=1)
+            modes[label] = c.execute("PRAGMA journal_mode").fetchone()[0]
+            c.close()
+        except Exception as exc:  # noqa: BLE001 - best effort
+            modes[label] = f"<unreadable: {exc}>"
+    return modes
+
+
+# The retry helpers sit between a call site and the `conn.execute` that
+# raised, so `_labelled` skips them and names the call site instead — the
+# same split `tests/test_discard_sweep.py`'s own `_labelled` draws for
+# `discard_sweep`'s identically-shaped helpers.
+_RETRY_HELPERS = frozenset({"_begin_immediate", "_execute_retrying_busy"})
+
+
+def _labelled(side: str, e: sqlite3.OperationalError, main_path, cold_path) -> str:
+    """A lock error's full evidence: which side raised, the call site that
+    issued the refused statement (skipping the retry helpers), the extended
+    `sqlite_errorcode`/name, both schemas' journal mode, and the traceback —
+    everything issue_01M504BG7VGE2AFXSYAHH9PDFX's own CI failures lacked,
+    because the test only kept the exception, not which statement raised it.
+    """
+    frames = [f for f in traceback.extract_tb(e.__traceback__)
+              if f.name not in _RETRY_HELPERS]
+    frame = frames[-1]
+    code = getattr(e, "sqlite_errorcode", None)
+    name = _errorname(code)
+    modes = _journal_modes(main_path, cold_path)
+    tb = "".join(traceback.format_exception(type(e), e, e.__traceback__))
+    return (f"{side} {frame.name}:{frame.lineno}: {e} "
+            f"(sqlite_errorcode={code} sqlite_errorname={name} "
+            f"journal_modes={modes})\n{tb}")
+
+
+def _watch_refused(monkeypatch, on_refused, prefix="BEGIN IMMEDIATE"):
+    """Route every `sqlite3.connect` in the test through a Connection subclass
+    that calls `on_refused()` each time a statement starting with `prefix` on
+    it is refused. The refusal is SQLite's own, so the handler sees a real
+    `SQLITE_BUSY` — the same helper `tests/test_discard_sweep.py` uses for
+    `discard_sweep`'s identically-shaped `_begin_immediate`."""
+    class _Watching(sqlite3.Connection):
+        def execute(self, sql, *args, **kwargs):
+            try:
+                return super().execute(sql, *args, **kwargs)
+            except sqlite3.OperationalError:
+                if sql.startswith(prefix):
+                    on_refused()
+                raise
+
+    real_connect = sqlite3.connect
+
+    def connect(*args, **kwargs):
+        kwargs.setdefault("factory", _Watching)
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", connect)
+
+
 # --- lock budget: a move pass beside a concurrent writer -----------------
 
 
@@ -279,6 +366,22 @@ def test_a_move_pass_and_a_concurrent_writer_neither_get_a_lock_error(db):
     reproduced the same error locally, 1 run in 420, against 0 in 420 in
     WAL. Production never runs in rollback mode, so the test switches the
     file before the race starts.
+
+    **The later, WAL-mode failures (library#290's head, and main's merge of
+    #289, both 2026-10-15) were a second, different mechanism**
+    (issue_01M504BG7VGE2AFXSYAHH9PDFX): `_move_batch`'s step 2, `BEGIN
+    IMMEDIATE` on `main`, losing the race for the write lock against this
+    same writer thread, and raising a plain `SQLITE_BUSY` once
+    `store.BUSY_TIMEOUT_MS` ran out — confirmed by amplified reproduction
+    (the PR body's evidence table), never `SQLITE_BUSY_SNAPSHOT` or
+    `SQLITE_BUSY_RECOVERY`, and never step 1's `INSERT ... SELECT`. That is
+    ordinary writer-vs-writer contention the busy handler already tried and
+    failed to clear in one attempt — `cold_tier._begin_immediate` now
+    retries it, the fix `discard_sweep.py` already carries for the
+    identical shape. `_labelled` below keeps the statement, the extended
+    error code and both schemas' journal mode in the failure message, so a
+    future failure here names its own cause rather than repeating the
+    2026-10-15 failures' bare "database is locked".
     """
     conn = sqlite3.connect(db)
     assert conn.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
@@ -287,8 +390,8 @@ def test_a_move_pass_and_a_concurrent_writer_neither_get_a_lock_error(db):
         _insert(db, f"sig_old_{i:03d}", "note",
                 ingested_at=f"2020-01-01 00:00:{i:02d}.000000")
 
+    cold_path = os.environ["LIBRARY_COLD_DB"]
     errors = []
-    move_errors = []
     writes = []
     stop = threading.Event()
 
@@ -311,7 +414,7 @@ def test_a_move_pass_and_a_concurrent_writer_neither_get_a_lock_error(db):
                     conn.close()
                 writes.append(i)
             except sqlite3.OperationalError as e:
-                errors.append(e)
+                errors.append(_labelled("writer", e, db, cold_path))
             i += 1
 
     t = threading.Thread(target=writer)
@@ -319,23 +422,113 @@ def test_a_move_pass_and_a_concurrent_writer_neither_get_a_lock_error(db):
     try:
         assert ct.run(dry_run=False, do_restore=False) == 0
     except sqlite3.OperationalError as e:
-        move_errors.append(e)
+        errors.append(_labelled("move", e, db, cold_path))
     finally:
         stop.set()
         t.join(timeout=5)
 
-    # Which side raised, and in which mode, is what tells a lost write from a
-    # move pass that will retry; the 2026-10-15 failures could say neither.
-    mode = sqlite3.connect(db).execute("PRAGMA journal_mode").fetchone()[0]
-    assert not errors, (f"the concurrent writer hit a lock error in "
-                        f"{mode} mode: {errors}")
-    assert not move_errors, (f"the move pass hit a lock error in {mode} "
-                             f"mode: {move_errors}")
+    assert not errors, f"a concurrent write hit a lock error:\n{errors}"
     assert writes, "the concurrent writer never got a turn — this test proves nothing"
     for i in range(40):
         assert not _hot_exists(db, f"sig_old_{i:03d}")
     for i in writes:
         assert _hot_exists(db, f"sig_live_{i:04d}")
+
+
+# --- cold_tier._begin_immediate: retried on SQLITE_BUSY -------------------
+#
+# issue_01M504BG7VGE2AFXSYAHH9PDFX's fix. Mirrors `tests/test_discard_sweep.
+# py`'s own tests for `discard_sweep._begin_immediate`, the identical helper
+# for the identical shape (a `BEGIN IMMEDIATE` on `main` that can lose a
+# race to a live writer).
+
+
+def test_a_refused_move_begin_immediate_is_retried_and_the_pass_completes(
+        db, monkeypatch):
+    """`_begin_immediate` retries a refused lock. A holder keeps the write
+    lock on `main` until `_move_batch`'s step 2 is refused once, and
+    releases it from inside the refusal handler, so the second attempt is
+    the one that takes the lock and the pass completes."""
+    monkeypatch.setattr(store, "BUSY_TIMEOUT_MS", 50)
+    _insert(db, "sig_old", "note", ingested_at=OLD, dedup_key="dk1")
+    holder = sqlite3.connect(db, isolation_level=None)
+    holder.execute("BEGIN IMMEDIATE")
+    refusals = []
+
+    def release_on_first_refusal():
+        refusals.append(1)
+        if len(refusals) == 1:
+            holder.execute("COMMIT")
+
+    _watch_refused(monkeypatch, release_on_first_refusal)
+    try:
+        assert ct.run(dry_run=False, do_restore=False) == 0
+    finally:
+        holder.close()
+
+    assert len(refusals) == 1
+    assert not _hot_exists(db, "sig_old")
+    assert _cold_exists("sig_old")
+    assert _registry_signal_for(db, "dk1") == "sig_old"
+
+
+def test_a_move_begin_immediate_refused_on_every_attempt_fails_the_pass_and_writes_nothing(
+        db, monkeypatch):
+    """A lock that never frees fails the pass after three tries, and step 2
+    has written nothing by then: the row stays hot, and step 1's cold copy
+    (already committed before step 2 ever runs) is the only trace of the
+    attempt — exactly what lets a resumed pass skip re-copying it rather
+    than find the row moved twice."""
+    monkeypatch.setattr(store, "BUSY_TIMEOUT_MS", 50)
+    _insert(db, "sig_old", "note", ingested_at=OLD, dedup_key="dk1")
+    holder = sqlite3.connect(db, isolation_level=None)
+    holder.execute("BEGIN IMMEDIATE")
+    refusals = []
+    _watch_refused(monkeypatch, lambda: refusals.append(1))
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+            ct.run(dry_run=False, do_restore=False)
+    finally:
+        holder.execute("COMMIT")
+        holder.close()
+
+    # Pinned as a literal, not `ct.BEGIN_ATTEMPTS`: the pass's worst-case wait
+    # is this count times `BUSY_TIMEOUT_MS`, so lowering the constant must
+    # fail here rather than pass by agreeing with itself.
+    assert len(refusals) == 3
+    assert _hot_exists(db, "sig_old")
+    assert _cold_exists("sig_old")
+    assert _registry_signal_for(db, "dk1") is None
+
+
+def test_a_refused_restore_begin_immediate_is_retried_and_the_pass_completes(
+        db, monkeypatch):
+    """The reverse of the first test above: `_restore_batch`'s own `BEGIN
+    IMMEDIATE` (step 1, on `main`) is retried the same way."""
+    _insert(db, "sig_old", "note", ingested_at=OLD, dedup_key="dk1")
+    ct.run(dry_run=False, do_restore=False)
+    assert not _hot_exists(db, "sig_old")
+
+    monkeypatch.setattr(store, "BUSY_TIMEOUT_MS", 50)
+    holder = sqlite3.connect(db, isolation_level=None)
+    holder.execute("BEGIN IMMEDIATE")
+    refusals = []
+
+    def release_on_first_refusal():
+        refusals.append(1)
+        if len(refusals) == 1:
+            holder.execute("COMMIT")
+
+    _watch_refused(monkeypatch, release_on_first_refusal)
+    try:
+        assert ct.run(dry_run=False, do_restore=True) == 0
+    finally:
+        holder.close()
+
+    assert len(refusals) == 1
+    assert _hot_exists(db, "sig_old")
+    assert not _cold_exists("sig_old")
+    assert _registry_signal_for(db, "dk1") is None
 
 
 def _conn(db_path):
