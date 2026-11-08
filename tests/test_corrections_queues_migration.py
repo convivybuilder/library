@@ -43,18 +43,18 @@ def _seed(db):
         "state, type, created_by, created_at, parent_id) "
         "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         [
-            # vivy: an epic and a correction (no parent) — vivy needs a queue.
-            ("e_v1", "vivy", "epic", "b", "{}", "low", "open", "epic", "t",
+            # fennick: an epic and a correction (no parent) — fennick needs a queue.
+            ("e_v1", "fennick", "epic", "b", "{}", "low", "open", "epic", "t",
              "2026-01-01", None),
-            ("c_v1", "vivy", "fix", "b", "{}", "low", "open", "bug", "t",
+            ("c_v1", "fennick", "fix", "b", "{}", "low", "open", "bug", "t",
              "2026-01-01", None),
-            # constance: an epic and a sub-item THAT HAS A PARENT — not a
+            # marlow: an epic and a sub-item THAT HAS A PARENT — not a
             # correction by today's rule, but still a non-epic row, so this
             # product gets a queue too (the migration seeds by product, not
             # by whether a given row is currently parentless).
-            ("e_c1", "constance", "epic", "b", "{}", "low", "open", "epic",
+            ("e_c1", "marlow", "epic", "b", "{}", "low", "open", "epic",
              "t", "2026-01-01", None),
-            ("t_c1", "constance", "task under e_c1", "b", "{}", "low",
+            ("t_c1", "marlow", "task under e_c1", "b", "{}", "low",
              "open", "task", "t", "2026-01-01", "e_c1"),
             # orient: one untyped correction, as library PR 236's migration
             # leaves an open non-epic item. `NULL != 'epic'` is not true, so
@@ -71,7 +71,7 @@ def _seed(db):
         "ingested_at, source, product, reported_by, epic_id) "
         "VALUES (?,?,?,?,?,?,?,?,?,?)",
         ("l1", "ld1", "2026-01-01", 100, "2026-01-01", "2026-01-01",
-         "agentctl", "archy", "t", "corrections"))
+         "agentctl", "spindle", "t", "corrections"))
     conn.commit()
     conn.close()
 
@@ -95,11 +95,11 @@ def test_upgrade_seeds_one_queue_per_product_with_a_correction(tmp_path):
             for r in conn.execute("SELECT * FROM corrections_queues")}
     conn.close()
 
-    # vivy (a correction), constance (a non-epic row with a parent) and
-    # archy (a ledger 'corrections' entry only, no issue_items row at all)
+    # fennick (a correction), marlow (a non-epic row with a parent) and
+    # spindle (a ledger 'corrections' entry only, no issue_items row at all)
     # each get exactly one queue, and so does orient (an untyped correction).
     # keel, which has only an epic, gets none.
-    assert set(rows) == {"vivy", "constance", "archy", "orient"}
+    assert set(rows) == {"fennick", "marlow", "spindle", "orient"}
     for queue_id in rows.values():
         assert queue_id.startswith("cq_")
 
@@ -136,7 +136,7 @@ def test_upgrade_writes_no_parent_id_and_changes_no_existing_row(tmp_path):
 
 
 def test_product_is_unique_so_one_queue_never_duplicates(tmp_path):
-    """`vivy` names both a correction in `issue_items` and, separately, could
+    """`fennick` names both a correction in `issue_items` and, separately, could
     also carry a `'corrections'` ledger entry — the schema's own `UNIQUE`
     on `product` is what keeps that from ever minting a second row, not
     just the `SELECT DISTINCT` the migration happens to run."""
@@ -147,21 +147,21 @@ def test_product_is_unique_so_one_queue_never_duplicates(tmp_path):
         "INSERT INTO issue_items (id, product, title, body, refs, severity, "
         "state, type, created_by, created_at, parent_id) "
         "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-        ("c_v1", "vivy", "fix", "b", "{}", "low", "open", "bug", "t",
+        ("c_v1", "fennick", "fix", "b", "{}", "low", "open", "bug", "t",
          "2026-01-01", None))
     conn.execute(
         "INSERT INTO ledger_entries (id, ledger_id, day, usd_micro, at, "
         "ingested_at, source, product, reported_by, epic_id) "
         "VALUES (?,?,?,?,?,?,?,?,?,?)",
         ("l1", "ld1", "2026-01-01", 100, "2026-01-01", "2026-01-01",
-         "agentctl", "vivy", "t", "corrections"))
+         "agentctl", "fennick", "t", "corrections"))
     conn.commit()
     conn.close()
 
     assert alembic("upgrade", REVISION, db=db).returncode == 0
     conn = sqlite3.connect(db)
     count = conn.execute(
-        "SELECT COUNT(*) FROM corrections_queues WHERE product = 'vivy'"
+        "SELECT COUNT(*) FROM corrections_queues WHERE product = 'fennick'"
     ).fetchone()[0]
     conn.close()
     assert count == 1

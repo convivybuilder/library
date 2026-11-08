@@ -219,29 +219,46 @@ class CredentialBindingGate:
         await self.app(scope, receive, send)
 
 
-def redemption_binding_holds(scope) -> bool:
-    """Whether the request in `scope` may redeem: it arrived over the
-    mutual-TLS listener, the client certificate resolves to a registered,
-    unrevoked machine, and the bearer credential presented is bound to that
-    same machine. `POST /tokens/redeem` refuses on `False`, before it reads
-    the body or looks up a slip, and this is the only check standing
-    between a request and a card.
+def redemption_machine(scope) -> str | None:
+    """The machine a redemption on `scope` is bound to, or `None` if it may
+    not redeem: the request did not arrive over the mutual-TLS listener, the
+    client certificate does not resolve to a registered, unrevoked machine,
+    or the bearer credential presented is not bound to that same machine.
+    `POST /tokens/redeem` refuses on `None`, before it reads the body or
+    looks up a slip, and this is the only check standing between a request
+    and a card. The machine this returns is what `library_cards.issue`
+    stores as the card's `bound_machine`
+    (library/specs/library-card-credential-and-revocation-plan §2) — the
+    one value the whole check exists to produce, not just a boolean.
 
     **Nothing here reads state another component set.** The machine comes
     from the peer certificate through `machine_identity.resolve_machine`,
     not from `scope["state"]["machine_identity"]`, so the check holds
     whether or not the middleware chain ran, and the credential comes from
     the same `Authorization` header `identity.resolve` reads. Every path
-    that does not reach the final comparison returns `False`: a plain
+    that does not reach the final comparison returns `None`: a plain
     listener (no `mtls.EXTENSION_KEY`), an unresolvable certificate, no
     bearer token, an unbound credential (`_bound_machine` is `None`, which
     equals no machine name).
     """
     mtls_info = scope.get("extensions", {}).get(mtls.EXTENSION_KEY)
     if mtls_info is None:
-        return False
+        return None
     machine = machine_identity.resolve_machine(mtls_info)
     token = _bearer_token(scope)
     if machine is None or token is None:
-        return False
-    return _bound_machine(sha256_token(token)) == machine
+        return None
+    if _bound_machine(sha256_token(token)) != machine:
+        return None
+    return machine
+
+
+def redemption_binding_holds(scope) -> bool:
+    """Whether the request in `scope` may redeem — `redemption_machine(scope)
+    is not None`. Kept as a boolean wrapper so `bundles.py`'s own docstring
+    (which names this function to say why its route does not call it) and
+    this module's existing tests keep reading a yes/no question.
+    `POST /tokens/redeem` calls `redemption_machine` directly instead, since
+    it needs the machine name itself, not just whether one holds.
+    """
+    return redemption_machine(scope) is not None

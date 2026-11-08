@@ -47,7 +47,7 @@ def client(tmp_path, monkeypatch, vector_index):
     tokens = tmp_path / "api-tokens.json"
     tokens.write_text(json.dumps({
         WIDE: {"name": "wide-agent", "products": ["*"]},
-        NARROW: {"name": "narrow-agent", "products": ["vivy"]},
+        NARROW: {"name": "narrow-agent", "products": ["fennick"]},
     }))
     monkeypatch.setattr(store, "DB_PATH", db)
     monkeypatch.setattr(identity, "TOKENS", tokens)
@@ -61,7 +61,7 @@ def _h(token=WIDE):
 
 def seed(item_id, **cols):
     """One item, with only the columns a case cares about."""
-    cols.setdefault("product", "vivy")
+    cols.setdefault("product", "fennick")
     cols.setdefault("title", item_id)
     cols.setdefault("body", "synthetic body")
     cols.setdefault("refs", "{}")
@@ -175,9 +175,9 @@ def test_progress_children_match_the_scoped_listing(client):
     reuses `_scope_clause` rather than re-deriving it, and this is the read
     that would catch the two drifting apart if it ever re-spelled the rule
     instead."""
-    seed("epic_1", type=store.ITEM_TYPE_EPIC, product="vivy")
-    seed("child_a", parent_id="epic_1", product="vivy", state="open")
-    seed("child_b", parent_id="epic_1", product="vivy", state="fixed")
+    seed("epic_1", type=store.ITEM_TYPE_EPIC, product="fennick")
+    seed("child_a", parent_id="epic_1", product="fennick", state="open")
+    seed("child_b", parent_id="epic_1", product="fennick", state="fixed")
 
     progress = get(client, "epic_1", token=NARROW)["progress"]
     listing = client.get("/items?parent_id=epic_1", headers=_h(NARROW))

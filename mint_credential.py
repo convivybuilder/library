@@ -8,8 +8,12 @@ Library's own token files and prints it once, in the shape of
 rather than going through a route, because there is no route for this yet and
 because a fresh install has no credential to authenticate one with.
 
-    ./mint_credential.py --file agents --name orient --out ~/.orient-control/library-token
-    ./mint_credential.py --file clients --name orient --out ~/.orient-control/library-client-token
+    LIBRARY_API_TOKENS=~/.library/api-tokens.json ./mint_credential.py --file agents --name orient --out ~/.orient-control/library-token
+    LIBRARY_CLIENT_TOKENS=~/.library/client-tokens.json ./mint_credential.py --file clients --name orient --out ~/.orient-control/library-client-token
+
+Both commands above name the variable explicitly rather than relying on its
+default so the example works verbatim on a shell that does not already have
+it set — see `--tokens-file` below for the alternative.
 
 `--out PATH` writes the token straight to PATH, atomically, at mode 0600 from creation, and stdout
 stays empty. Redirecting stdout with `>` instead — still supported, for scripting — creates the
@@ -20,17 +24,27 @@ write then fails, the `--out` file is removed again, so a failure never leaves a
 the store that nobody saw. `--out` refuses a PATH that resolves — symlinks included — to either
 credential store file itself, and refuses a dangling symlink rather than writing through it.
 
-`--file agents` writes an entry to `identity.TOKENS`
-(`~/.library/api-tokens.json`, or `LIBRARY_API_TOKENS`), which resolves as
-`agent` unless `--kind system` is given — `approved_client` is never
-nameable there (`identity.NAMEABLE_KINDS`) — and there alone `--grants` adds
-capabilities beyond the role's own and `--crew` names which crew took the
-credential (CQ·10). `--file clients` writes to `identity.CLIENT_TOKENS`,
-whose every entry resolves as `approved_client` regardless of what it says,
-and there alone `--holds-reserved` and `--withholds` narrow the
-human-reserved capabilities a client credential carries — all four
-validated with `identity`'s own load-time validators, so this command
-cannot write an entry `identity` would then refuse to serve.
+`--file agents` writes an entry to `identity.TOKENS` (`LIBRARY_API_TOKENS`,
+or `~/.library/api-tokens.json` when that variable is unset); `--file
+clients` writes to `identity.CLIENT_TOKENS` (`LIBRARY_CLIENT_TOKENS`, the
+same way). **Refused, writing nothing, when neither the variable nor
+`--tokens-file PATH` names the target** — the running Library's own
+environment can point either file somewhere other than `identity`'s default,
+and a mint run from a shell missing the variable used to land silently on
+that default and report success, writing a credential the running Library
+never read (CQ·244). `--tokens-file PATH` overrides the variable for this
+one run; either way, the resolved path is printed, before anything is
+written, on every mint and every `--revoke`.
+
+`--file agents` resolves as `agent` unless `--kind system` is given —
+`approved_client` is never nameable there (`identity.NAMEABLE_KINDS`) — and
+there alone `--crew` names which crew took the credential (CQ·10). `--file
+clients`'s every entry resolves as `approved_client` regardless of what it
+says, and there alone `--holds-reserved` and `--withholds` narrow the
+human-reserved capabilities a client credential carries. `--grants` adds
+capabilities beyond the role's own in either file — all of these validated with `identity`'s own
+load-time validators, so this command cannot write an entry `identity` would
+then refuse to serve.
 
 **The token is generated here with `secrets.token_urlsafe(32)`, printed on
 stdout, and nothing else is.** Status goes to stderr, so
@@ -44,7 +58,8 @@ printed or logged.
 a credential minted this way to take effect.
 
 **`--revoke --name NAME` removes that entry instead of minting one** — the
-same file, resolved through the same `FILES` map:
+same file, resolved through the same rule above (the variable, or
+`--tokens-file`, required just the same):
 
     ./mint_credential.py --file agents --revoke --name orient
     ./mint_credential.py --file clients --revoke --name orient
@@ -56,9 +71,10 @@ does — the refusal says how many, never which. `identity` re-reads the file
 per request (see above), so a credential already in use is refused with 401
 on its very next request, no restart needed. Stdout stays empty; the name
 and the file revoked from go to stderr, never a token. `--revoke` takes only
-`--file` and `--name`; it is refused at argument parsing alongside `--out`,
-`--replace`, `--products`, `--kind`, `--grants`, `--holds-reserved` or
-`--withholds`, none of which apply to removing an entry.
+`--file`, `--name` and `--tokens-file`; it is refused at argument parsing
+alongside `--out`, `--replace`, `--products`, `--kind`, `--grants`,
+`--holds-reserved` or `--withholds`, none of which apply to removing an
+entry.
 
 **Importing `identity` is deferred past the one line that settles the
 environment it needs, and that line is not optional.** `identity` imports
@@ -91,9 +107,42 @@ import identity  # noqa: E402  (see the module docstring's note above)
 
 FILES = {"agents": lambda: identity.TOKENS, "clients": lambda: identity.CLIENT_TOKENS}
 
+# The variable `identity` itself reads for each file (see `identity.py`'s own
+# `resolve_tokens()` and its `CLIENT_TOKENS` assignment) — the one `_resolve_target`
+# below requires, since it is the one the running Library's environment sets.
+TOKENS_ENV_VAR = {"agents": "LIBRARY_API_TOKENS", "clients": "LIBRARY_CLIENT_TOKENS"}
+
 
 class Refused(RuntimeError):
     """The credential cannot be written and nothing was."""
+
+
+def _resolve_target(file: str, tokens_file: str | None) -> Path:
+    """The file this run mints into or revokes from: `--tokens-file` if
+    given, else `FILES[file]()` — but only once `TOKENS_ENV_VAR[file]` is
+    confirmed set in this process's environment. Refuses otherwise, writing
+    nothing: `identity.TOKENS`/`identity.CLIENT_TOKENS` fall back to a file
+    under `~/.library` even when the running Library's own environment
+    points its half of this pair elsewhere, so minting without the variable
+    (or `--tokens-file`) would silently write a credential the Library never
+    reads (CQ·244).
+
+    Reads `FILES[file]()` by attribute at call time, same as `_build_entry`
+    used to — see that function's history — so a test that monkeypatches
+    `identity.TOKENS`/`identity.CLIENT_TOKENS` after import still reaches the
+    same path this resolves to."""
+    if tokens_file is not None:
+        return Path(tokens_file).expanduser()
+    env_var = TOKENS_ENV_VAR[file]
+    if env_var not in os.environ:
+        raise Refused(
+            f"neither {env_var} nor --tokens-file names the {file} token "
+            f"file; refusing to guess at identity's own default "
+            f"({FILES[file]()}), which the running Library may not be "
+            f"reading from. Set {env_var} — the same variable the running "
+            f"Library's own environment sets — or pass --tokens-file PATH. "
+            f"Nothing was written.")
+    return FILES[file]()
 
 
 def _check_mode(path: Path) -> None:
@@ -180,15 +229,16 @@ def _ensure_private_dir(dir_path: Path) -> None:
         os.chmod(d, 0o700)
 
 
-def _check_out_not_store(path: Path) -> None:
+def _check_out_not_store(path: Path, target: Path) -> None:
     """Refuse a `--out` PATH that resolves — following symlinks, via
     `os.path.realpath` — to either credential store, `identity.TOKENS` or
-    `identity.CLIENT_TOKENS`, regardless of which one `--file` targets:
-    `--out` writes a bare token, not JSON, and landing it on either store
-    file destroys every credential that file holds with no warning beyond
-    this one."""
+    `identity.CLIENT_TOKENS`, regardless of which one `--file` targets, or
+    to `target`, the store this run writes, which `--tokens-file` can point
+    outside both: `--out` writes a bare token, not JSON, and landing it on a
+    store file destroys every credential that file holds with no warning
+    beyond this one."""
     out_real = os.path.realpath(str(path))
-    for store_path in (identity.TOKENS, identity.CLIENT_TOKENS):
+    for store_path in (identity.TOKENS, identity.CLIENT_TOKENS, target):
         if out_real == os.path.realpath(str(store_path)):
             raise Refused(
                 f"--out {path} resolves to {store_path}, a credential "
@@ -348,21 +398,24 @@ def _split_caps(raw: str | None) -> list[str]:
 
 
 def _client_fields(withholds: list[str], holds_reserved: list[str] | None,
-                   label: str) -> dict:
-    """`{"withholds": [...]}` and optionally `{"holds_reserved": [...]}`,
+                   grants: list[str], label: str) -> dict:
+    """`{"withholds": [...]}`, `{"grants": [...]}` and optionally
+    `{"holds_reserved": [...]}`,
     validated with `identity`'s own load-time validators so this command
     cannot write an entry `identity.resolve` would then refuse to serve.
     `_entry_capabilities`/`_entry_holds_reserved` are the exact functions
     `identity._client_tokens()` calls over every entry at read time."""
-    meta: dict = {"withholds": withholds}
+    meta: dict = {"withholds": withholds, "grants": grants}
     try:
-        _, withholds_fs = identity._entry_capabilities(
+        grants_fs, withholds_fs = identity._entry_capabilities(
             meta, "approved_client", label)
     except identity._BadEntry as exc:
         raise Refused(str(exc)) from None
     fields: dict = {}
     if withholds_fs:
         fields["withholds"] = sorted(withholds_fs)
+    if grants_fs:
+        fields["grants"] = sorted(grants_fs)
     if holds_reserved is not None:
         meta["holds_reserved"] = holds_reserved
         try:
@@ -426,21 +479,19 @@ def _crew_field(crew: str | None, kind: str, label: str) -> dict:
     return {"crew": validated}
 
 
-def _build_entry(*, file: str, name: str, products: list[str], kind: str,
-                  holds_reserved: list[str] | None, withholds: list[str],
-                  grants: list[str], profile: str | None, crew: str | None,
-                  replace: bool) -> tuple[Path, dict, str]:
+def _build_entry(*, file: str, path: Path, name: str, products: list[str],
+                  kind: str, holds_reserved: list[str] | None,
+                  withholds: list[str], grants: list[str],
+                  profile: str | None, crew: str | None,
+                  replace: bool) -> tuple[dict, str]:
     """Validate everything `mint()` would write and generate the token, but
-    write nothing: returns `(path, entries, token)`, where `entries` is the
-    exact dict `path` should end up holding. Splitting build from commit
-    lets the caller land `--out` before the store file is touched at all.
+    write nothing: returns `(entries, token)`, where `entries` is the exact
+    dict `path` should end up holding. Splitting build from commit lets the
+    caller land `--out` before the store file is touched at all.
 
-    Reads the two paths off `identity` by attribute at call time (never
-    copied into a local), so a test that monkeypatches
-    `identity.TOKENS`/`identity.CLIENT_TOKENS` after import — the same
-    pattern `tests/test_bootstrap_library.py` already uses — reaches this
-    function too."""
-    path = FILES[file]()
+    `path` is the caller's job to resolve, through `_resolve_target` —
+    refusing a call that names no tokens file happens there, before this
+    function ever runs."""
     _check_mode(path)
     entries = _load_entries(path)
 
@@ -460,13 +511,13 @@ def _build_entry(*, file: str, name: str, products: list[str], kind: str,
         entry.update(_profile_field(profile, kind, f"{name!r} (new)"))
         entry.update(_crew_field(crew, kind, f"{name!r} (new)"))
     else:
-        entry.update(_client_fields(withholds, holds_reserved, f"{name!r} (new)"))
+        entry.update(_client_fields(withholds, holds_reserved, grants, f"{name!r} (new)"))
 
     token = secrets.token_urlsafe(32)
     for tok in existing:
         del entries[tok]
     entries[token] = entry
-    return path, entries, token
+    return entries, token
 
 
 def _commit(path: Path, entries: dict) -> None:
@@ -501,14 +552,19 @@ def _revoke_entry(path: Path, name: str) -> None:
 def mint(*, file: str, name: str, products: list[str], kind: str,
          holds_reserved: list[str] | None, withholds: list[str],
          grants: list[str] = (), profile: str | None = None,
-         crew: str | None = None, replace: bool) -> str:
+         crew: str | None = None, replace: bool,
+         tokens_file: str | None = None) -> str:
     """Add one credential to `identity.TOKENS` or `identity.CLIENT_TOKENS`;
     return the raw token. `main` does not call this directly — it needs the
     build and the commit as separate steps to sequence `--out` between them
     — but it stays as the one-call shape for anything else that mints a
-    credential with no `--out` to land first."""
-    path, entries, token = _build_entry(
-        file=file, name=name, products=products, kind=kind,
+    credential with no `--out` to land first. Resolves the target through
+    `_resolve_target`, the same gate `main()` applies (CQ·244): refused when
+    neither `tokens_file` nor the variable `identity` reads for `file` is
+    set."""
+    path = _resolve_target(file, tokens_file)
+    entries, token = _build_entry(
+        file=file, path=path, name=name, products=products, kind=kind,
         holds_reserved=holds_reserved, withholds=withholds, grants=list(grants),
         profile=profile, crew=crew, replace=replace)
     _commit(path, entries)
@@ -531,9 +587,17 @@ def main(argv=None) -> int:
                         "--holds-reserved and --withholds.")
     p.add_argument("--products", default=None,
                    help="comma-separated product scope (default: *, every product)")
-    p.add_argument("--kind", choices=("agent", "system"), default=None,
+    p.add_argument("--kind", choices=("agent", "system", "review_record_writer",
+                                      "registrar"),
+                   default=None,
                    help="--file agents only (default: agent); approved_client "
-                        "is never nameable in the agents file")
+                        "is never nameable in the agents file. "
+                        "review_record_writer is a private crew's verdict-only "
+                        "credential (CQ·237): it needs exactly one product in "
+                        "--products, never '*', and takes no --grants, "
+                        "--profile or --crew. registrar holds registry.write "
+                        "alone (CQ·246) and takes no --grants, --profile or "
+                        "--crew")
     p.add_argument("--holds-reserved", default=None,
                    help="--file clients only: comma-separated human-reserved "
                         "capabilities this client holds (default: all of them)")
@@ -541,7 +605,7 @@ def main(argv=None) -> int:
                    help="--file clients only: comma-separated capabilities "
                         "this client's role grants but does not hold")
     p.add_argument("--grants", default=None,
-                   help="--file agents only: comma-separated capability "
+                   help="comma-separated capability "
                         "names to add to the role's capabilities — "
                         "identity.resolve_capabilities computes "
                         "(role_caps | grants) - withholds, so --kind agent "
@@ -585,6 +649,15 @@ def main(argv=None) -> int:
                         "at <PATH>.mint-backup — if the command crashes, "
                         "that file may still be there holding the old, "
                         "still-valid token")
+    p.add_argument("--tokens-file", default=None, metavar="PATH",
+                   help="the token file to mint into or revoke from, "
+                        "overriding LIBRARY_API_TOKENS (--file agents) or "
+                        "LIBRARY_CLIENT_TOKENS (--file clients). Required "
+                        "when that variable is not set in this shell's "
+                        "environment: without one or the other, this command "
+                        "refuses to guess at identity's own default, which "
+                        "the running Library may not be reading from "
+                        "(CQ·244). Compatible with --revoke.")
     args = p.parse_args(argv)
 
     name = args.name.strip()
@@ -616,7 +689,12 @@ def main(argv=None) -> int:
             print(f"mint_credential: --revoke is incompatible with "
                   f"{', '.join(conflicts)}", file=sys.stderr)
             return 2
-        path = FILES[args.file]()
+        try:
+            path = _resolve_target(args.file, args.tokens_file)
+        except Refused as e:
+            print(f"mint_credential: {e}", file=sys.stderr)
+            return 1
+        print(f"mint_credential: target file: {path}", file=sys.stderr)
         try:
             _revoke_entry(path, name)
         except Refused as e:
@@ -639,10 +717,6 @@ def main(argv=None) -> int:
         print("mint_credential: --holds-reserved and --withholds apply only "
               "to --file clients", file=sys.stderr)
         return 2
-    if args.file == "clients" and args.grants is not None:
-        print("mint_credential: --grants applies only to --file agents",
-              file=sys.stderr)
-        return 2
     if args.file == "clients" and args.profile is not None:
         print("mint_credential: --profile applies only to --file agents; a "
               "client credential has no single dispatch profile to bind to",
@@ -661,10 +735,48 @@ def main(argv=None) -> int:
               "or '*'", file=sys.stderr)
         return 2
 
+    # A `review_record_writer` credential is handed to one private crew's
+    # review dispatch, so it holds `review_record.create` for that crew alone:
+    # a second product, '*', or any widening flag would make it more than the
+    # verdict-only credential the private crew's wall allows (CQ·237).
+    if args.kind == "review_record_writer":
+        widening = [flag for flag, value in (("--grants", args.grants),
+                                             ("--profile", args.profile),
+                                             ("--crew", args.crew))
+                    if value is not None]
+        if widening:
+            print(f"mint_credential: --kind review_record_writer holds "
+                  f"review_record.create alone and takes no "
+                  f"{', '.join(widening)}", file=sys.stderr)
+            return 2
+        if len(products) != 1 or products[0] == "*":
+            print("mint_credential: --kind review_record_writer needs exactly "
+                  "one product in --products, never '*'", file=sys.stderr)
+            return 2
+
+    # A `registrar` credential holds `registry.write` and nothing else
+    # (CQ·246); any widening flag would make it more than that.
+    if args.kind == "registrar":
+        widening = [flag for flag, value in (("--grants", args.grants),
+                                             ("--profile", args.profile),
+                                             ("--crew", args.crew))
+                    if value is not None]
+        if widening:
+            print(f"mint_credential: --kind registrar holds registry.write "
+                  f"alone and takes no {', '.join(widening)}", file=sys.stderr)
+            return 2
+
+    try:
+        path = _resolve_target(args.file, args.tokens_file)
+    except Refused as e:
+        print(f"mint_credential: {e}", file=sys.stderr)
+        return 1
+    print(f"mint_credential: target file: {path}", file=sys.stderr)
+
     out_path = Path(args.out).expanduser() if args.out is not None else None
     if out_path is not None:
         try:
-            _check_out_not_store(out_path)
+            _check_out_not_store(out_path, path)
             _check_out_dangling(out_path)
             if args.replace:
                 _check_out_replace_target(out_path)
@@ -673,8 +785,8 @@ def main(argv=None) -> int:
             return 1
 
     try:
-        path, entries, token = _build_entry(
-            file=args.file, name=name, products=products,
+        entries, token = _build_entry(
+            file=args.file, path=path, name=name, products=products,
             kind=args.kind or "agent",
             holds_reserved=(_split_caps(args.holds_reserved)
                             if args.holds_reserved is not None else None),

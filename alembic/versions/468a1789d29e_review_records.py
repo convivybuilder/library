@@ -40,16 +40,16 @@ The measurement above is why "return the existing record" is not the whole
 rule. Grouping those 10,890 signals by (run, role, reviewed commit): 50 groups
 are identical re-posts, which idempotency alone collapses; 3 groups share a
 verdict and differ only in prose; and 6 groups differ in VERDICT — one run
-posted APPROVE, then REQUEST_CHANGES two minutes later, on selector#395
-(run-68db8257, 2026-08-18) and again on sous-chef#442 (run-102e6fbc,
-2026-08-14). 167 stamps carry no run at all, and 3 of those (role,
-reviewed_ref) groups hold two comments each.
+posted APPROVE, then REQUEST_CHANGES two minutes later, on a product
+repository's PR (run-68db8257, 2026-08-18) and again on another product
+repository's PR (run-102e6fbc, 2026-08-14). 167 stamps carry no run at all,
+and 3 of those (role, reviewed_ref) groups hold two comments each.
 
 Today's merge gate takes the LAST stamp per agent
 (`agent-platform/lib/agent-platform/review_protocol.py:309`: "the last stamp
 per agent wins, so a later REQUEST_CHANGES correctly overrides an earlier
-APPROVE"). A record that kept only the first write would have counted
-selector#395's withdrawn APPROVE as the agent's word on that commit; a record
+APPROVE"). A record that kept only the first write would have counted the
+first run's withdrawn APPROVE as the agent's word on that commit; a record
 that kept only the last write would break "every review is kept," which the
 epic's specification also asks for. Both are wrong for a changed review, so
 the contract this schema supports is:

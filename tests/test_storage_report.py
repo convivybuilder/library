@@ -32,7 +32,7 @@ sqlite_vec = pytest.importorskip("sqlite_vec")
 
 REPO = Path(__file__).resolve().parent.parent
 
-AGENT = "agent-token-vivy"
+AGENT = "agent-token-fennick"
 # `"*"` products, `signal.customer`, and (per the fixture's `REGISTRY`, no
 # product bearing a stored `handoff` signal) nothing a handoff wall excludes
 # — the three conditions `app._storage_report_wide` requires, so this token
@@ -46,16 +46,18 @@ WIDE = "agent-token-wide"
 # platform-wide ratio under the round-1 fix.
 WIDE_NO_CUSTOMER = "agent-token-wide-no-customer"
 NOSIGNAL = "agent-token-nosignal"
+# `WIDE`, plus `signal.post_draft` through its own `grants` (CQ·228).
+WIDE_DRAFT = "agent-token-wide-draft"
 
 REGISTRY = {
     "_meta": {},
-    "vivy": {"repos": []},
-    "sous-chef": {"repos": []},
+    "fennick": {"repos": []},
+    "galley": {"repos": []},
     # A black-box crew (ADR-0043) — registered so it counts toward
     # `len(projects.projects())`, which is exactly the figure a scoped
     # caller must not learn anything about (security-reviewer, PR #203
     # round 1).
-    "cfo": {"private": True, "task_text_public": False, "repos": []},
+    "quill": {"private": True, "task_text_public": False, "repos": []},
 }
 
 
@@ -69,7 +71,7 @@ def _ts(**delta):
             - _dt.timedelta(**delta)).isoformat(" ")
 
 
-def _insert_signal(db_path, sig_id, kind, *, product="vivy", body="body",
+def _insert_signal(db_path, sig_id, kind, *, product="fennick", body="body",
                    meta="{}", ingested_at=None, embedded_at=None,
                    privacy_class="internal"):
     conn = sqlite3.connect(db_path)
@@ -145,13 +147,16 @@ def env(tmp_path, monkeypatch, vector_index):
 
     tokens = tmp_path / "api-tokens.json"
     tokens.write_text(json.dumps({
-        AGENT: {"name": "vivy-agent", "products": ["vivy"]},
+        AGENT: {"name": "fennick-agent", "products": ["fennick"]},
         WIDE: {"name": "wide-agent", "products": ["*"],
               "kind": "customer_reader"},
         WIDE_NO_CUSTOMER: {"name": "wide-no-customer-agent",
                           "products": ["*"]},
         NOSIGNAL: {"name": "nosignal-agent", "products": ["*"],
                   "withholds": ["signal.read"]},
+        WIDE_DRAFT: {"name": "wide-draft-agent", "products": ["*"],
+                     "kind": "customer_reader",
+                     "grants": ["signal.post_draft"]},
     }))
 
     vector_index(db)
@@ -496,15 +501,15 @@ def test_storage_refuses_an_unrecognised_parameter(env):
 
 def test_a_scoped_caller_does_not_see_another_products_kind(env):
     db, cold = env
-    _insert_signal(db, "sig_vivy", "note", product="vivy",
+    _insert_signal(db, "sig_fennick", "note", product="fennick",
                    embedded_at=_ts(days=1))
-    _insert_vector_row(vectors.VEC_TABLE, "sig_vivy")
-    _insert_signal(db, "sig_sc", "finding", product="sous-chef",
+    _insert_vector_row(vectors.VEC_TABLE, "sig_fennick")
+    _insert_signal(db, "sig_sc", "finding", product="galley",
                    embedded_at=_ts(days=1))
     _insert_vector_row(vectors.VEC_TABLE, "sig_sc", dominant=7)
 
     client = TestClient(libapp.app)
-    r = client.get("/signals/storage", headers=_h(AGENT))  # scoped to vivy
+    r = client.get("/signals/storage", headers=_h(AGENT))  # scoped to fennick
     assert r.status_code == 200
     kinds = {kind for kind, _, _ in r.json()["by_kind"]}
     assert "note" in kinds
@@ -526,12 +531,12 @@ def test_a_scoped_caller_sees_no_platform_wide_tier_size_or_project_count(
     kind of figure.
     """
     db, cold = env
-    _insert_signal(db, "sig_sc", "note", product="sous-chef",
+    _insert_signal(db, "sig_sc", "note", product="galley",
                    body="y" * 5000, embedded_at=_ts(days=1))
     _insert_vector_row(vectors.VEC_TABLE, "sig_sc")
 
     client = TestClient(libapp.app)
-    r = client.get("/signals/storage", headers=_h(AGENT))  # scoped to vivy
+    r = client.get("/signals/storage", headers=_h(AGENT))  # scoped to fennick
     assert r.status_code == 200
     body = r.json()
     for tier in storage_report.TIERS:
@@ -539,7 +544,7 @@ def test_a_scoped_caller_sees_no_platform_wide_tier_size_or_project_count(
         assert t["available"] is False
         assert t["size_bytes"] is None, (
             "a scoped caller must not see any tier's byte total, which is "
-            "computed over every product's rows, sous-chef's included")
+            "computed over every product's rows, galley's included")
         assert t["growth_bytes_per_day"] is None
         assert t["projected_size_bytes_at_horizon"] is None
         # The reason must name the gate THIS caller actually failed — not
@@ -583,7 +588,7 @@ def test_a_wildcard_caller_without_signal_customer_is_withheld_the_wide_figures(
     grant `signal.customer`.
     """
     db, cold = env
-    _insert_signal(db, "sig_customer", "note", product="vivy",
+    _insert_signal(db, "sig_customer", "note", product="fennick",
                    privacy_class="customer", body="x" * 5000,
                    embedded_at=_ts(days=1))
     _insert_vector_row(vectors.VEC_TABLE, "sig_customer")
@@ -617,11 +622,11 @@ def test_a_wildcard_customer_reading_caller_behind_a_handoff_wall_is_withheld_to
     identity — still cannot read such a row through any route this service
     offers, and must get the wide figures withheld too once one exists,
     rather than a ratio or a project count derived from content it cannot
-    read anywhere else (security-reviewer, PR #203 round 2; `cfo` is this
+    read anywhere else (security-reviewer, PR #203 round 2; `quill` is this
     fixture's private crew, ADR-0043).
     """
     db, cold = env
-    _insert_signal(db, "sig_handoff", "handoff", product="cfo",
+    _insert_signal(db, "sig_handoff", "handoff", product="quill",
                    body="x" * 5000, embedded_at=_ts(days=1))
     _insert_vector_row(vectors.VEC_TABLE, "sig_handoff")
 
@@ -666,7 +671,7 @@ def test_the_handoff_admission_check_is_not_cached_unlike_tier_sizes(env):
     assert r1.status_code == 200
     assert r1.json()["tiers"][storage_report.TIER_HOT]["available"] is True
 
-    _insert_signal(db, "sig_handoff", "handoff", product="cfo",
+    _insert_signal(db, "sig_handoff", "handoff", product="quill",
                    body="x" * 5000, embedded_at=_ts(days=1))
     _insert_vector_row(vectors.VEC_TABLE, "sig_handoff")
 
@@ -676,6 +681,31 @@ def test_the_handoff_admission_check_is_not_cached_unlike_tier_sizes(env):
     assert body2["tiers"][storage_report.TIER_HOT]["available"] is False
     assert body2["tiers"][storage_report.TIER_HOT]["reason"] == (
         libapp._WIDE_REASON_HANDOFF)
+
+
+def test_a_draft_post_withholds_the_wide_figures_from_a_caller_without_the_capability(env):
+    """The draft-post wall excludes a `post_draft` row for a caller without
+    `signal.post_draft`, and the platform-wide figures are computed over it
+    too, so `WIDE` is withheld them once one exists, while `WIDE_DRAFT`, the
+    same identity holding the capability, still gets them (CQ·228,
+    security-reviewer, PR #305 round 1). Checked fresh, like the handoff
+    check: the first call, before the draft exists, sees the figures."""
+    db, cold = env
+    client = TestClient(libapp.app)
+    r0 = client.get("/signals/storage", headers=_h(WIDE))
+    assert r0.json()["tiers"][storage_report.TIER_HOT]["available"] is True
+
+    _insert_signal(db, "sig_draft", "post_draft", product="company",
+                   body="x" * 5000, embedded_at=_ts(days=1))
+
+    body = client.get("/signals/storage", headers=_h(WIDE)).json()
+    for tier in storage_report.TIERS:
+        assert body["tiers"][tier]["available"] is False
+        assert body["tiers"][tier]["reason"] == libapp._WIDE_REASON_POST_DRAFT
+    assert body["measurement"]["current_project_count"] is None
+
+    lifted = client.get("/signals/storage", headers=_h(WIDE_DRAFT)).json()
+    assert lifted["tiers"][storage_report.TIER_HOT]["available"] is True
 
 
 # --- the vectors tier's growth ratio shares one scope end-to-end ---------
@@ -694,13 +724,13 @@ def test_vectors_growth_rate_divides_by_the_platform_wide_embedded_total(
     db, cold = env
     now = _dt.datetime(2026, 10, 1, 12, 0, 0)
     since = (now - _dt.timedelta(days=5)).isoformat(" ")
-    # vivy: 1,000 embedded bytes (998 body + 2 meta). sous-chef: 9,000
+    # fennick: 1,000 embedded bytes (998 body + 2 meta). galley: 9,000
     # (8,998 body + 2 meta). Platform total: 10,000.
-    _insert_signal(db, "sig_vivy", "note", product="vivy", body="x" * 998,
+    _insert_signal(db, "sig_fennick", "note", product="fennick", body="x" * 998,
                   meta="{}", ingested_at=since, embedded_at=since)
-    _insert_signal(db, "sig_sc", "note", product="sous-chef", body="y" * 8998,
+    _insert_signal(db, "sig_sc", "note", product="galley", body="y" * 8998,
                   meta="{}", ingested_at=since, embedded_at=since)
-    _insert_vector_row(vectors.VEC_TABLE, "sig_vivy")
+    _insert_vector_row(vectors.VEC_TABLE, "sig_fennick")
     _insert_vector_row(vectors.VEC_TABLE, "sig_sc", dominant=1)
 
     conn = vectors.connect(store.DB_PATH)
@@ -711,12 +741,12 @@ def test_vectors_growth_rate_divides_by_the_platform_wide_embedded_total(
             conn)[storage_report.TIER_VECTORS]
         result = storage_report.report(
             conn, source=source, where="WHERE 1 = 1 AND product = ?",
-            params=["vivy"], current_project_count=2, window_days=5, now=now)
+            params=["fennick"], current_project_count=2, window_days=5, now=now)
     finally:
         conn.close()
 
     # Hand-worked from the PLATFORM-WIDE ratio (index bytes ÷ 10,000 total
-    # embedded bytes ever), applied to vivy's own 1,000 window bytes, scaled
+    # embedded bytes ever), applied to fennick's own 1,000 window bytes, scaled
     # from today's 2 projects to the epic's 20.
     expected_ratio = index_bytes / 10_000
     expected_rate = round(1_000 * expected_ratio / 5 * (20 / 2))
@@ -725,7 +755,7 @@ def test_vectors_growth_rate_divides_by_the_platform_wide_embedded_total(
     assert actual_rate == expected_rate
 
     # The bug this guards against: scoping the ratio's denominator to
-    # vivy's own 1,000 bytes instead of the platform's 10,000 inflates the
+    # fennick's own 1,000 bytes instead of the platform's 10,000 inflates the
     # ratio roughly 10x — assert the fixed code does not reproduce it.
     buggy_ratio = index_bytes / 1_000
     buggy_rate = round(1_000 * buggy_ratio / 5 * (20 / 2))
@@ -741,34 +771,34 @@ def test_embedded_bytes_total_cache_is_keyed_by_source(env):
     `source` today, so this is the only way to reach a second one.
     """
     db, cold = env
-    # vivy: 1,000 embedded bytes (998 body + 2 meta). sous-chef: 9,000
+    # fennick: 1,000 embedded bytes (998 body + 2 meta). galley: 9,000
     # (8,998 body + 2 meta) — same split the ratio test above uses.
-    _insert_signal(db, "sig_vivy", "note", product="vivy", body="x" * 998,
+    _insert_signal(db, "sig_fennick", "note", product="fennick", body="x" * 998,
                   meta="{}", embedded_at=_ts(days=1))
-    _insert_signal(db, "sig_sc", "note", product="sous-chef",
+    _insert_signal(db, "sig_sc", "note", product="galley",
                   body="y" * 8998, meta="{}", embedded_at=_ts(days=1))
 
     conn = vectors.connect(store.DB_PATH)
     try:
         store.attach_cold(conn, readonly=True)
         full_source = store.signals_source()
-        vivy_source = store.signals_source("product = 'vivy'")
+        fennick_source = store.signals_source("product = 'fennick'")
 
-        # Populate the cache under `vivy_source` FIRST, so a cache keyed
+        # Populate the cache under `fennick_source` FIRST, so a cache keyed
         # on time alone (the pre-fix shape) would hand the full-platform
-        # call vivy's own 1,000-byte total instead of recomputing.
-        vivy_total = storage_report._embedded_bytes_total(conn, vivy_source)
+        # call fennick's own 1,000-byte total instead of recomputing.
+        fennick_total = storage_report._embedded_bytes_total(conn, fennick_source)
         full_total = storage_report._embedded_bytes_total(conn, full_source)
         # And the reverse order must not cross-contaminate either.
         storage_report.reset_embedded_total_cache()
         full_total_2 = storage_report._embedded_bytes_total(
             conn, full_source)
-        vivy_total_2 = storage_report._embedded_bytes_total(
-            conn, vivy_source)
+        fennick_total_2 = storage_report._embedded_bytes_total(
+            conn, fennick_source)
     finally:
         conn.close()
 
-    assert vivy_total == 1_000
+    assert fennick_total == 1_000
     assert full_total == 10_000
     assert full_total_2 == 10_000
-    assert vivy_total_2 == 1_000
+    assert fennick_total_2 == 1_000

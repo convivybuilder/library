@@ -31,7 +31,7 @@ import protocol
 import reference
 import store
 
-AGENT = "agent-token-vivy"
+AGENT = "agent-token-fennick"
 ORCHESTRATOR = identity.Identity(actor="co-library-test", kind="orchestrator")
 
 DOC_ID = "platform/decisions/0022-library-repo"
@@ -41,7 +41,7 @@ DOC_BODY = "the Library is a service with its own storage"
 # the hash's documented scope: it covers the body the index holds, not the
 # source file, so these must hash the same.
 TWIN_A = "platform/decisions/0031-twin-a"
-TWIN_B = "vivy/specs/twin-b"
+TWIN_B = "fennick/specs/twin-b"
 TWIN_BODY = "one body, two documents, deliberately"
 
 
@@ -52,6 +52,7 @@ def client(tmp_path, monkeypatch):
     conn.executescript("""
         CREATE TABLE roster_agents (
             id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE,
+            source_doc TEXT,
             created_at TEXT NOT NULL, created_by TEXT NOT NULL,
             updated_at TEXT NOT NULL, updated_by TEXT NOT NULL);
         CREATE TABLE profiles (
@@ -87,7 +88,7 @@ def client(tmp_path, monkeypatch):
         (DOC_ID, "decision", "platform", "The Library gets its own repository",
          DOC_BODY),
         (TWIN_A, "decision", "platform", "Twin A", TWIN_BODY),
-        (TWIN_B, "spec", "vivy", "Twin B", TWIN_BODY),
+        (TWIN_B, "spec", "fennick", "Twin B", TWIN_BODY),
     ]
     for doc_id, kind, project, title, body in rows:
         iconn.execute(
@@ -101,7 +102,7 @@ def client(tmp_path, monkeypatch):
 
     tokens = tmp_path / "api-tokens.json"
     tokens.write_text(json.dumps({
-        AGENT: {"name": "vivy-agent", "products": ["vivy"]},
+        AGENT: {"name": "fennick-agent", "products": ["fennick"]},
     }))
 
     monkeypatch.setattr(store, "DB_PATH", control)

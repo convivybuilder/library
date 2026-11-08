@@ -756,15 +756,29 @@ def claimable_clause(*, now=None) -> tuple[str, list]:
     SQLAlchemy in that same shape, so the comparison is the one Orient's own query
     makes; ISO-8601 with a space separator orders lexicographically, which is what
     makes that safe rather than merely convenient.
+
+    **The lease must sit on the item's CURRENT root**, `root_id_for`'s rule in
+    SQL, as `claim_status` reads it. Matched on `taken_for` alone, an item
+    re-parented while a dead, unreleased lease still sat on its old root was
+    judged on that lease's clock here and on the 24-hour TTL there, so one
+    response could list it claimable and report `claim_expired: false`
+    (issue_01M06VDX8NRKG3WZ02DQT3VK2A).
     """
     now = now or _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None)
+    root = ("CASE WHEN issue_items.type = ? THEN issue_items.id "
+            "WHEN EXISTS (SELECT 1 FROM issue_items p "
+            "WHERE p.id = issue_items.parent_id AND p.type = ?) "
+            "THEN issue_items.parent_id ELSE issue_items.id END")
     live = ("SELECT 1 FROM issue_leases l WHERE l.taken_for = issue_items.id "
-            "AND l.released_at IS NULL")
+            f"AND l.root_id = {root} AND l.released_at IS NULL")
+    epic = [store.ITEM_TYPE_EPIC, store.ITEM_TYPE_EPIC]
     sql = (f"(issue_items.claimed_at IS NULL"
            f" OR EXISTS ({live} AND (l.heartbeat_at <= ? OR l.taken_at <= ?))"
            f" OR (NOT EXISTS ({live}) AND issue_items.claimed_at <= ?))")
-    return sql, [(now - grace()).isoformat(" "),
+    return sql, [*epic,
+                 (now - grace()).isoformat(" "),
                  (now - max_lease()).isoformat(" "),
+                 *epic,
                  (now - CLAIM_TTL).isoformat(" ")]
 
 

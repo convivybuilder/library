@@ -53,6 +53,7 @@ import machine_identity  # noqa: E402
 import machine_registry  # noqa: E402
 import mtls  # noqa: E402
 import store  # noqa: E402
+import store_owner  # noqa: E402
 
 CERT_EXPIRY_WARNING_DAYS = 21
 
@@ -246,6 +247,18 @@ def run(*, now: _dt.datetime | None = None) -> int:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.parse_args(argv)
+    raw_args = sys.argv[1:] if argv is None else list(argv)
+    # Runs this check as LIBRARY_DB's own owner when that differs from the
+    # invoking user (company/decisions/0025 point 5) — a no-op on the
+    # single-account install, where it always already is.
+    try:
+        switched = store_owner.reexec_as_db_owner(
+            store.DB_PATH, Path(__file__).resolve(), raw_args)
+    except store_owner.OwnerSwitchRefused as ex:
+        print(f"cert_expiry_check: {ex}", file=sys.stderr)
+        return 1
+    if switched is not None:
+        return switched
     return run()
 
 

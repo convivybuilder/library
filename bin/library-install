@@ -72,9 +72,24 @@
 #       README), a failed migration, or --no-migrate over a vault that is
 #       behind — surfacing its message and exiting non-zero without step (e)
 #       below.
-#   (e) Prints a one-line verdict comparing the commit `install-library
-#       --status` now reports and the commit/staged_commit `/health` reports
-#       against the target commit.
+#   (e) Polls `/health` (the commit/staged_commit it reports) against the
+#       target commit until they agree or a deadline passes, then prints a
+#       one-line verdict comparing that against the commit `install-library
+#       --status` reports. The deadline is app.py's own
+#       `_DRAIN_DEADLINE_SECONDS` (the just-deployed release's, read fresh
+#       from the deploy area) plus a startup allowance, because the running
+#       process self-restarts onto the new commit rather than being
+#       reloaded by this script, and a single immediate read of `/health`
+#       cannot have observed that restart yet (library issue
+#       issue_01M584Q5SH8BQVGABSQWBPBV62: a deploy that left the service
+#       down reported "Deploy confirmed" exactly because of that gap,
+#       exiting 0 regardless). On agreement, prints "Deploy confirmed" and
+#       returns 0, same as before. On a timeout, prints the last `/health`
+#       answer, says the code is installed but the service is not serving
+#       it, and exits 3 — distinct from every refusal above and from
+#       install-library's own, so a log tells the two apart. `exit 3` is
+#       itself enough to make library-deploy-watch post a `deploy_failure`
+#       signal for the target; it does not retry anything itself.
 #
 # Takes one optional argument, --no-migrate, passed through to
 # bin/install-library unchanged (same meaning: never apply a pending
@@ -193,6 +208,63 @@ _fetch_health() {
 # commit shas, so this plain sed is exact for it without a JSON parser.
 _health_field() {
   printf '%s' "$1" | sed -n 's/.*"'"$2"'":"\([^"]*\)".*/\1/p' | head -n 1
+}
+
+# How often step (e) re-polls /health once the first attempt disagrees.
+# Fixed, not test-overridable: the only input a test needs to vary is how
+# LONG the deadline below runs, not how often this asks within it.
+_HEALTH_POLL_INTERVAL_S=1
+
+# Added on top of app.py's own _DRAIN_DEADLINE_SECONDS (below) for however
+# long the new process itself takes to come up once the old one has
+# drained and exited. Generous against the two seconds every observed
+# self-restart has actually taken (library issue
+# issue_01M584Q5SH8BQVGABSQWBPBV62).
+_HEALTH_POLL_STARTUP_ALLOWANCE_S=10
+
+# Used in place of the sum above only when $DEPLOY_DIR/app.py's own
+# _DRAIN_DEADLINE_SECONDS cannot be read at all (see _drain_deadline_seconds)
+# — large enough to cover a genuinely slow restart without guessing at the
+# real bound, small enough to stay well inside library-deploy-watch's
+# INSTALL_TIMEOUT_S of 600s.
+_HEALTH_POLL_DEADLINE_FALLBACK_S=120
+
+# A deliberate copy of bin/install-library's own _drain_deadline_seconds,
+# not a shared one — same reasoning as _plist_env_value above: the two
+# scripts are independent on purpose. Reads $1 (the release step (d) just
+# staged, so its app.py) for a top-level _DRAIN_DEADLINE_SECONDS, truncated
+# to whole seconds. Prints nothing — never zero — when the line isn't
+# there or isn't a plain integer once parsed, which the caller below treats
+# as "could not read." Always returns 0, even when $1 doesn't exist at
+# all: awk itself exits nonzero on a missing file, and the one caller
+# below assigns this straight into a variable (`drain="$(...)"`), which
+# under this script's own `set -eu` would abort the whole deploy on that
+# nonzero status — exactly the case this function's fallback exists to
+# survive, not trigger.
+_drain_deadline_seconds() {
+  awk '
+    /^_DRAIN_DEADLINE_SECONDS[ \t]*(:[ \t]*[A-Za-z_][A-Za-z0-9_]*[ \t]*)?=/ {
+      line = $0
+      sub(/^[^=]*=/, "", line)
+      sub(/#.*/, "", line)
+      gsub(/[ \t]/, "", line)
+      sub(/\.[0-9]*$/, "", line)
+      if (line ~ /^[0-9]+$/) print line
+      exit
+    }
+  ' "$1" 2>/dev/null || true
+}
+
+# The total number of seconds step (e) polls /health for before giving up:
+# app.py's own _DRAIN_DEADLINE_SECONDS (read fresh from $DEPLOY_DIR/app.py)
+# plus _HEALTH_POLL_STARTUP_ALLOWANCE_S, or _HEALTH_POLL_DEADLINE_FALLBACK_S
+# when that constant cannot be read.
+_health_poll_deadline_seconds() {
+  drain="$(_drain_deadline_seconds "$DEPLOY_DIR/app.py")"
+  case "$drain" in
+    ''|*[!0-9]*) printf '%s\n' "$_HEALTH_POLL_DEADLINE_FALLBACK_S" ;;
+    *) printf '%s\n' "$((drain + _HEALTH_POLL_STARTUP_ALLOWANCE_S))" ;;
+  esac
 }
 
 # The "commit: <sha>" line out of a DEPLOYED_COMMIT file ($1), or nothing
@@ -392,17 +464,51 @@ main() {
   fi
 
   # --- (e) verdict -----------------------------------------------------------
+  # install-library --status reads $DEPLOYED_COMMIT_FILE, which step (d)
+  # just wrote synchronously — it cannot change again before a second
+  # deploy, so it is read once rather than polled.
   STATUS_OUTPUT="$("$INSTALL_LIBRARY_BIN" --status 2>&1)" || true
   STATUS_SHA="$(printf '%s\n' "$STATUS_OUTPUT" | sed -n 's/^commit: //p' | head -n 1)"
+
+  # /health, by contrast, reports what the RUNNING process has loaded, and
+  # it self-restarts onto the new commit rather than being reloaded by this
+  # script — a single read immediately after install-library returns can
+  # only ever see the OLD commit or none at all, every time, which is
+  # exactly how this reported "Deploy confirmed" on a deploy that left the
+  # service down (library issue issue_01M584Q5SH8BQVGABSQWBPBV62). Poll
+  # until it agrees or the deadline runs out.
+  POLL_DEADLINE_S="$(_health_poll_deadline_seconds)"
+  POLL_START_S="$(date +%s)"
   HEALTH_JSON="$(_fetch_health)"
   HEALTH_SHA="$(_health_field "$HEALTH_JSON" commit)"
   HEALTH_STAGED_SHA="$(_health_field "$HEALTH_JSON" staged_commit)"
+  while [ "$HEALTH_SHA" != "$TARGET_SHA" ]; do
+    ELAPSED_S=$(( $(date +%s) - POLL_START_S ))
+    [ "$ELAPSED_S" -ge "$POLL_DEADLINE_S" ] && break
+    sleep "$_HEALTH_POLL_INTERVAL_S"
+    HEALTH_JSON="$(_fetch_health)"
+    HEALTH_SHA="$(_health_field "$HEALTH_JSON" commit)"
+    HEALTH_STAGED_SHA="$(_health_field "$HEALTH_JSON" staged_commit)"
+  done
 
   if [ "$STATUS_SHA" = "$TARGET_SHA" ] && [ "$HEALTH_SHA" = "$TARGET_SHA" ]; then
     say "verdict: target $TARGET_SHA — install-library --status and /health both agree. Deploy confirmed."
-  else
-    warn "verdict: target $TARGET_SHA; install-library --status reports ${STATUS_SHA:-nothing}; /health reports commit=${HEALTH_SHA:-none} staged_commit=${HEALTH_STAGED_SHA:-none} — not yet confirmed; re-run --status and curl /health once the restart settles."
+    return 0
   fi
+
+  warn "verdict: target $TARGET_SHA; install-library --status reports ${STATUS_SHA:-nothing}; /health reports commit=${HEALTH_SHA:-none} staged_commit=${HEALTH_STAGED_SHA:-none} after waiting up to ${POLL_DEADLINE_S}s — the code is installed but the service is not serving it."
+  # Never run for real under a test redirect, even though launchctl print
+  # is read-only: the no-agent-no-test rule at the top of this file covers
+  # every real launchd call this script makes, not only the mutating ones.
+  if [ -z "${LIBRARY_INSTALL_TEST_INSTALL_LIBRARY:-}" ] && command -v launchctl >/dev/null 2>&1; then
+    LABEL="$(basename "$PLIST_TEMPLATE" .plist)"
+    if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
+      warn "launchctl print gui/$(id -u)/$LABEL finds the job."
+    else
+      warn "launchctl print gui/$(id -u)/$LABEL does not find the job — it may have been removed rather than merely restarting."
+    fi
+  fi
+  exit 3
 }
 
 if [ -z "${LIBRARY_INSTALL_SOURCE_ONLY:-}" ]; then

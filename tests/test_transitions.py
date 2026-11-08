@@ -20,7 +20,7 @@ import lease
 import protocol
 import store
 
-AGENT = "agent-token-vivy"
+AGENT = "agent-token-fennick"
 
 
 def _ts(**delta):
@@ -67,16 +67,16 @@ def client(tmp_path, monkeypatch):
     conn.executemany(
         "INSERT INTO issue_items (id, product, title, type, state, needs, "
         "created_by_kind, created_at, refs) VALUES (?,?,?,?,?,?,?,?,?)",
-        [("task", "vivy", "A task", "task", "open", "agent", "agent",
+        [("task", "fennick", "A task", "task", "open", "agent", "agent",
           _ts(days=2), "{}"),
-         ("done", "vivy", "Done", "task", "fixed", "agent", "agent",
+         ("done", "fennick", "Done", "task", "fixed", "agent", "agent",
           _ts(days=2), "{}")])
     conn.commit()
     conn.close()
 
     tokens = tmp_path / "api-tokens.json"
     tokens.write_text(json.dumps({
-        AGENT: {"name": "vivy-agent", "products": ["vivy"]},
+        AGENT: {"name": "fennick-agent", "products": ["fennick"]},
     }))
     monkeypatch.setattr(store, "DB_PATH", db)
     monkeypatch.setattr(identity, "TOKENS", tokens)
@@ -169,6 +169,71 @@ def test_linking_a_pr_to_a_terminal_item_is_refused(client):
                        headers=_h()).status_code == 409
 
 
+# A link replaces `pr` and `url` together (round-2 security review, CQ-248):
+# a later link-pr with no url must drop a url an earlier call stored, or
+# `pr_url`/`pr_repo` would keep naming the PR that call linked rather than
+# the `pr` this call names.
+
+
+def test_a_later_link_pr_with_no_url_drops_the_earlier_stored_url(client):
+    client.post("/items/task/link-pr",
+               json={"pr": 5, "url": "https://github.com/o/r/pull/5"},
+               headers=_h())
+    r = client.post("/items/task/link-pr", json={"pr": 6}, headers=_h())
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["pr"] == 6
+    assert body["pr_url"] is None
+    assert body["pr_repo"] is None
+    assert "url" not in _refs("task")
+    assert _refs("task")["pr"] == 6
+
+
+def test_a_later_link_pr_with_a_blank_url_drops_the_earlier_stored_url(client):
+    client.post("/items/task/link-pr",
+               json={"pr": 5, "url": "https://github.com/o/r/pull/5"},
+               headers=_h())
+    r = client.post("/items/task/link-pr", json={"pr": 6, "url": "   "},
+                    headers=_h())
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["pr"] == 6
+    assert body["pr_url"] is None
+    assert "url" not in _refs("task")
+
+
+def test_a_later_link_pr_with_a_new_url_stores_and_serves_it(client):
+    client.post("/items/task/link-pr",
+               json={"pr": 5, "url": "https://github.com/o/r/pull/5"},
+               headers=_h())
+    r = client.post("/items/task/link-pr",
+                    json={"pr": 6, "url": "https://github.com/o/r/pull/6"},
+                    headers=_h())
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["pr"] == 6
+    assert body["pr_url"] == "https://github.com/o/r/pull/6"
+    assert _refs("task")["url"] == "https://github.com/o/r/pull/6"
+
+
+def test_source_url_survives_a_link_pr_that_drops_url(client):
+    conn = _db()
+    conn.execute("UPDATE issue_items SET refs = ? WHERE id = 'task'",
+                (json.dumps({"source_url": "https://example.com/src"}),))
+    conn.commit()
+    conn.close()
+    client.post("/items/task/link-pr",
+               json={"pr": 5, "url": "https://github.com/o/r/pull/5"},
+               headers=_h())
+    r = client.post("/items/task/link-pr", json={"pr": 6}, headers=_h())
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["source_url"] == "https://example.com/src"
+    assert body["pr_url"] is None
+    assert _refs("task")["source_url"] == "https://example.com/src"
+    assert "url" not in _refs("task")
+
+
 # --- every transition leaves a trail -------------------------------------------
 
 
@@ -180,7 +245,7 @@ def test_a_state_change_always_appends_an_event(client):
                       "WHERE item_id='task' ORDER BY id DESC LIMIT 1").fetchone()
     conn.close()
     assert (ev["actor"], ev["from_state"], ev["to_state"]) == (
-        "vivy-agent", "open", "pr-open")
+        "fennick-agent", "open", "pr-open")
 
 
 def test_writes_are_refused_while_the_shadow_is_running(client, monkeypatch):

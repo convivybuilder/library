@@ -112,13 +112,13 @@ def test_a_persons_project_set_survives_an_alembic_upgrade_and_a_restart(
     # routes fail closed with 503 wherever no agent-platform checkout exists,
     # which is CI.
     registry = tmp_path / "projects.json"
-    registry.write_text(json.dumps({"vivy": {}, "hollis": {}}))
+    registry.write_text(json.dumps({"fennick": {}, "bramwell": {}}))
     monkeypatch.setattr(projects, "REGISTRY_PATH", registry)
     projects.reload()
     writer = _app_instance(db, tmp_path, monkeypatch)
 
     grant = writer.post(f"/people/{WITH_PROJECTS}/projects",
-                        json={"grant": ["vivy", "hollis"]}, headers=_headers())
+                        json={"grant": ["fennick", "bramwell"]}, headers=_headers())
     assert grant.status_code == 200, grant.text
     # `WITH_NOTHING` gets no call at all: the route refuses a grant/revoke
     # naming nothing (`test_a_malformed_change_is_a_400_for_an_administrator`),
@@ -127,7 +127,7 @@ def test_a_persons_project_set_survives_an_alembic_upgrade_and_a_restart(
 
     written = {WITH_PROJECTS: _read(writer, WITH_PROJECTS),
                WITH_NOTHING: _read(writer, WITH_NOTHING)}
-    assert written[WITH_PROJECTS] == {"projects": ["hollis", "vivy"], "count": 2}
+    assert written[WITH_PROJECTS] == {"projects": ["bramwell", "fennick"], "count": 2}
     assert written[WITH_NOTHING] == {"projects": [], "count": 0}
 
     upgraded = _alembic("upgrade", "head", db=db)

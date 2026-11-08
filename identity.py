@@ -127,8 +127,7 @@ ROLE_CAPS: dict[str, frozenset[str]] = {
 # the registry that decides which machines may authenticate a session.
 #
 # **GRANTED ONLY THROUGH AN ENTRY'S OWN `grants`** (`mint_credential.py
-# --grants machine.verify`, `--file agents`, is the supported path; a
-# hand-edited `client-tokens.json` entry's `grants` reaches it too, because
+# --grants machine.verify` is the supported path, on either file, because
 # `_entry_capabilities` reads `grants` on every kind), so it is in
 # `GRANT_ONLY_CAPS` below rather than a role literal: naming it in
 # `ROLE_CAPS` would hand it to
@@ -138,14 +137,19 @@ ROLE_CAPS: dict[str, frozenset[str]] = {
 # all (`_entry_capabilities`), and this one is a question about a machine's
 # certificate, not an act reserved to a verified human's client.
 #
-# **`ledger.spend.subscription` GATES `lane: "subscription"` ON `POST
-# /ledger-entries`** (issue_01M35QG5NA13JE8FQVM9XET4HD, platform/decisions/0057).
-# `ledger.spend` alone, held by every `agent` and `system` credential, says a
-# caller may report spend; it says nothing about which LANE it may claim, and
-# `subscription` is the one lane `ledger_days` and every threshold and
-# checkout check skip. Without a second gate, any `ledger.spend` holder could
-# tag real, metered-gateway spend `"subscription"` and keep it out of
-# enforcement while it still reads as reported.
+# **`ledger.spend.subscription` GATES `lane: "subscription"` AND
+# `lane: "openai-subscription"` ON `POST /ledger-entries`**
+# (issue_01M35QG5NA13JE8FQVM9XET4HD, platform/decisions/0057,
+# issue_01M58502RQC0XDAC1D704XQW5B). `ledger.spend` alone, held by every
+# `agent` and `system` credential, says a caller may report spend; it says
+# nothing about which LANE it may claim, and `store.NON_ENFORCEABLE_LEDGER_
+# LANES` names the lanes `ledger_days` and every threshold and checkout
+# check skip. Without a second gate, any `ledger.spend` holder could tag
+# real, metered-gateway spend with one of those lanes and keep it out of
+# enforcement while it still reads as reported. The one capability covers
+# both lanes rather than one per subscription, because the question it
+# answers — may this credential claim spend the Library cannot enforce — is
+# the same question for either.
 #
 # **ON NO ROLE SET AT ALL, for `machine.verify`'s reason above**: handing this
 # to every `agent` and `system` credential is the exact gap the capability
@@ -153,14 +157,42 @@ ROLE_CAPS: dict[str, frozenset[str]] = {
 # `approved_client`.
 #
 # **GRANTED ONLY THROUGH AN ENTRY'S OWN `grants`** (`mint_credential.py
-# --grants ledger.spend.subscription`, `--file agents`), the same path
+# --grants ledger.spend.subscription`), the same path
 # `machine.verify` takes: a deliberate, auditable grant to the one credential
 # that can back the claim — the Bosun's subscription reporter — rather than a
 # role everything of that kind inherits. It is not human-reserved: `--file
 # agents` cannot name a human-reserved capability in `grants` at all
 # (`_entry_capabilities`), and the Bosun's reporter credential is not a
 # verified human's client.
-GRANT_ONLY_CAPS = frozenset({"machine.verify", "ledger.spend.subscription"})
+#
+# **`signal.post_draft` GATES READ ACCESS TO A `kind = 'post_draft'` ROW**
+# (CQ·228, Orient's E26, issue_01M584RKNA5KKFXE00GSHKEEYD). A draft Writing
+# Desk post is an ordinary Archive record once E26 lands, walled the way
+# `app._post_draft_wall` describes: every list, count, search and facet
+# route excludes it, and a single-row read answers 404, unless the caller
+# holds this capability. Writing one still needs only `signal.create` — the
+# wall is read-only.
+#
+# **ON NO ROLE SET AT ALL, for `machine.verify`'s reason above**: the spec
+# this capability implements says a draft "is readable only by people who
+# hold Writing Desk write access", which is a question Orient alone answers
+# per viewer — handing this to every `agent` or `system` credential would
+# make every one of them able to read every draft, which is not what any
+# role needs today.
+#
+# **GRANTED ONLY THROUGH AN ENTRY'S OWN `grants`**, the same path
+# `machine.verify` and `ledger.spend.subscription` take: Orient's
+# `approved_client` token names it in `grants` so Orient can read drafts
+# back and gate them per viewer itself. Not human-reserved: a draft's
+# readability is Orient's own question to answer, not an act reserved to a
+# verified human's client.
+#
+# `registry.read` is the fourth member; its own comment block, below, says
+# why. `token.revoke` and `token.read` are the fifth and sixth; theirs
+# follows `registry.read`'s.
+GRANT_ONLY_CAPS = frozenset({"machine.verify", "ledger.spend.subscription",
+                             "signal.post_draft", "registry.read",
+                             "token.revoke", "token.read"})
 
 # **`roster.read` GATES `GET /roster`, `GET /profiles` AND `GET /profiles/
 # {project}/{variant}`** (issue_01M19QPV0J72EK1NDB0H8KT5EM), the read
@@ -185,6 +217,58 @@ GRANT_ONLY_CAPS = frozenset({"machine.verify", "ledger.spend.subscription"})
 # ordinary `agent` or `system` credential can read a profile's resolved
 # document set without gaining any ability to change which agents exist or
 # which documents a profile selects.
+
+# **`registry.read` GATES `GET /registry`** (CQ·241, platform/decisions/
+# 0098's 2026-10-25 amendment), the whole project registry as the Chart
+# House holds it — private crews included, because agent-platform needs
+# them to hide those crews from an ordinary caller.
+#
+# **A NEW CAPABILITY RATHER THAN REUSING `roster.read`**, for `roster.
+# read`'s own reasoning above: the rows this route serves live in a
+# different table (`project_registry`, not `roster_agents`/`profiles`),
+# and a capability names the resource it gates rather than borrowing one
+# that happens to be held by the same callers today.
+#
+# **ON NO ROLE SET AT ALL: GRANTED ONLY THROUGH AN ENTRY'S OWN `grants`**,
+# the path `machine.verify` and `ledger.spend.subscription` take
+# (`mint_credential.py --grants registry.read`). The route
+# withholds nothing, so every private crew's slug, repos and kb settings
+# reach whoever holds this. On `agent` or `system` it would reach every role
+# built as a union over them: `customer_reader`, `orchestrator` and
+# `approved_client` (security-reviewer, PR #332, round 1), and every
+# product-scoped token besides, since the route does not scope by product.
+# Only the credentials agent-platform's registry reader runs under need it,
+# so those entries name it.
+#
+# **NOT HUMAN-RESERVED.** The reader that needs it is an agent process,
+# not an act ADR-0038 reserves to a verified human's client.
+
+# **`token.revoke` GATES `POST /tokens/revoke`, AND `token.read` GATES `GET
+# /tokens/{card_id}`** (library/specs/library-card-credential-and-revocation-
+# plan §4). Two capabilities rather than one because ending a card and
+# reading its state are different acts the plan's open points keep apart —
+# the Bosun's E15·4 needs the first to end a run's card and the second to
+# learn why one it didn't end stopped working, and a future caller of
+# either alone must not get the other for free.
+#
+# **ON NO ROLE SET AT ALL — not `agent`, not `system`, not
+# `approved_client`, and never on `library_card` itself**: §3's table is
+# this credential's whole capability set, and it does not include either.
+# A card cannot revoke itself or another card, and handing either
+# capability to every `agent` or `system` credential would let any
+# dispatched coder end another run's card.
+#
+# **GRANTED ONLY THROUGH AN ENTRY'S OWN `grants`** (`mint_credential.py
+# --grants token.revoke,token.read`, `--file agents`), the path
+# `machine.verify` and `ledger.spend.subscription` take above: §4 says both
+# are minted onto the Bosun's service credential when E15·4 needs them, and
+# onto Orient's the same way if a human control is ever built — a
+# deliberate, auditable grant to the few credentials that may end or read
+# back a run's card, not a role every credential of that kind inherits.
+#
+# **NOT HUMAN-RESERVED.** Ending or reading a card is a question the
+# Bosun's own service credential answers, not an act ADR-0038 reserves to a
+# verified human's client.
 
 # **`bundle.issue` AND `bundle.redeem` GATE `POST /bundles` AND `POST
 # /bundles/redeem`** (issue_01M2VCWQXTF5EGHD1X1J3P4RTJ), the individuation
@@ -343,7 +427,61 @@ ROLE_CAPS["customer_reader"] = ROLE_CAPS["agent"] | frozenset({"signal.customer"
 # a copy is a thing that drifts, and every ordinary capability an
 # `orchestrator` credential needs — reading courses, claiming items,
 # spending against a ledger — is exactly what `agent` already grants.
-ROLE_CAPS["orchestrator"] = ROLE_CAPS["agent"] | frozenset({"roster.write"})
+#
+# **`registry.write` JOINS `roster.write` HERE, FOR THE SAME REASON AND ON
+# THE SAME ROLE** (CQ·242, platform/decisions/0098's 2026-10-25 amendment:
+# agent-platform's `crew_registration.register` sends a new crew to the
+# Library instead of writing `config/projects.json` itself). The steward and
+# the cos register crews, and both already authenticate as `orchestrator`
+# for `roster.write`. `registrar` below holds it too, alone, for the one
+# credential agent-platform's own registration presents (CQ·246). Not
+# human-reserved — registering a crew is
+# an act a co's own session takes, not one ADR-0038 reserves to a verified
+# human's client. It must not land on `system` or `agent`, for `roster.
+# write`'s own reason: the github-capture poller resolves to `kind: system`
+# today, and granting it there would hand that poller the ability to add a
+# row to the project registry.
+ROLE_CAPS["orchestrator"] = ROLE_CAPS["agent"] | frozenset(
+    {"roster.write", "registry.write"})
+
+# **A LITERAL ONE-CAPABILITY SET, NOT A UNION** — `registrar` holds
+# `registry.write` and nothing else (CQ·246). It is the credential
+# agent-platform's `agentctl crew register` and `agentctl crew create` present
+# to `POST /registry/crews`, kept apart from agent-platform-token and from the
+# registry reader so a leak of either cannot register a crew, and so the
+# registry's `updated_by` names the registrar. An `orchestrator` narrowed with
+# `withholds` would fail open instead: a capability later added to `agent`
+# would reach it silently.
+#
+# **Not `registry.read`.** The route answers without it, and its refusals
+# were built for a caller that cannot read the registry: a collision names
+# only the caller's own value (`project_registry.register_crew`).
+#
+# **Not on `system` or `agent`**, for the reason the comment above gives. The
+# `grants` refusal in `_entry_capabilities` is unchanged: an entry naming
+# `registry.write` there is still refused for every kind but `orchestrator`,
+# because a `registrar` holds it by role, not by grant.
+ROLE_CAPS["registrar"] = frozenset({"registry.write"})
+
+# **A LITERAL ONE-CAPABILITY SET, NOT A UNION** — `review_record_writer` holds
+# `review_record.create` and nothing else (CQ·237, issue_01M5QE987V342E9NX422BTWW8J).
+# This is the credential the Bosun gives a private dispatch's verdict-only
+# server: a run under ADR-0043's wall has neither the general verdict MCP
+# server nor a `system`-kind token, since `system` also reaches `signal.read`
+# and every other capability that role carries, and a private crew's run must
+# not read back anything through the credential that posts its own stamp.
+#
+# **Not `review_record.read`, deliberately.** The three readers the epic
+# names — the Bosun's own gates, a session starting work, Deck and Orient —
+# are already `agent`- or `system`-kind callers; this role exists only to let
+# a private dispatch WRITE its own verdict-only row, never to read one back.
+#
+# **Scoped to one product the ordinary way, through the token entry's own
+# `products` list** (`identity.in_scope`), not a new mechanism — the write
+# route already resolves `repo_identity` to a product and refuses an
+# out-of-scope caller with a 404, the same check every other credential goes
+# through.
+ROLE_CAPS["review_record_writer"] = frozenset({"review_record.create"})
 
 # **WHICH `kind` VALUES A TOKEN FILE MAY NAME, AND `approved_client` IS NOT ONE
 # OF THEM.** `api-tokens.json` is the Library's own agent/system credential
@@ -357,8 +495,12 @@ ROLE_CAPS["orchestrator"] = ROLE_CAPS["agent"] | frozenset({"roster.write"})
 # way `system` and `customer_reader` are — an entry in that token file —
 # rather than through the separate approved-client file ADR-0038 reserves for
 # a verified human's client. Nothing names it there yet; adding the entry is
-# Bosun-side.
-NAMEABLE_KINDS = frozenset({"system", "customer_reader", "orchestrator"})
+# Bosun-side. `review_record_writer` is nameable the same way, for the Bosun
+# to mint when it dispatches a private crew's review. `registrar` is nameable
+# the same way, for the one credential agent-platform's crew registration
+# presents (CQ·246).
+NAMEABLE_KINDS = frozenset({"system", "customer_reader", "orchestrator",
+                            "review_record_writer", "registrar"})
 assert "approved_client" not in NAMEABLE_KINDS
 
 # EVERYTHING `system` HOLDS, PLUS THE HUMAN-RESERVED CAPABILITIES (ADR-0038).
@@ -379,14 +521,16 @@ assert "approved_client" not in NAMEABLE_KINDS
 HUMAN_RESERVED_CAPS = frozenset(
     {"signal.ack", "policy.write", "ledger.grant", "ledger.void",
      "machine.write", "signing.write", "reference.promote", "person.read",
-     "person.write", "epic.approve", "item.model"})
+     "person.write", "epic.approve", "item.model", "merge.enforcement"})
 ROLE_CAPS["approved_client"] = ROLE_CAPS["system"] | HUMAN_RESERVED_CAPS
 
-# `epic.approve` GATES `POST /items/{item_id}/approve`
-# (issue_01M32CA70BNV0WEW150V3KYBJ9), the only route that sets an item's
-# `maturity` to `approved`. **NAMED FOR THE ACT THE SPECIFICATION NAMES**
-# ("approving an epic"), and the route refuses anything that is not an epic, so
-# `item.approve` would promise a reach the route does not have.
+# `epic.approve` GATES `POST /items/{item_id}/approve`, `/decline` and
+# `/repropose` (issue_01M32CA70BNV0WEW150V3KYBJ9; `/decline` and `/repropose`
+# added by library/decisions/0005). Between them these are the only routes
+# that write `maturity` to `approved`, `declined`, or back to `proposed` from
+# either. **NAMED FOR THE ACT THE SPECIFICATION NAMES** ("approving an
+# epic"), and all three routes refuse anything that is not an epic, so
+# `item.approve` would promise a reach the routes do not have.
 #
 # **DEFINED ON A ROLE AND THEN WITHHELD, because it cannot be entry-only.**
 # `_entry_capabilities` refuses an entry naming a capability no role defines, so
@@ -413,6 +557,23 @@ ROLE_CAPS["approved_client"] = ROLE_CAPS["system"] | HUMAN_RESERVED_CAPS
 # narrowed off one that must not set it by a `withholds` entry, and the
 # capability is the authorization while `acting_human` (`attested_human`) is
 # only the record.
+
+# `merge.enforcement` GATES `PUT /merge/admission/enforcement`, the only
+# route that writes `merge_admission_settings`, AND `GET` OF THE SAME PATH
+# (issue_01M5FM2W1JV82A3XH3P0R5TX8J, CQ·219). **HUMAN-RESERVED FOR THE
+# REASON THE GATE EXISTS**: it decides whether `POST /merge/admission`'s
+# verdict actually gates a merge or only reports what the evaluator found,
+# so a field any agent could write would let an agent turn off the one
+# check standing between it and merging its own work. Like `item.model`, it
+# is held by default by an `approved_client` and narrowed off one that must
+# not set it by a `withholds` entry, and the capability is the
+# authorization while `acting_human` (`attested_human`) is only the
+# record. `merge.admit`, which gates asking the route a question, is never
+# reserved — only turning its answer off or on, and reading who did, is.
+# The `GET` is gated on the SAME capability rather than left open the way
+# `/whoami` is: `/health` already shows everything but `acting_human` to
+# any caller, credential or none, so the one thing the `GET` adds over
+# `/health` is exactly the fact this capability exists to reserve.
 
 # `person.read` GATES `GET /people/{person_id}/projects`
 # (issue_01M2RSE08WRRB1RJY1ZCSMD6EG). Named explicitly here rather than
@@ -754,6 +915,11 @@ def _entry_capabilities(meta: dict, kind: str, label: str
     ability to change which agents exist, the exact reach the comment on
     `ROLE_CAPS["orchestrator"]` keeps off `system`. `withholds` is unaffected:
     narrowing a kind that never holds it is a no-op there.
+
+    `registry.write` is refused in `grants` for any `kind` but `orchestrator`
+    for the identical reason (`ROLE_CAPS["orchestrator"]`'s own comment,
+    CQ·242): the github-capture poller must not gain the ability to add a
+    row to the project registry by an entry naming the capability directly.
     """
     known = _known_capabilities()
     out = []
@@ -771,10 +937,11 @@ def _entry_capabilities(meta: dict, kind: str, label: str
             if kind != "approved_client" and cap in HUMAN_RESERVED_CAPS:
                 raise _BadEntry(f"entry {label}: kind {kind!r} may not name "
                                 f"human-reserved capability {cap!r}")
-            if (field_name == "grants" and cap == "roster.write"
+            if (field_name == "grants" and cap in ("roster.write", "registry.write")
                     and kind != "orchestrator"):
                 raise _BadEntry(f"entry {label}: kind {kind!r} may not name "
-                                f"orchestrator-only capability {cap!r}")
+                                f"role-only capability {cap!r}; only an orchestrator "
+                                f"may name it in grants")
         out.append(frozenset(raw))
     return out[0], out[1]
 

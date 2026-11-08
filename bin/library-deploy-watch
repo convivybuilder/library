@@ -40,9 +40,13 @@ suppression and tries again on its own, with no action needed to "reset" it.
 
 **Posts with a dedicated credential, `~/.library/deploy-watch-token`**,
 minted the same way `~/.library/ci-fetch-token` was —
-`mint_credential.py --file agents --name library_deploy_watch --out
-~/.library/deploy-watch-token` — an `agent`-role credential, which already
-holds `signal.create` (identity.py's `ROLE_CAPS`). The POST and 429-retry
+`mint_credential.py --file agents --name library_deploy_watch --tokens-file
+<the file the Library job's LIBRARY_API_TOKENS names> --out
+~/.library/deploy-watch-token` — naming the tokens file explicitly rather
+than relying on a shell that happens to have `LIBRARY_API_TOKENS` exported;
+minting into the wrong file reports success while the running Library never
+reads it (CQ·244). An `agent`-role credential, which already holds
+`signal.create` (identity.py's `ROLE_CAPS`). The POST and 429-retry
 handling below are a deliberate copy of the retired `bin/ci_result_fetch.py`'s own
 `post_signal`/`_retry_after_seconds`, not a shared import: that file's own
 module docstring gives the reason for duplicating `install-library`'s
@@ -90,7 +94,7 @@ SOURCE = "library-deploy-watch"
 KIND = "deploy_failure"
 PRODUCT = "library"
 
-# `bin/library-install` builds a fresh venv from requirements.txt on an
+# `bin/library-install` builds a fresh venv from requirements.lock on an
 # ordinary run and may also back up and migrate the vault — matching
 # convivy-orient/deploy_watch.py's own INSTALL_TIMEOUT_S and its reasoning:
 # nothing here touches the network beyond pip's index, but a cold pip cache

@@ -51,10 +51,12 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import os
 import sqlite3
 import sys
 
 import store
+import store_owner
 import vectors
 
 # **UNMEASURED — see archives-cold-tier.md's "Guesses and things not yet
@@ -354,7 +356,19 @@ def main(argv=None) -> int:
     parser.add_argument("--restore", action="store_true",
                         help="move every cold row back to hot, reversing "
                              "every pass this has ever made")
+    raw_args = sys.argv[1:] if argv is None else list(argv)
     args = parser.parse_args(argv)
+    # Runs this pass as LIBRARY_DB's own owner when that differs from the
+    # invoking user (company/decisions/0025 point 5) — a no-op on the
+    # single-account install, where it always already is.
+    try:
+        switched = store_owner.reexec_as_db_owner(
+            store.DB_PATH, os.path.abspath(__file__), raw_args)
+    except store_owner.OwnerSwitchRefused as ex:
+        print(f"cold_tier: {ex}", file=sys.stderr)
+        return 1
+    if switched is not None:
+        return switched
     return run(dry_run=args.dry_run, do_restore=args.restore)
 
 

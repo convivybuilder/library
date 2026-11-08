@@ -47,26 +47,14 @@ import projects
 # Library's own file and Orient has stopped writing to it.
 WRITES_ENABLED = os.environ.get("LIBRARY_WRITES_ENABLED") == "1"
 
-# **UNSET APPROVES EVERYTHING, and that is the point of the switch rather than
-# a gap in it** (`issue_01M0EQTMZMAB93V9FFP4AD52JK`). `POST /merge/admission`
-# answers the same shape either way — `{approved, reason}` — so flipping this
-# is a Library-only deploy change the Bosun never has to coordinate with: a
-# stub that always approves is indistinguishable from a real gate to anyone
-# downstream, which is what lets it turn real on its own schedule instead of
-# on the day the Bosun ships its half.
-#
-# Set, real evaluation would run — and none is built yet, so that branch
-# answers an honest refusal (`approved: false`, naming that enforcement is
-# configured but no evaluator exists) rather than keep approving under a flag
-# that claims to be a gate.
-#
-# **DO NOT MAKE THIS DEFAULT TO ENFORCED.** The epic's thread is explicit that
-# the default flips to enforced-by-default in the SAME change that builds the
-# real evaluator, not as a follow-up — flip it here today and every merge
-# refuses with "no evaluator is built" the moment this deploys, for a gate
-# nothing yet implements.
-MERGE_ADMISSION_ENFORCED = os.environ.get(
-    "LIBRARY_MERGE_ADMISSION_ENFORCED") == "1"
+# **MERGE-ADMISSION ENFORCEMENT IS NOW A VAULT SETTING, NOT AN ENVIRONMENT
+# FLAG** (CQ·219, issue_01M5FM2W1JV82A3XH3P0R5TX8J). `LIBRARY_MERGE_ADMISSION_
+# ENFORCED` governed the stub `POST /merge/admission` gave before the real
+# evaluator (`merge_admission.py`, CQ·218) existed; now that it does, turning
+# enforcement off is itself an operator write worth a record — an append-only
+# row in `merge_admission_settings`, not a deploy-time variable nobody can see
+# from `/health`. See `merge_admission_enforced` below for the table this
+# reads and why an empty table enforces.
 
 # Where Orient's control database lives when nothing says otherwise. A reader may
 # fall back to it — during the shadow this service reads Orient's file on purpose
@@ -724,6 +712,91 @@ def cold_db_available() -> tuple[bool, str]:
     return True, "ready"
 
 
+# --- merge-admission enforcement (CQ·219, issue_01M5FM2W1JV82A3XH3P0R5TX8J) ---
+#
+# `merge_admission_settings` is append-only: every write is a new row, never
+# an update, so the table is its own audit trail and the current state is
+# just the newest row — the same shape `tool_policy_events` keeps beside the
+# current-state `tool_policy` table, collapsed here into one table because
+# there is no separate "current state" row to keep in sync with it.
+
+
+def latest_merge_admission_setting(conn: sqlite3.Connection) -> sqlite3.Row | None:
+    """The newest row in `merge_admission_settings`, or `None` when the table
+    holds none yet. Ordered by `id` rather than `set_at`, which is wall-clock
+    and could tie between two writes in the same millisecond; `id` cannot."""
+    return conn.execute(
+        "SELECT * FROM merge_admission_settings ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+
+
+def merge_admission_enforced(conn: sqlite3.Connection) -> bool:
+    """Whether `POST /merge/admission` enforces the evaluator's verdict right
+    now: the newest row's `enforced`, or `True` when the table holds no row
+    at all. **ENFORCED BY DEFAULT** — CQ·219 flips the stub's old
+    unset-approves-everything default in the same change that wires the real
+    evaluator in, matching the epic's own rule that the two land together."""
+    row = latest_merge_admission_setting(conn)
+    return True if row is None else bool(row["enforced"])
+
+
+def set_merge_admission_enforcement(*, actor: str, enforced: bool,
+                                    acting_human: str, reason: str | None) -> dict:
+    """Append a row recording a flip of the enforcement switch, and return
+    it. Never updates or deletes a row — the newest one simply becomes what
+    `merge_admission_enforced` and `/health` read back."""
+    conn = connect_rw()
+    try:
+        now_iso = _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None).isoformat(" ")
+        cur = conn.execute(
+            "INSERT INTO merge_admission_settings "
+            "(enforced, set_by_client, acting_human, reason, set_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (1 if enforced else 0, actor, acting_human, reason, now_iso))
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM merge_admission_settings WHERE id = ?",
+            (cur.lastrowid,)).fetchone()
+        return dict(row)
+    finally:
+        conn.close()
+
+
+MERGE_ADMISSION_DEFAULT_HEALTH = {"enforced": True, "changed_at": None,
+                                  "changed_by_client": None, "reason": None}
+
+
+def merge_admission_boot_state() -> tuple[dict, str]:
+    """`(health, line)` for `app.lifespan`'s own startup — `health` is the
+    `/health` cache seed `app.py` keeps in memory from here on (never
+    recomputed on a caller's request, `_readiness_cache`'s own reasoning),
+    and `line` is the startup diagnostic, which distinguishes an empty
+    table (`ENFORCED (default...)`) from one that could not be read at all
+    (`UNREADABLE`) — a distinction `health` alone cannot make, since both
+    fail to the same enforced-by-default dict.
+
+    **One read, not two** — `cold_db_available`'s own shape: a read failure
+    must not crash the lifespan handler this runs inside, so it is
+    reported rather than raised, and the one open serves both return
+    values."""
+    try:
+        conn = connect()
+        try:
+            row = latest_merge_admission_setting(conn)
+        finally:
+            conn.close()
+    except Exception as exc:  # noqa: BLE001 — a startup line must not crash the process
+        return dict(MERGE_ADMISSION_DEFAULT_HEALTH), f"UNREADABLE — {type(exc).__name__}: {exc}"
+    if row is None:
+        return (dict(MERGE_ADMISSION_DEFAULT_HEALTH),
+                "ENFORCED (default — merge_admission_settings is empty)")
+    health = {"enforced": bool(row["enforced"]), "changed_at": row["set_at"],
+             "changed_by_client": row["set_by_client"], "reason": row["reason"]}
+    line = ("ENFORCED" if row["enforced"] else
+           f"NOT enforced (set by {row['set_by_client']} at {row['set_at']})")
+    return health, line
+
+
 def cold_signal_by_id(signal_id: str) -> sqlite3.Row | None:
     """One signal row from the cold tier, or None, on its OWN read-only
     connection with `cold` attached `mode=ro` — never on a write handle.
@@ -1041,23 +1114,30 @@ ITEM_TYPE_EPIC = "epic"
 # value this vocabulary still holds. A non-epic row stores `type = NULL`.
 ITEM_TYPES = frozenset({ITEM_TYPE_EPIC})
 
-# The maturity ladder (ADR-0024). `approved` is the bucket that becomes the build
-# queue, which is why moving an item into it is worth an operator's attention.
+# The maturity ladder (ADR-0024, library/decisions/0005). `approved` is the
+# bucket that becomes the build queue, which is why moving an item into it is
+# worth an operator's attention. `built` and `superseded` are GONE
+# (library/decisions/0005): an epic is proposed, approved or declined, and
+# only an approved epic has a Course `epic_state` — there is no fourth
+# terminal bucket for "the build happened" distinct from the epic's own
+# `state` reaching `fixed`.
 #
-# **THE LADDER ITSELF NAMES NO CAPABILITY — the gate lives at the one route that
-# may set `approved`.** The operator settled it on 2026-08-18 that the Library authorizes
-# and records, with a restriction on WHO may approve applied outside if one were
-# ever wanted; `epic.approve` (issue_01M32CA70BNV0WEW150V3KYBJ9) is that
-# restriction, and it sits on `POST /items/{item_id}/approve`, not on this
+# **THE LADDER ITSELF NAMES NO CAPABILITY — the gate lives at the routes that
+# may set `approved` or `declined`.** The operator settled it on 2026-08-18
+# that the Library authorizes and records, with a restriction on WHO may
+# decide applied outside if one were ever wanted; `epic.approve`
+# (issue_01M32CA70BNV0WEW150V3KYBJ9) is that restriction, and it sits on
+# `POST /items/{item_id}/approve`, `/decline` and `/repropose`, not on this
 # constant or on `_approval_invariant`, which still checks nothing about the
-# caller. `/correct` and `/revision` refuse a request naming `maturity` outright
-# rather than checking a capability on it, so there is still no `decide`-shaped
-# capability anywhere in `ROLE_CAPS` gating this value — only a route that is
-# the sole writer of `approved`.
+# caller. `/correct` and `/revision` refuse a request naming `maturity`
+# outright rather than checking a capability on it, so there is still no
+# `decide`-shaped capability anywhere in `ROLE_CAPS` gating this value — only
+# the three routes that write it.
 ITEM_MATURITY_PROPOSED = "proposed"
 ITEM_MATURITY_APPROVED = "approved"
-ITEM_MATURITIES = (ITEM_MATURITY_PROPOSED, ITEM_MATURITY_APPROVED, "built",
-                   "superseded")
+ITEM_MATURITY_DECLINED = "declined"
+ITEM_MATURITIES = (ITEM_MATURITY_PROPOSED, ITEM_MATURITY_APPROVED,
+                   ITEM_MATURITY_DECLINED)
 ITEM_MATURITY_SET = frozenset(ITEM_MATURITIES)
 ITEM_SEVERITIES = frozenset({"high", "medium", "low"})
 ITEM_NEEDS = frozenset({"agent", "operator", "either"})
@@ -1170,7 +1250,7 @@ ITEM_INSERT_COLUMNS = ("id", "product", "title", "body", "refs", "severity",
                        "state", "type", "created_by", "created_by_kind",
                        "needs", "parent_id", "found_during", "topics",
                        "prerequisites", "once_key", "item_key",
-                       "short_description")
+                       "short_description", "maturity")
 
 # **THE SHORT, STABLE KEY A PERSON TYPES** (issue_01M2P5CBY5JY8SK5W344CV82AE)
 # — `E9` for an epic, `E9·4` for a sub-item of it, `CQ·63` for a correction (an
@@ -1327,10 +1407,10 @@ POLICY_DENY = "deny"
 POLICY_DECISIONS = frozenset({POLICY_ALLOW, POLICY_DENY})
 
 # A Reference Room document's checkout (`issue_01M0DVAH9KAACHH0RRWQZ3KZTE`).
-# `doc_id` is a KB document id from the knowledge index — `platform/decisions/
-# 0047-a-reviewers-suite-scope-caps-at-the-foreground-ceiling-and-vivy-is-the-
-# first-repo-across-it` is a real one at 115 characters — so the bound is
-# generous rather than `MAX_IDENT`'s short-slug size, matching `MAX_TITLE`.
+# `doc_id` is a KB document id from the knowledge index — a decision's slug
+# can run well past 100 characters (platform decision 0047's id is 115) — so
+# the bound is generous rather than `MAX_IDENT`'s short-slug size, matching
+# `MAX_TITLE`.
 MAX_DOC_ID = MAX_TITLE
 
 # **THE CLASSES THAT SUPPLY A DEFAULT WHEN NO EXPLICIT ROW EXISTS** (ADR-0048).
@@ -1423,7 +1503,8 @@ def insert_item(row: dict, can_return_existing, claim_for,
                 return 200, {**item_dict(
                                  existing, claim=claim_for(conn, existing),
                                  prerequisites=prerequisite_status(
-                                     conn, existing, in_scope=in_scope)),
+                                     conn, existing, in_scope=in_scope),
+                                 epic_state=epic_state_of(conn, existing)),
                              "idempotent": True}
         # **FROM HERE, THE WRITE LOCK IS HELD FOR THE WHOLE TRANSACTION.**
         # `mint_item_key` reads and advances a counter row — a check-then-act
@@ -1438,6 +1519,11 @@ def insert_item(row: dict, can_return_existing, claim_for,
         # Optional item content: `POST /items` always passes it, the direct
         # callers in `test_alembic_baseline.py` do not, and absent means NULL.
         values.setdefault("short_description", None)
+        # Same reasoning, for `maturity` (library/decisions/0005): `POST
+        # /items` sets it explicitly (`proposed` for an epic, `None`
+        # otherwise), and a direct caller that predates the field gets a
+        # non-epic row's ordinary value rather than a KeyError.
+        values.setdefault("maturity", None)
         # **A NON-EPIC WITH NO PARENT GETS ITS PRODUCT'S CORRECTIONS QUEUE,
         # NEVER A BARE NULL** (`library/specs/one-home-per-work-item`, PR 2).
         # `mint_item_key` would mint the same `CQ·n` either way — its own
@@ -1474,7 +1560,8 @@ def insert_item(row: dict, can_return_existing, claim_for,
                 return 200, {**item_dict(
                                  existing, claim=claim_for(conn, existing),
                                  prerequisites=prerequisite_status(
-                                     conn, existing, in_scope=in_scope)),
+                                     conn, existing, in_scope=in_scope),
+                                 epic_state=epic_state_of(conn, existing)),
                              "idempotent": True}
             if existing is None:
                 # THE CONFLICT WAS NOT A `once_key` COLLISION. Something else
@@ -1489,7 +1576,8 @@ def insert_item(row: dict, can_return_existing, claim_for,
                               (row["id"],)).fetchone()
         return 201, item_dict(
             stored, claim=claim_for(conn, stored),
-            prerequisites=prerequisite_status(conn, stored, in_scope=in_scope))
+            prerequisites=prerequisite_status(conn, stored, in_scope=in_scope),
+            epic_state=epic_state_of(conn, stored))
     finally:
         conn.close()
 
@@ -2804,28 +2892,115 @@ def unmet_prerequisite_count(conn, row: sqlite3.Row) -> int:
 # `pr_url` names a pull request on this org's own GitHub, never another
 # org's — `/link-pr` accepts any string a caller sends, so `_pr_repo` is the
 # one place that decides whether a `pr_url` is trusted enough to name a repo.
-# Pinned to the org every repo in this codebase actually lives under
-# (`convivy/library`, `convivy/vivy`, `convivy/constance`,
-# `convivy/agent-platform`); a URL naming any other host or org derives no
-# `pr_repo` at all, rather than one a caller could spoof by linking a PR on a
-# lookalike repository.
+# Pinned to the owner the project registry names for the `library` project
+# (`projects.repo_owner`, the same resolver `ci_tracked.deck_tracked_repos`
+# uses): a URL naming any other host or owner derives no `pr_repo` at all,
+# rather than one a caller could spoof by linking a PR on a lookalike
+# repository. With no owner in the registry — unreadable, or the `library`
+# entry absent or naming none — no URL derives a `pr_repo`; there is no
+# literal to fall back to.
 #
-# Matches `agent-platform`'s `bin/issue-pr-reconcile` (`_PR_URL_RE`) exactly,
-# end-anchor and repo-name class both — keep the two in step.
-_PR_REPO_RE = re.compile(
-    r"^https://github\.com/(convivy/[A-Za-z0-9][A-Za-z0-9._-]*)/pull/(\d+)/?$")
+# Diverges from agent-platform's `bin/issue-pr-reconcile` (`_PR_URL_RE`),
+# which still pins to the literal `convivy` until that crew reads its own
+# owner from the registry too.
+def _pr_repo_pattern() -> re.Pattern | None:
+    """The compiled pattern for the current registry read, or `None` when it
+    names no owner to pin to."""
+    owner = projects.repo_owner(projects.projects().get("library") or {}, "library")
+    if owner is None:
+        return None
+    return re.compile(
+        rf"^https://github\.com/({re.escape(owner)}/[A-Za-z0-9][A-Za-z0-9._-]*)/pull/(\d+)/?$")
 
 
 def _pr_repo(pr_url) -> str | None:
-    """`pr_url`'s repo, as `convivy/<name>`, or `None` when `pr_url` is absent
-    or does not name a pull request on this org's GitHub."""
+    """`pr_url`'s repo, as `<owner>/<name>`, or `None` when `pr_url` is
+    absent, the registry names no owner, or `pr_url` does not name a pull
+    request on that owner's GitHub."""
     if not isinstance(pr_url, str):
         return None
-    m = _PR_REPO_RE.match(pr_url.strip())
+    pattern = _pr_repo_pattern()
+    if pattern is None:
+        return None
+    m = pattern.match(pr_url.strip())
     return m.group(1) if m else None
 
 
-def item_dict(row: sqlite3.Row, *, claim, prerequisites) -> dict:
+# `epic_state` (library/decisions/0005): a read-time computation over an
+# approved epic's own `state` and its children's, the same "derived, not
+# stored" shape `ITEM_STATE_CLAIMABLE` and `epic_progress` already use for
+# this table. `None` on every row that is not an approved epic — a work item
+# answers no question `epic_state` asks, and a proposed or declined epic has
+# no Course position for the value to describe.
+EPIC_STATE_NOT_STARTED = "not_started"
+EPIC_STATE_IN_PROGRESS = "in_progress"
+EPIC_STATE_COMPLETED = "completed"
+EPIC_STATE_CANCELED = "canceled"
+EPIC_STATES = frozenset({EPIC_STATE_NOT_STARTED, EPIC_STATE_IN_PROGRESS,
+                         EPIC_STATE_COMPLETED, EPIC_STATE_CANCELED})
+
+# A child "has started" once it is claimed, pr-open, or already fixed —
+# `library/decisions/0005`'s own wording. An epic resolved `fixed` is itself
+# `completed`; resolved any other way (`wontfix`, `duplicate`, `redirected`)
+# it is `canceled` — both read from the epic's own `state`, independent of
+# its children, the same split `epic_progress`'s `reached` already draws.
+_EPIC_CHILD_STARTED_STATES = (ITEM_STATE_CLAIMED, ITEM_STATE_PR_OPEN, "fixed")
+
+
+def epic_state_of(conn, row) -> str | None:
+    """`epic_state` for one row — see the module note above for the table.
+
+    One query, over `parent_id = row["id"]` with no scope clause: unlike a
+    listing's child count, this discloses no row's existence, only whether
+    at least one child (which the invariant already same-products with its
+    epic) has started — the same "safe because every edge is same-product"
+    argument `_do_correct`'s descendant count makes for itself.
+    """
+    if row["type"] != ITEM_TYPE_EPIC or row["maturity"] != ITEM_MATURITY_APPROVED:
+        return None
+    if row["state"] == "fixed":
+        return EPIC_STATE_COMPLETED
+    if row["state"] in ITEM_TERMINAL:
+        return EPIC_STATE_CANCELED
+    started = conn.execute(
+        f"SELECT 1 FROM issue_items WHERE parent_id = ? AND state IN "
+        f"({','.join('?' * len(_EPIC_CHILD_STARTED_STATES))}) LIMIT 1",
+        (row["id"], *_EPIC_CHILD_STARTED_STATES)).fetchone()
+    return EPIC_STATE_IN_PROGRESS if started else EPIC_STATE_NOT_STARTED
+
+
+def epic_states_of(conn, rows) -> dict:
+    """`{item_id: epic_state}` for a whole page, in one query for every
+    active approved epic rather than one per row — the same N+1
+    `claim_statuses` and `prerequisite_statuses` already exist to prevent."""
+    out = {r["id"]: None for r in rows}
+    epics = [r for r in rows if r["type"] == ITEM_TYPE_EPIC
+            and r["maturity"] == ITEM_MATURITY_APPROVED]
+    if not epics:
+        return out
+    active = []
+    for r in epics:
+        if r["state"] == "fixed":
+            out[r["id"]] = EPIC_STATE_COMPLETED
+        elif r["state"] in ITEM_TERMINAL:
+            out[r["id"]] = EPIC_STATE_CANCELED
+        else:
+            active.append(r)
+    if active:
+        ids = [r["id"] for r in active]
+        id_marks = ",".join("?" * len(ids))
+        state_marks = ",".join("?" * len(_EPIC_CHILD_STARTED_STATES))
+        started = {r["parent_id"] for r in conn.execute(
+            f"SELECT DISTINCT parent_id FROM issue_items WHERE parent_id IN "
+            f"({id_marks}) AND state IN ({state_marks})",
+            [*ids, *_EPIC_CHILD_STARTED_STATES])}
+        for r in active:
+            out[r["id"]] = (EPIC_STATE_IN_PROGRESS if r["id"] in started
+                            else EPIC_STATE_NOT_STARTED)
+    return out
+
+
+def item_dict(row: sqlite3.Row, *, claim, prerequisites, epic_state) -> dict:
     """One work item in protocol shape.
 
     `once_key` and `embedded_at` are omitted on purpose. The first is an
@@ -2841,6 +3016,11 @@ def item_dict(row: sqlite3.Row, *, claim, prerequisites) -> dict:
     `park_reason` without `parked_at`, `resolution` without `resolved_by`. Each
     read as an oversight rather than a decision because the other half was already
     there, and a client migrating off Orient would have lost them silently.
+
+    **`epic_state` IS PASSED IN FOR THE SAME REASON `claim` IS** — `epic_state_of`
+    / `epic_states_of` need a connection to query an epic's children, which this
+    function does not take, so the caller resolves it the same way it already
+    resolves `claim` and `prerequisites` and hands the answer down.
 
     **`claim` IS PASSED IN RATHER THAN LOOKED UP**, because it comes from the
     lease covering this item, which is a second row. A serialiser that fetched it
@@ -2898,6 +3078,9 @@ def item_dict(row: sqlite3.Row, *, claim, prerequisites) -> dict:
         "severity": row["severity"],
         "needs": row["needs"],
         "maturity": row["maturity"],
+        # Additive (library/decisions/0005, Library-Protocol stays version 1):
+        # `None` unless this row is an approved epic — see `epic_state_of`.
+        "epic_state": epic_state,
         "parent_id": row["parent_id"],
         # The epic whose work turned this item up, or None — a fact distinct
         # from `parent_id` (ADR-0023's nesting) and from `blocked`'s
@@ -2911,6 +3094,10 @@ def item_dict(row: sqlite3.Row, *, claim, prerequisites) -> dict:
         "pr": refs_obj.get("pr"),
         "pr_url": pr_url,
         "pr_repo": _pr_repo(pr_url),
+        # Additive (Library-Protocol stays version 1): the create-time url a
+        # filer gave as source context, distinct from `pr_url`, which only
+        # `/link-pr` sets (CQ·248). `None` when absent.
+        "source_url": refs_obj.get("source_url"),
         "specification": row["specification"],
         "definition_of_done": row["definition_of_done"],
         "resolution": row["resolution"],
@@ -3060,7 +3247,7 @@ def signal_dict(row: sqlite3.Row, *, reveal_human: bool = False) -> dict:
 REVIEW_RECORD_COLUMNS = ("id", "repo_identity", "product", "pr", "reviewed_ref",
                         "role", "run_id", "identity_key", "verdict", "findings",
                         "prose", "paths", "doc_ids", "item_ids", "auth",
-                        "auth_reason", "content_sha", "version",
+                        "auth_reason", "verdict_bound", "content_sha", "version",
                         "source_comment_id", "signal_id", "created_at",
                         "updated_at")
 
@@ -3149,6 +3336,7 @@ def review_record_dict(row: sqlite3.Row) -> dict:
         "item_ids": _json_or(row["item_ids"], []),
         "auth": row["auth"],
         "auth_reason": row["auth_reason"],
+        "verdict_bound": bool(row["verdict_bound"]),
         "content_sha": row["content_sha"],
         "version": row["version"],
         "source_comment_id": row["source_comment_id"],
@@ -3180,6 +3368,7 @@ def review_record_version_dict(row: sqlite3.Row) -> dict:
         "item_ids": _json_or(row["item_ids"], []),
         "auth": row["auth"],
         "auth_reason": row["auth_reason"],
+        "verdict_bound": bool(row["verdict_bound"]),
         "content_sha": row["content_sha"],
         "run_id": row["run_id"],
         "source_comment_id": row["source_comment_id"],
@@ -3248,6 +3437,52 @@ def _review_record_is_downgrade(existing: sqlite3.Row | None, row: dict) -> bool
             and row["auth"] == REVIEW_AUTH_UNVERIFIED)
 
 
+class ReviewRecordVerdictBound(RuntimeError):
+    """Raised by `write_review_record` instead of superseding a
+    verdict-bound, run-verified record with a write naming a different
+    `verdict`, on the same uniqueness key (library CQ·217,
+    issue_01M5FM2A102PKMQVKFE7HM30F0).
+
+    `_review_record_auth` binds a run-verified record's verdict to what the
+    run register attests the run itself posted — but that attestation
+    (`posted_verdict`/`posted_pr` in the run's own `meta.json`) is
+    self-reported, writable by whatever account runs the reviewed code. A
+    process with that access could rewrite it to match a forged post, which
+    would make the forged write compute `run-verified` too, and
+    `_review_record_is_downgrade` above only catches a write that computes
+    `unverified`. This guard fires on the verdict alone, independent of
+    what the new write's own `auth` is: once a key's verdict is bound, no
+    later write on that key may carry a different one.
+
+    Carries the still-current record, in `review_record_dict` shape, as
+    `existing`, the same way `ReviewRecordWouldDowngrade` does.
+    """
+    def __init__(self, existing: dict):
+        self.existing = existing
+        super().__init__(
+            f"existing {existing['role']} record for {existing['repo_identity']} "
+            f"at {existing['reviewed_ref']} has a verdict bound to its run "
+            f"(verdict {existing['verdict']}); a write naming a different "
+            f"verdict may not supersede it")
+
+
+def _review_record_would_flip_bound_verdict(existing: sqlite3.Row | None,
+                                            row: dict) -> bool:
+    """True when `existing` is a verdict-bound, run-verified record and
+    `row` names a different `verdict` on the same key — the pairing
+    `write_review_record` refuses outright regardless of what `row`'s own
+    computed `auth` is. See `ReviewRecordVerdictBound`.
+
+    Checked independently of, and in addition to, `_review_record_is_downgrade`:
+    that function only looks at `auth`, so a write a same-account process
+    forged to also compute `run-verified` would pass it, but not this.
+    """
+    return (existing is not None
+            and existing["auth"] == REVIEW_AUTH_RUN_VERIFIED
+            and bool(existing["verdict_bound"])
+            and row["verdict"] != existing["verdict"])
+
+
 def _review_record_identity_key(run_id: str | None, content_sha: str) -> str:
     """The dispatch run's id when the review carries one, else
     `content:<content_sha>` — see the migration's docstring for why a
@@ -3275,27 +3510,27 @@ def _supersede_review_record(conn, existing: sqlite3.Row, row: dict,
     conn.execute(
         "INSERT INTO review_record_versions "
         "(record_id, version, product, pr, verdict, findings, prose, paths, "
-        " doc_ids, item_ids, auth, auth_reason, content_sha, run_id, "
-        " source_comment_id, signal_id, written_at) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        " doc_ids, item_ids, auth, auth_reason, verdict_bound, content_sha, "
+        " run_id, source_comment_id, signal_id, written_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (existing["id"], existing["version"], existing["product"],
          existing["pr"], existing["verdict"], existing["findings"],
          existing["prose"], existing["paths"], existing["doc_ids"],
          existing["item_ids"], existing["auth"], existing["auth_reason"],
-         existing["content_sha"], existing["run_id"],
+         existing["verdict_bound"], existing["content_sha"], existing["run_id"],
          existing["source_comment_id"], existing["signal_id"],
          existing["updated_at"]))
     conn.execute(
         "UPDATE review_records SET verdict = ?, findings = ?, prose = ?, "
         "paths = ?, doc_ids = ?, item_ids = ?, auth = ?, auth_reason = ?, "
-        "content_sha = ?, run_id = ?, pr = ?, product = ?, "
+        "verdict_bound = ?, content_sha = ?, run_id = ?, pr = ?, product = ?, "
         "source_comment_id = ?, signal_id = NULL, version = version + 1, "
         "updated_at = ? WHERE id = ?",
         (row["verdict"], json.dumps(row["findings"]), row["prose"],
          json.dumps(row["paths"]), json.dumps(row["doc_ids"]),
          json.dumps(row["item_ids"]), row["auth"], row["auth_reason"],
-         content_sha, row["run_id"], row["pr"], row["product"],
-         row["source_comment_id"], now_iso, existing["id"]))
+         row["verdict_bound"], content_sha, row["run_id"], row["pr"],
+         row["product"], row["source_comment_id"], now_iso, existing["id"]))
     return conn.execute("SELECT * FROM review_records WHERE id = ?",
                         (existing["id"],)).fetchone()
 
@@ -3412,6 +3647,16 @@ def write_review_record(row: dict, *, at: str | None = None,
     `REVIEW_OUTCOME_LEFT_VERIFIED` for that same pairing before this one is
     reached. `POST /review-records` is the only route-reachable caller this
     can raise for.
+
+    **Also checked against the same fresh read, independent of `auth`
+    entirely: when `existing` is a verdict-bound, run-verified record and
+    `row` names a different `verdict`, roll back and raise
+    `ReviewRecordVerdictBound`** (`_review_record_would_flip_bound_verdict`,
+    library CQ·217, issue_01M5FM2A102PKMQVKFE7HM30F0) — storing nothing. A
+    verdict bound to its run does not move on that key again, whatever
+    `auth` the new write itself computed to; see that exception's docstring
+    for why `_review_record_is_downgrade` alone (which looks at `auth`, not
+    `verdict`) is not enough.
     """
     content_sha = review_content_sha(
         row["verdict"], row["findings"], row["prose"], row["paths"],
@@ -3433,6 +3678,9 @@ def write_review_record(row: dict, *, at: str | None = None,
         if _review_record_is_downgrade(existing, row):
             conn.rollback()
             raise ReviewRecordWouldDowngrade(review_record_dict(existing))
+        if _review_record_would_flip_bound_verdict(existing, row):
+            conn.rollback()
+            raise ReviewRecordVerdictBound(review_record_dict(existing))
         now_iso = at if at is not None else _dt.datetime.now(
             _dt.timezone.utc).replace(tzinfo=None).isoformat(" ")
         if existing is not None:
@@ -3449,15 +3697,16 @@ def write_review_record(row: dict, *, at: str | None = None,
                 "INSERT INTO review_records "
                 "(id, repo_identity, product, pr, reviewed_ref, role, run_id, "
                 " identity_key, verdict, findings, prose, paths, doc_ids, "
-                " item_ids, auth, auth_reason, content_sha, version, "
-                " source_comment_id, signal_id, created_at, updated_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,NULL,?,?)",
+                " item_ids, auth, auth_reason, verdict_bound, content_sha, "
+                " version, source_comment_id, signal_id, created_at, updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,NULL,?,?)",
                 (record_id, row["repo_identity"], row["product"], row["pr"],
                  row["reviewed_ref"], row["role"], row["run_id"], identity_key,
                  row["verdict"], json.dumps(row["findings"]), row["prose"],
                  json.dumps(row["paths"]), json.dumps(row["doc_ids"]),
                  json.dumps(row["item_ids"]), row["auth"], row["auth_reason"],
-                 content_sha, row["source_comment_id"], now_iso, now_iso))
+                 row["verdict_bound"], content_sha, row["source_comment_id"],
+                 now_iso, now_iso))
         except sqlite3.IntegrityError:
             conn.rollback()
             conn.execute("BEGIN IMMEDIATE")
@@ -3479,6 +3728,9 @@ def write_review_record(row: dict, *, at: str | None = None,
             if _review_record_is_downgrade(existing, row):
                 conn.rollback()
                 raise ReviewRecordWouldDowngrade(review_record_dict(existing))
+            if _review_record_would_flip_bound_verdict(existing, row):
+                conn.rollback()
+                raise ReviewRecordVerdictBound(review_record_dict(existing))
             if existing["content_sha"] == content_sha:
                 conn.rollback()
                 return 200, REVIEW_OUTCOME_UNCHANGED, review_record_dict(existing)
@@ -3549,16 +3801,28 @@ LEDGER_STATES = frozenset({"live", "closed"})
 LEDGER_SOURCES = frozenset({"agentctl", "app"})
 
 # Which kind of spend an entry is. `gateway` is metered provider spend —
-# money a budget can be enforced against. `subscription` is subscription
-# usage billed flat, so its dollar figure is an estimate rather than a
-# metered fact — it may inform a human, and nothing here lets it move a
-# number admission control refuses on (issue_01M35QG5NA13JE8FQVM9XET4HD).
+# money a budget can be enforced against. `subscription` and
+# `openai-subscription` are each a subscription billed flat, so their dollar
+# figures are estimates rather than a metered fact — they may inform a
+# human, and nothing here lets either move a number admission control
+# refuses on (issue_01M35QG5NA13JE8FQVM9XET4HD, issue_01M58502RQC0XDAC1D704XQW5B).
 #
 # **OPTIONAL, NOT YET REQUIRED.** This is the first of two contract steps:
 # the Library accepts `lane` and stores it when given, and an entry with no
 # `lane` is still recorded, same as before this column existed. Refusing a
 # write with no `lane` is the second step, made once `agentctl` sends one.
-LEDGER_LANES = frozenset({"gateway", "subscription"})
+LEDGER_LANES = frozenset({"gateway", "subscription", "openai-subscription"})
+
+# Which lanes above are never enforceable: never counted in `ledger_days`,
+# `ledger_total`'s figure or any warn, refuse or per-run cap. `subscription`
+# and `openai-subscription` are kept as two lanes rather than folded into
+# one, because summing Claude's and Codex's flat-billed subscriptions into a
+# single estimate would hide which one a cap crossing actually came from —
+# the operator's ruling, issue_01M58502RQC0XDAC1D704XQW5B. Every site that used to
+# compare a lane literally to `"subscription"` to decide enforceability now
+# tests membership here, so a third non-enforceable lane needs only an entry
+# in this set and nothing else.
+NON_ENFORCEABLE_LEDGER_LANES = frozenset({"subscription", "openai-subscription"})
 
 MAX_LEDGER_SCOPE_ID = MAX_IDENT
 # Millionths of a dollar. A day's cap of $160 is 160_000_000, and SQLite's
@@ -3776,11 +4040,11 @@ def ledger_total(conn, ledger_id: str, day: str) -> int:
 
     **THIS IS THE ENFORCEABLE TOTAL, NOT EVERY ENTRY'S TOTAL.** `ledger_days`
     is written by `record_spend` from `gateway`-lane and no-`lane` entries
-    only — a `subscription`-lane entry never moves it (see `record_spend`'s
-    docstring). That is also why this function needs no `lane` argument: the
-    column it reads already excludes the one lane admission control must not
-    act on. `ledger_lane_total` reads the entries directly for the one lane
-    this function's total does not carry.
+    only — a lane in `NON_ENFORCEABLE_LEDGER_LANES` never moves it (see
+    `record_spend`'s docstring). That is also why this function needs no
+    `lane` argument: the column it reads already excludes every lane
+    admission control must not act on. `ledger_lane_total` reads the entries
+    directly for a lane this function's total does not carry.
     """
     row = conn.execute(
         "SELECT spent_usd_micro FROM ledger_days WHERE ledger_id = ? AND day = ?",
@@ -3795,7 +4059,7 @@ def ledger_lane_total(conn, ledger_id: str, day: str, lane: str) -> int:
     **Exact match — an entry with no `lane` is never counted here**, unlike
     `ledger_total`'s enforceable figure, which folds a no-`lane` entry into
     the `gateway` side on the reasoning that a spend nobody has tagged yet
-    is not known to be the one lane that is not real money. This function
+    is not known to be one of the lanes that is not real money. This function
     answers a narrower question: what has this ledger recorded, today, that
     IS tagged `lane`. It reads `ledger_entries` directly rather than a
     materialized column, because nothing on the admission path calls it —
@@ -3889,8 +4153,9 @@ def record_spend(row: dict) -> tuple[bool, dict, str | None]:
     `ledger_id`. `DedupKeyTaken` carries only the key, nothing from the
     matched row.
 
-    **`row["lane"]` MAY BE `None`, `"gateway"` OR `"subscription"`, and only
-    `"subscription"` skips the day's total** (issue_01M35QG5NA13JE8FQVM9XET4HD).
+    **`row["lane"]` MAY BE `None` OR ANY MEMBER OF `LEDGER_LANES`, and only a
+    lane in `NON_ENFORCEABLE_LEDGER_LANES` skips the day's total**
+    (issue_01M35QG5NA13JE8FQVM9XET4HD, issue_01M58502RQC0XDAC1D704XQW5B).
     `ledger_total`'s docstring carries the reasoning; this is the write side
     of the same split — `None` moves the total exactly as it always has,
     because every entry this function has ever accepted before `lane` existed
@@ -4066,12 +4331,12 @@ def record_spend(row: dict) -> tuple[bool, dict, str | None]:
         now = _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None)
         now_iso = now.isoformat(" ")
         entry_id = f"lde_{new_ulid()}"
-        # **WHETHER THIS ENTRY MOVES `ledger_days` AT ALL.** `subscription` is
-        # the one lane that is not money a budget can be enforced against —
-        # `ledger_total`'s docstring is the other half of this split. An
-        # entry with no `lane` moves it, matching today's behaviour for every
-        # client that has not started sending one.
-        enforceable = lane != "subscription"
+        # **WHETHER THIS ENTRY MOVES `ledger_days` AT ALL.** A lane in
+        # `NON_ENFORCEABLE_LEDGER_LANES` is not money a budget can be
+        # enforced against — `ledger_total`'s docstring is the other half of
+        # this split. An entry with no `lane` moves it, matching today's
+        # behaviour for every client that has not started sending one.
+        enforceable = lane not in NON_ENFORCEABLE_LEDGER_LANES
         try:
             conn.execute(
                 "INSERT INTO ledger_entries "
@@ -4089,9 +4354,10 @@ def record_spend(row: dict) -> tuple[bool, dict, str | None]:
             # the increment inside the statement rather than in a read-then-write
             # this function would have to lock around a second time.
             #
-            # SKIPPED FOR A SUBSCRIPTION-LANE ENTRY: this table is the
-            # enforceable total, and a subscription estimate must never move
-            # the number admission control refuses on.
+            # SKIPPED FOR A NON-ENFORCEABLE-LANE ENTRY: this table is the
+            # enforceable total, and a subscription estimate — on either
+            # subscription — must never move the number admission control
+            # refuses on.
             if enforceable:
                 conn.execute(
                     "INSERT INTO ledger_days (ledger_id, day, spent_usd_micro, updated_at) "
@@ -4122,7 +4388,7 @@ def record_spend(row: dict) -> tuple[bool, dict, str | None]:
             return True, dict(won), None
         conn.commit()
         # `after_micro` MATCHES WHAT WAS ACTUALLY WRITTEN ABOVE, not simply
-        # "before plus this report": a subscription-lane entry left
+        # "before plus this report": a non-enforceable-lane entry left
         # `ledger_days` untouched, and crediting it here would report a
         # crossing that never happened to the number admission control reads.
         after_micro = before_micro + row["usd_micro"] if enforceable else before_micro
@@ -4361,12 +4627,13 @@ def void_spend_entry(entry_id: str, voided_by: str,
 
     **The invariant this preserves is the one `record_spend` protects on the
     way in, mirrored on the way out**: `ledger_days.spent_usd_micro` keeps
-    equaling the sum of the ENFORCEABLE entries behind it (not `subscription`,
-    see `record_spend`'s docstring) that are NOT voided. A `subscription`-lane
-    entry never joined that total, so voiding one leaves it untouched rather
-    than subtracting an amount it never added. The entry stays in the table
-    rather than being deleted — see the migration's module docstring for why
-    the log is append-only and a void is a mark rather than a removal.
+    equaling the sum of the ENFORCEABLE entries behind it (not a lane in
+    `NON_ENFORCEABLE_LEDGER_LANES`, see `record_spend`'s docstring) that are
+    NOT voided. A non-enforceable-lane entry never joined that total, so
+    voiding one leaves it untouched rather than subtracting an amount it
+    never added. The entry stays in the table rather than being deleted —
+    see the migration's module docstring for why the log is append-only and
+    a void is a mark rather than a removal.
 
     Raises `LookupError` for an entry id that does not exist; the route turns
     that into a 404 rather than the 200-with-a-lie an unconditioned UPDATE
@@ -4393,10 +4660,10 @@ def void_spend_entry(entry_id: str, voided_by: str,
             "UPDATE ledger_entries SET voided_at = ?, voided_by = ?, "
             "void_reason = ? WHERE id = ?",
             (now_iso, voided_by, reason, entry_id))
-        # MIRRORS `record_spend`'s OWN ENFORCEABLE CHECK: a subscription-lane
-        # entry never added itself to `ledger_days`, so voiding it must not
-        # subtract from a total it never joined.
-        if entry["lane"] != "subscription":
+        # MIRRORS `record_spend`'s OWN ENFORCEABLE CHECK: a non-enforceable-
+        # lane entry never added itself to `ledger_days`, so voiding it must
+        # not subtract from a total it never joined.
+        if entry["lane"] not in NON_ENFORCEABLE_LEDGER_LANES:
             conn.execute(
                 "UPDATE ledger_days SET spent_usd_micro = spent_usd_micro - ?, "
                 "updated_at = ? WHERE ledger_id = ? AND day = ?",

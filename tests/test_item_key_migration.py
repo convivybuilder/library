@@ -48,38 +48,38 @@ def _seed(db):
         "state, type, created_by, created_at, parent_id) "
         "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         [
-            # vivy: two epics, filed out of id order so a naive MAX()/id sort
+            # fennick: two epics, filed out of id order so a naive MAX()/id sort
             # would get the numbering wrong — only created_at should decide it.
-            ("e_v2", "vivy", "epic two", "b", "{}", "low", "open", "epic", "t",
+            ("e_v2", "fennick", "epic two", "b", "{}", "low", "open", "epic", "t",
              "2026-01-02", None),
-            ("e_v1", "vivy", "epic one", "b", "{}", "low", "open", "epic", "t",
+            ("e_v1", "fennick", "epic one", "b", "{}", "low", "open", "epic", "t",
              "2026-01-01", None),
-            # vivy: two corrections, a sequence independent of the epics'.
-            ("c_v1", "vivy", "fix one", "b", "{}", "low", "open", "bug", "t",
+            # fennick: two corrections, a sequence independent of the epics'.
+            ("c_v1", "fennick", "fix one", "b", "{}", "low", "open", "bug", "t",
              "2026-01-01", None),
-            ("c_v2", "vivy", "fix two", "b", "{}", "low", "open", "nit", "t",
+            ("c_v2", "fennick", "fix two", "b", "{}", "low", "open", "nit", "t",
              "2026-01-02", None),
-            # vivy: sub-items under both epics, also out of id order.
-            ("t_v1", "vivy", "task under e1, later", "b", "{}", "low", "open",
+            # fennick: sub-items under both epics, also out of id order.
+            ("t_v1", "fennick", "task under e1, later", "b", "{}", "low", "open",
              "task", "t", "2026-01-03", "e_v1"),
-            ("t_v2", "vivy", "task under e1, earlier", "b", "{}", "low",
+            ("t_v2", "fennick", "task under e1, earlier", "b", "{}", "low",
              "open", "task", "t", "2026-01-02", "e_v1"),
-            ("t_v3", "vivy", "task under e2", "b", "{}", "low", "open",
+            ("t_v3", "fennick", "task under e2", "b", "{}", "low", "open",
              "task", "t", "2026-01-01", "e_v2"),
-            # constance: its own product-scoped sequence, starting over at 1.
-            ("e_c1", "constance", "a constance epic", "b", "{}", "low",
+            # marlow: its own product-scoped sequence, starting over at 1.
+            ("e_c1", "marlow", "a marlow epic", "b", "{}", "low",
              "open", "epic", "t", "2026-01-01", None),
-            # vivy: a four-level tree — a sub-epic under e_v1, a sub-sub-epic
+            # fennick: a four-level tree — a sub-epic under e_v1, a sub-sub-epic
             # under THAT, and a leaf item under the sub-sub-epic. Every one of
             # these three rows is itself only keyed by the same backfill pass
             # that must also key its own parent — the exact shape the old,
             # un-fixed backfill left `item_key = NULL` for below the second
             # level.
-            ("se_v1", "vivy", "sub-epic under e1", "b", "{}", "low", "open",
+            ("se_v1", "fennick", "sub-epic under e1", "b", "{}", "low", "open",
              "epic", "t", "2026-01-04", "e_v1"),
-            ("sse_v1", "vivy", "sub-sub-epic under se_v1", "b", "{}", "low",
+            ("sse_v1", "fennick", "sub-sub-epic under se_v1", "b", "{}", "low",
              "open", "epic", "t", "2026-01-05", "se_v1"),
-            ("leaf_v1", "vivy", "leaf under sse_v1", "b", "{}", "low", "open",
+            ("leaf_v1", "fennick", "leaf under sse_v1", "b", "{}", "low", "open",
              "task", "t", "2026-01-06", "sse_v1"),
         ])
     conn.commit()
@@ -123,8 +123,8 @@ def test_upgrade_backfills_keys_in_created_at_order_per_product(tmp_path):
         "se_v1": "E3", "sse_v1": "E4", "leaf_v1": "E4·1",
     }
     assert counters == {
-        ("epic", "vivy"): 5, ("epic", "constance"): 2,
-        ("correction", "vivy"): 3,
+        ("epic", "fennick"): 5, ("epic", "marlow"): 2,
+        ("correction", "fennick"): 3,
         ("item", "e_v1"): 3, ("item", "e_v2"): 2, ("item", "sse_v1"): 2,
     }
 
@@ -146,11 +146,11 @@ def test_upgrade_resolves_a_legacy_item_nested_under_an_item(tmp_path):
         "state, type, created_by, created_at, parent_id) "
         "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         [
-            ("e_v9", "vivy", "epic for the legacy chain", "b", "{}", "low",
+            ("e_v9", "fennick", "epic for the legacy chain", "b", "{}", "low",
              "open", "epic", "t", "2026-02-01", None),
-            ("mid", "vivy", "a plain item with its own child", "b", "{}",
+            ("mid", "fennick", "a plain item with its own child", "b", "{}",
              "low", "open", "task", "t", "2026-02-02", "e_v9"),
-            ("deep", "vivy", "nested under a non-epic item", "b", "{}",
+            ("deep", "fennick", "nested under a non-epic item", "b", "{}",
              "low", "open", "task", "t", "2026-02-03", "mid"),
         ])
     conn.commit()
@@ -185,9 +185,9 @@ def test_upgrade_refuses_rather_than_leave_a_row_keyless(tmp_path):
         "state, type, created_by, created_at, parent_id) "
         "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         [
-            ("cyc_a", "vivy", "cycle a", "b", "{}", "low", "open", "task",
+            ("cyc_a", "fennick", "cycle a", "b", "{}", "low", "open", "task",
              "t", "2026-01-01", "cyc_b"),
-            ("cyc_b", "vivy", "cycle b", "b", "{}", "low", "open", "task",
+            ("cyc_b", "fennick", "cycle b", "b", "{}", "low", "open", "task",
              "t", "2026-01-01", "cyc_a"),
         ])
     conn.commit()

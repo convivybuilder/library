@@ -26,10 +26,11 @@ on a value with more than one slash, which the regex refuses outright.
 signals is scoped `*`, or its scope is unaffected by these moves.** Changing a
 row's `product` changes which callers can see it, since `in_scope` compares an
 identity's `products` with that column. On 2026-09-16 every identity was `*`
-except two scoped to `vivy`, and no `vivy` row moves, so the correction changed
-no one's visibility. That was the whole reason it could be made without asking
-the operator. If a narrowly scoped identity exists at a later run, moving a row out of
-its product silently removes the row from what it can see, and moving one in
+except two scoped to one product, and no row of that product moves, so the
+correction changed no one's visibility. That was the whole reason it could be
+made without asking the operator. If a narrowly scoped identity exists at a
+later run, moving a row out of its product silently removes the row from
+what it can see, and moving one in
 silently grants it a row. Identities come from exactly two places,
 `identity._tokens()` and `identity._client_tokens()`, and every run prints each
 identity's scope and names any narrow one whose products a move touches, so the

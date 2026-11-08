@@ -19,7 +19,7 @@ import identity
 import protocol
 import store
 
-AGENT = "agent-token-vivy"
+AGENT = "agent-token-fennick"
 SYSTEM = "system-token"
 CLIENT = "orient-token"
 
@@ -50,7 +50,7 @@ def client(tmp_path, monkeypatch):
 
     tokens = tmp_path / "api-tokens.json"
     tokens.write_text(json.dumps({
-        AGENT: {"name": "vivy-agent", "products": ["vivy"]},
+        AGENT: {"name": "fennick-agent", "products": ["fennick"]},
         SYSTEM: {"name": "capture", "products": ["*"], "kind": "system"},
     }))
     client_tokens = tmp_path / "client-tokens.json"
@@ -72,7 +72,7 @@ def _h(token):
 
 
 def _grant(client, token=CLIENT, **over):
-    body = {"agent": "scout", "crew": "cfo", "model": "sonnet",
+    body = {"agent": "scout", "crew": "quill", "model": "sonnet",
             "target": "WebFetch", "decision": "allow",
             "acting_human": "operator"}
     body.update(over)
@@ -95,21 +95,21 @@ def _events():
 @pytest.mark.parametrize("token", [AGENT, SYSTEM, CLIENT])
 def test_every_identity_can_read(client, token):
     r = client.get("/policy/resolve",
-                   params={"agent": "scout", "crew": "cfo", "model": "sonnet"},
+                   params={"agent": "scout", "crew": "quill", "model": "sonnet"},
                    headers=_h(token))
     assert r.status_code == 200
 
 
 def test_unauthenticated_read_is_refused(client):
     r = client.get("/policy/resolve",
-                   params={"agent": "scout", "crew": "cfo", "model": "sonnet"},
+                   params={"agent": "scout", "crew": "quill", "model": "sonnet"},
                    headers={protocol.HEADER: str(protocol.CURRENT)})
     assert r.status_code == 401
 
 
 def test_resolve_carries_the_class_defaults(client):
     r = client.get("/policy/resolve",
-                   params={"agent": "scout", "crew": "cfo", "model": "sonnet"},
+                   params={"agent": "scout", "crew": "quill", "model": "sonnet"},
                    headers=_h(AGENT))
     body = r.json()
     assert body["explicit"] == {}
@@ -120,7 +120,7 @@ def test_resolve_carries_the_class_defaults(client):
 
 
 def test_resolve_required_fields(client):
-    r = client.get("/policy/resolve", params={"agent": "scout", "crew": "cfo"},
+    r = client.get("/policy/resolve", params={"agent": "scout", "crew": "quill"},
                    headers=_h(AGENT))
     assert r.status_code == 400
     assert "model" in r.json()["error"]
@@ -128,7 +128,7 @@ def test_resolve_required_fields(client):
 
 def test_resolve_refuses_an_unrecognised_parameter(client):
     r = client.get("/policy/resolve",
-                   params={"agent": "scout", "crew": "cfo", "model": "sonnet",
+                   params={"agent": "scout", "crew": "quill", "model": "sonnet",
                             "target": "WebFetch"},
                    headers=_h(AGENT))
     assert r.status_code == 400
@@ -173,7 +173,7 @@ def test_an_agent_holding_policy_write_is_refused_by_the_kind_check(
     # no history row.
     resolved = client.get(
         "/policy/resolve",
-        params={"agent": "scout", "crew": "cfo", "model": "sonnet"},
+        params={"agent": "scout", "crew": "quill", "model": "sonnet"},
         headers=_h(AGENT)).json()
     assert resolved["explicit"] == {}
     assert resolved["version"] == 0
@@ -181,7 +181,7 @@ def test_an_agent_holding_policy_write_is_refused_by_the_kind_check(
 
 
 def test_unauthenticated_write_is_refused(client):
-    r = client.put("/policy", json={"agent": "scout", "crew": "cfo",
+    r = client.put("/policy", json={"agent": "scout", "crew": "quill",
                                     "model": "sonnet", "target": "WebFetch",
                                     "decision": "allow"},
                    headers={protocol.HEADER: str(protocol.CURRENT)})
@@ -198,7 +198,7 @@ def test_approved_client_can_write(client):
 
 
 def test_write_without_acting_human_is_refused(client):
-    r = client.put("/policy", json={"agent": "scout", "crew": "cfo",
+    r = client.put("/policy", json={"agent": "scout", "crew": "quill",
                                     "model": "sonnet", "target": "WebFetch",
                                     "decision": "allow"}, headers=_h(CLIENT))
     assert r.status_code == 403
@@ -254,7 +254,7 @@ def test_a_container_field_refuses_cleanly_rather_than_storing_empty(client):
 
     resolved = client.get(
         "/policy/resolve",
-        params={"agent": "", "crew": "cfo", "model": "sonnet"},
+        params={"agent": "", "crew": "quill", "model": "sonnet"},
         headers=_h(AGENT))
     # THE REFUSED WRITE MUST NOT HAVE LANDED as an agent="" row — the read
     # side already refuses an empty agent, so this would be an unreachable
@@ -287,7 +287,7 @@ def test_a_second_grant_on_the_same_combination_overwrites_the_first(client):
 
     resolved = client.get(
         "/policy/resolve",
-        params={"agent": "scout", "crew": "cfo", "model": "sonnet"},
+        params={"agent": "scout", "crew": "quill", "model": "sonnet"},
         headers=_h(AGENT)).json()
     assert resolved["explicit"] == {"WebFetch": "deny"}
 
@@ -317,7 +317,7 @@ def test_different_targets_on_the_same_combination_coexist(client):
     _grant(client, target="claude_ai_Gmail", decision="deny")
     resolved = client.get(
         "/policy/resolve",
-        params={"agent": "scout", "crew": "cfo", "model": "sonnet"},
+        params={"agent": "scout", "crew": "quill", "model": "sonnet"},
         headers=_h(AGENT)).json()
     assert resolved["explicit"] == {"WebFetch": "allow", "claude_ai_Gmail": "deny"}
 
@@ -325,14 +325,14 @@ def test_different_targets_on_the_same_combination_coexist(client):
 def test_incidental_whitespace_does_not_create_an_unreachable_grant(client):
     """A trailing space in a written field must not produce a row a clean
     read can never find again (reviewer, PR #41)."""
-    r = _grant(client, agent="scout ", crew=" cfo", decision="deny")
+    r = _grant(client, agent="scout ", crew=" quill", decision="deny")
     assert r.status_code == 200
     assert r.json()["agent"] == "scout"
-    assert r.json()["crew"] == "cfo"
+    assert r.json()["crew"] == "quill"
 
     resolved = client.get(
         "/policy/resolve",
-        params={"agent": " scout", "crew": "cfo ", "model": "sonnet"},
+        params={"agent": " scout", "crew": "quill ", "model": "sonnet"},
         headers=_h(AGENT)).json()
     assert resolved["explicit"] == {"WebFetch": "deny"}
 
@@ -341,7 +341,7 @@ def test_a_different_combination_is_unaffected(client):
     _grant(client, agent="scout")
     resolved = client.get(
         "/policy/resolve",
-        params={"agent": "consultant", "crew": "cfo", "model": "sonnet"},
+        params={"agent": "consultant", "crew": "quill", "model": "sonnet"},
         headers=_h(AGENT)).json()
     assert resolved["explicit"] == {}
 
@@ -374,7 +374,7 @@ def test_everything_else_defaults_allowed(target):
 
 
 def _remove(client, token=CLIENT, **over):
-    body = {"agent": "scout", "crew": "cfo", "model": "sonnet",
+    body = {"agent": "scout", "crew": "quill", "model": "sonnet",
             "target": "WebFetch", "acting_human": "operator"}
     body.update(over)
     return client.request("DELETE", "/policy", json=body, headers=_h(token))
@@ -382,7 +382,7 @@ def _remove(client, token=CLIENT, **over):
 
 def _explicit(client):
     return client.get("/policy/resolve", params={
-        "agent": "scout", "crew": "cfo", "model": "sonnet"},
+        "agent": "scout", "crew": "quill", "model": "sonnet"},
         headers=_h(AGENT)).json()["explicit"]
 
 
@@ -425,7 +425,7 @@ def test_agent_and_system_cannot_remove(client, token):
 def test_removal_without_acting_human_is_refused(client):
     _grant(client, decision="deny")
     r = client.request("DELETE", "/policy", json={
-        "agent": "scout", "crew": "cfo", "model": "sonnet",
+        "agent": "scout", "crew": "quill", "model": "sonnet",
         "target": "WebFetch"}, headers=_h(CLIENT))
     assert r.status_code == 403
     assert _explicit(client) == {"WebFetch": "deny"}
@@ -459,15 +459,15 @@ def test_a_black_box_crews_row_cannot_be_removed(client):
 def test_a_private_crews_row_cannot_be_removed(client, tmp_path, monkeypatch):
     black_box_tables.use_registry(tmp_path, monkeypatch, {
         **black_box_tables.ORDINARY_REGISTRY,
-        "cfo": {"repos": [], "private": True}})
+        "quill": {"repos": [], "private": True}})
     _grant(client, decision="deny")
     assert _remove(client).status_code == 409
 
 
 def test_an_unreadable_registry_refuses_removal_closed(client, tmp_path, monkeypatch):
     black_box_tables.use_registry(tmp_path, monkeypatch, {})
-    _grant(client, crew="vivy", decision="deny")
-    assert _remove(client, crew="vivy").status_code == 503
+    _grant(client, crew="fennick", decision="deny")
+    assert _remove(client, crew="fennick").status_code == 503
 
 
 def test_the_listing_enumerates_every_row_and_narrows_by_field(client):

@@ -62,11 +62,13 @@ def client(tmp_path, monkeypatch, vector_index):
     tokens.write_text(json.dumps({
         SYSTEM: {"name": "system", "products": ["*"], "kind": "system"},
         AGENT: {"name": "an-agent", "products": ["*"]},
-        NARROW: {"name": "vivy-only", "products": ["vivy"], "kind": "system"}}))
+        NARROW: {"name": "fennick-only", "products": ["fennick"], "kind": "system"}}))
     registry = tmp_path / "projects.json"
     registry.write_text(json.dumps({
         "_meta": {}, "library": {"repos": ["library"]},
-        "vivy": {"repos": ["vivy"]}}))
+        "fennick": {"repos": ["fennick", "qh-shared"]},
+        "quillhouse": {"repos": ["quillhouse-site", "qh-shared"], "private": True},
+        "ledgerwick": {"repos": [], "private": True}}))
 
     monkeypatch.setattr(store, "DB_PATH", db)
     monkeypatch.setattr(identity, "TOKENS", tokens)
@@ -82,18 +84,41 @@ def facts(monkeypatch):
     """`runs.run_facts`, faked. Each test seeds `facts[run_id] = {...}`; an
     unseeded run_id answers `{"available": True, "found": False}`, matching
     what the real function answers for a run the Bosun does not recognise.
+
+    **Models `include_private_facts` the way the real function does**
+    (CQ·237): a run seeded with `private: True` reads as
+    `{"available", "found", "private"}` alone unless the keyword is passed.
+    A fake that handed every caller full facts is how round 1 shipped a
+    route that fetched a private run's facts for any post (security-reviewer
+    and reviewer, CQ·237 round 1). `seeded.calls` records each call's
+    keyword so a test can assert which path the route took.
     """
-    seeded: dict[str, dict] = {}
-    monkeypatch.setattr(
-        runs, "run_facts",
-        lambda run_id: seeded.get(run_id, {"available": True, "found": False}))
+    class Seeded(dict):
+        calls: list
+
+    seeded = Seeded()
+    seeded.calls = []
+
+    def fake(run_id, *, include_private_facts=False):
+        seeded.calls.append((run_id, include_private_facts))
+        got = seeded.get(run_id, {"available": True, "found": False})
+        if got.get("private") and not include_private_facts:
+            return {"available": True, "found": True, "private": True}
+        return got
+
+    monkeypatch.setattr(runs, "run_facts", fake)
     return seeded
 
 
 def _run_verified_facts(**over):
+    """Defaults to matching `_body()`'s own defaults (`verdict="APPROVE"`,
+    no `pr`) through `posted_verdict`/`posted_pr`, so a test that overrides
+    neither still reaches `run-verified` under CQ·217's rule without having
+    to restate them."""
     facts = {"available": True, "found": True, "agent": "coder",
             "repo": "library", "review_sha": "a" * 40, "pr": None,
-            "review_role": "reviewer"}
+            "review_role": "reviewer", "posted_verdict": "APPROVE",
+            "posted_pr": None}
     facts.update(over)
     return facts
 
@@ -162,11 +187,11 @@ def client_with_cold(tmp_path, monkeypatch, vector_index):
     tokens.write_text(json.dumps({
         SYSTEM: {"name": "system", "products": ["*"], "kind": "system"},
         AGENT: {"name": "an-agent", "products": ["*"]},
-        NARROW: {"name": "vivy-only", "products": ["vivy"], "kind": "system"}}))
+        NARROW: {"name": "fennick-only", "products": ["fennick"], "kind": "system"}}))
     registry = tmp_path / "projects.json"
     registry.write_text(json.dumps({
         "_meta": {}, "library": {"repos": ["library"]},
-        "vivy": {"repos": ["vivy"]}}))
+        "fennick": {"repos": ["fennick"]}}))
 
     monkeypatch.setattr(store, "DB_PATH", db)
     monkeypatch.setattr(identity, "TOKENS", tokens)
@@ -263,6 +288,95 @@ def test_an_agent_lacks_the_capability(client):
     assert "review_record.create" in r.json()["error"]
 
 
+# --- private crews (ADR-0043, CQ·237, issue_01M5QE987V342E9NX422BTWW8J) -----
+
+
+@pytest.mark.parametrize("field,value", [
+    ("prose", "a review of the OpenAI key fix"),
+    ("findings", [{"severity": "blocking", "note": "x"}]),
+    ("paths", ["app.py"]),
+    ("doc_ids", ["projects/platform/decisions/0001"]),
+    ("item_ids", ["issue_01ABC"]),
+    ("source_comment_id", "3061234567"),
+])
+def test_a_private_githubs_text_field_is_refused_400_naming_the_field(
+        client, field, value):
+    r = post(client, repo_identity="github:examplecorp/quillhouse-site",
+             **{field: value})
+    assert r.status_code == 400, r.text
+    assert field in r.json()["error"]
+    assert record_count(store.DB_PATH) == 0
+
+
+def test_a_private_products_text_field_is_refused_400_via_a_git_identity(client):
+    """The epic names both forms: a private `github:` repo, and a private
+    PRODUCT named through a `git:` identity's own `product` field — `ledgerwick`
+    here carries no `repos` at all, so only the slug names it."""
+    r = post(client, repo_identity="git:" + "e" * 40, product="ledgerwick",
+             findings=[{"severity": "blocking"}])
+    assert r.status_code == 400, r.text
+    assert "findings" in r.json()["error"]
+    assert record_count(store.DB_PATH) == 0
+
+
+def test_a_verdict_only_post_for_a_private_crew_stores_a_row_with_no_archives_signal(
+        client):
+    r = post(client, repo_identity="github:examplecorp/quillhouse-site")
+    assert r.status_code == 201, r.text
+    assert r.json()["prose"] == ""
+    assert r.json()["findings"] == []
+    assert record_count(store.DB_PATH) == 1
+    assert signal_count(store.DB_PATH) == 0
+
+
+def test_a_self_registered_black_box_crew_is_refused_even_when_the_registry_does_not_mark_it_private(
+        client):
+    """The third union member, `store.black_box_registration_crews()`
+    (`create_signal`'s own reasoning): a crew that registered itself as a
+    black box is one whether or not the project registry's `private` flag
+    also says so. `fennick` here is an ordinary, non-private registry
+    entry — only the self-registration makes it private for this route."""
+    conn = sqlite3.connect(store.DB_PATH)
+    conn.execute(
+        "INSERT INTO black_box_registrations "
+        "(crew, model, gateway, created_by, created_at, updated_by, updated_at) "
+        "VALUES ('fennick', 'gpt-4', 'openai', 'tester', "
+        "'2026-10-24T00:00:00Z', 'tester', '2026-10-24T00:00:00Z')")
+    conn.commit()
+    conn.close()
+    r = post(client, repo_identity="github:convivy/fennick", prose="hi")
+    assert r.status_code == 400, r.text
+    assert "prose" in r.json()["error"]
+
+
+def test_an_unreadable_registry_gives_503_and_stores_nothing(client, monkeypatch):
+    """`_review_record_product`'s own `projects.available()` gate already
+    404s a repository the registry cannot resolve at all, so the only way
+    this check's own 503 is reachable is a registry that answers `resolve()`
+    but not `private_repos()` — the live case is a race: the file is edited
+    out from under the second read within the same request. Simulated
+    directly at the function this check calls, rather than by deleting the
+    registry file, which `_review_record_product` would already have
+    refused with a 404 before this check ever ran."""
+    monkeypatch.setattr(projects, "private_repos", lambda: None)
+    r = post(client)
+    assert r.status_code == 503, r.text
+    assert record_count(store.DB_PATH) == 0
+
+
+def test_a_non_private_post_is_unchanged(client, facts):
+    """The protocol effect this change states: an ordinary repository's
+    review record still writes prose and findings and still mints an
+    Archives signal, exactly as before."""
+    facts[RUN] = _run_verified_facts()
+    r = post(client, run_id=RUN, prose="an ordinary review",
+             findings=[{"severity": "blocking"}])
+    assert r.status_code == 201, r.text
+    assert r.json()["prose"] == "an ordinary review"
+    assert r.json()["findings"] == [{"severity": "blocking"}]
+    assert signal_count(store.DB_PATH) == 1
+
+
 # --- idempotency and supersede ----------------------------------------------
 
 def test_a_double_post_of_one_review_yields_one_record_one_signal(client, facts):
@@ -332,26 +446,93 @@ def test_the_linked_signal_is_findable_through_search(client, facts):
     assert created.json()["id"] in ids
 
 
-def test_a_changed_verdict_on_the_same_run_role_ref_supersedes(client, facts):
-    facts[RUN] = _run_verified_facts()
-    first = post(client, run_id=RUN, verdict="APPROVE")
+def test_a_changed_verdict_on_the_same_run_role_ref_is_refused_once_bound(
+        client, facts):
+    """CQ·217 (issue_01M5FM2A102PKMQVKFE7HM30F0): before this build, a
+    second post on the same run/role/commit superseded the record into
+    whatever verdict it named and kept it `run-verified` — exactly the
+    shape the vulnerability this item fixes exploited, since nothing bound
+    the stored verdict to what the run actually posted. A real reviewer's
+    `REQUEST_CHANGES`, re-posted as `APPROVE` under the same `run_id`, is
+    now refused 409, and the stored record is left exactly as it was."""
+    facts[RUN] = _run_verified_facts(posted_verdict="REQUEST_CHANGES")
+    first = post(client, run_id=RUN, verdict="REQUEST_CHANGES")
     assert first.status_code == 201, first.text
+    assert first.json()["auth"] == "run-verified"
+    assert first.json()["verdict_bound"] is True
     record_id = first.json()["id"]
 
-    second = post(client, run_id=RUN, verdict="REQUEST_CHANGES")
-    assert second.status_code == 200, second.text
-    assert second.json()["outcome"] == "superseded"
-    assert second.json()["id"] == record_id
-    assert second.json()["version"] == 2
-    assert second.json()["verdict"] == "REQUEST_CHANGES"
+    second = post(client, run_id=RUN, verdict="APPROVE")
+    assert second.status_code == 409, second.text
+    assert second.json()["existing"]["id"] == record_id
+    assert second.json()["existing"]["verdict"] == "REQUEST_CHANGES"
+    assert second.json()["existing"]["auth"] == "run-verified"
 
-    versions = version_rows(store.DB_PATH, record_id)
-    assert len(versions) == 1
-    assert versions[0]["version"] == 1
-    assert versions[0]["verdict"] == "APPROVE"
+    conn = sqlite3.connect(store.DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            f"SELECT {', '.join(store.REVIEW_RECORD_COLUMNS)} "
+            f"FROM review_records WHERE id = ?", (record_id,)).fetchone()
+    finally:
+        conn.close()
+    out = store.review_record_dict(row)
+    assert out["verdict"] == "REQUEST_CHANGES"
+    assert out["auth"] == "run-verified"
+    assert out["version"] == 1
+    assert record_count(store.DB_PATH) == 1
+    assert signal_count(store.DB_PATH) == 1
+
+
+def test_a_forged_repost_whose_facts_also_match_is_refused_through_the_route(
+        client, facts):
+    """CQ·217, round 1 (reviewer): the test above reaches the older
+    `ReviewRecordWouldDowngrade` refusal, because its second post computes
+    `unverified`. This one drives `ReviewRecordVerdictBound` through the
+    route: a same-account process that also rewrites the run's `meta.json`
+    so `posted_verdict` reads `APPROVE` makes the forged post compute
+    `run-verified` too, and the bound verdict still does not move."""
+    facts[RUN] = _run_verified_facts(posted_verdict="REQUEST_CHANGES")
+    first = post(client, run_id=RUN, verdict="REQUEST_CHANGES")
+    assert first.status_code == 201, first.text
+    assert first.json()["verdict_bound"] is True
+    record_id = first.json()["id"]
+
+    facts[RUN] = _run_verified_facts(posted_verdict="APPROVE")
+    second = post(client, run_id=RUN, verdict="APPROVE")
+    assert second.status_code == 409, second.text
+    assert "bound to its run" in second.json()["error"]
+    assert second.json()["existing"]["id"] == record_id
+    assert second.json()["existing"]["verdict"] == "REQUEST_CHANGES"
 
     assert record_count(store.DB_PATH) == 1
-    assert signal_count(store.DB_PATH) == 2
+    assert signal_count(store.DB_PATH) == 1
+    assert version_rows(store.DB_PATH, record_id) == []
+
+
+def test_a_matching_post_is_run_verified_and_verdict_bound(client, facts):
+    """CQ·217: the done-when case — a genuine post whose verdict and pr
+    match what the run register attests it posted still reaches
+    `run-verified`, and is now `verdict_bound` as well."""
+    facts[RUN] = _run_verified_facts(pr="7", posted_verdict="APPROVE",
+                                     posted_pr="7")
+    r = post(client, run_id=RUN, pr=7, verdict="APPROVE")
+    assert r.status_code == 201, r.text
+    assert r.json()["auth"] == "run-verified"
+    assert r.json()["auth_reason"] is None
+    assert r.json()["verdict_bound"] is True
+
+
+def test_an_empty_posted_verdict_is_unverified(client, facts):
+    """CQ·217: a run the register has no attested post for — `posted_verdict`
+    empty or absent — stays unverified rather than comparing the claimed
+    verdict against nothing."""
+    facts[RUN] = _run_verified_facts(posted_verdict="")
+    r = post(client, run_id=RUN)
+    assert r.status_code == 201, r.text
+    assert r.json()["auth"] == "unverified"
+    assert r.json()["auth_reason"] == "verdict not recorded by the run"
+    assert r.json()["verdict_bound"] is False
 
 
 def test_a_runless_identical_repost_collapses_to_one_record(client):
@@ -397,12 +578,86 @@ def test_run_not_found_is_unverified(client, facts):
     assert r.json()["auth_reason"] == "run not found"
 
 
-def test_a_private_run_is_unverified(client, facts):
+def test_a_private_runs_matching_facts_reach_run_verified(client, facts):
+    """CQ·237: the write route calls `runs.run_facts(...,
+    include_private_facts=True)`, the internal path that gives
+    `_review_record_auth` a private run's full `RUN_FACTS_FIELDS` rather
+    than the `{"found", "private"}` shape `GET /runs` still gets. Before
+    this, `facts.get("private")` short-circuited every private run straight
+    to `unverified, "private run"`, no matter how well the claim matched —
+    making `run-verified` permanently unreachable for a private crew's own
+    review. Posted under the private crew's own repository, the only
+    record the full facts are fetched for."""
+    facts[RUN] = _run_verified_facts(private=True, repo="quillhouse-site")
+    r = post(client, run_id=RUN, repo_identity="github:examplecorp/quillhouse-site")
+    assert r.status_code == 201, r.text
+    assert r.json()["auth"] == "run-verified"
+    assert r.json()["auth_reason"] is None
+    assert facts.calls[-1] == (RUN, True)
+
+
+def test_an_ordinary_record_naming_a_private_run_never_reads_its_facts(
+        client, facts):
+    """Security-reviewer and reviewer, CQ·237 round 1. A post under an
+    ordinary repository that names a private crew's run sees only
+    `{"found", "private"}`. It stays unverified, gets no mismatch reason that
+    would act as an oracle, and the private repository's name reaches no
+    stored row or Archives signal."""
+    facts[RUN] = _run_verified_facts(private=True, repo="quillhouse-site")
+    r = post(client, run_id=RUN, repo_identity="git:" + "f" * 40,
+             product="library", prose="an ordinary review")
+    assert r.status_code == 201, r.text
+    assert r.json()["auth"] == "unverified"
+    assert all(flag is False for _, flag in facts.calls)
+    conn = sqlite3.connect(store.DB_PATH)
+    try:
+        dump = "\n".join(conn.iterdump())
+    finally:
+        conn.close()
+    assert "quillhouse-site" not in dump
+
+
+def test_a_private_record_naming_another_private_crews_run_learns_nothing(
+        client, facts):
+    """A private crew's record that names a different private crew's run gets
+    the same answer as an ordinary record would: unverified, with the reason
+    the `{found, private}` shape produces, so no mismatch reason describes the
+    other crew's run."""
+    facts[RUN] = _run_verified_facts(private=True, repo="ledgerwick-books")
+    r = post(client, run_id=RUN, repo_identity="github:examplecorp/quillhouse-site")
+    assert r.status_code == 201, r.text
+    assert r.json()["auth"] == "unverified"
+    seeded_shape = {"available": True, "found": True, "private": True}
+    facts[RUN + "x"] = seeded_shape
+    baseline = post(client, run_id=RUN + "x",
+                    repo_identity="github:examplecorp/quillhouse-site",
+                    reviewed_ref="b" * 40)
+    assert r.json()["auth_reason"] == baseline.json()["auth_reason"]
+
+
+def test_a_git_product_spelling_shared_with_a_private_crew_is_private(client):
+    """Reviewer, CQ·237 round 1. `qh-shared` is listed by the ordinary
+    `fennick` first and by the private `quillhouse` second, so
+    `projects.resolve` answers `fennick`. The raw spelling still names a
+    private crew, and the route treats it as one."""
+    r = post(client, repo_identity="git:" + "d" * 40, product="qh-shared",
+             prose="text a private crew may not store")
+    assert r.status_code == 400, r.text
+    assert "prose" in r.json()["error"]
+    assert record_count(store.DB_PATH) == 0
+
+
+def test_a_private_run_with_incomplete_facts_is_unverified_on_the_missing_field(
+        client, facts):
+    """The removed `"private run"` shortcut is not replaced by a free pass:
+    a private run whose facts carry no `review_role` at all (the shape a
+    stale or partial register entry could still produce) is refused on that
+    missing field exactly as a non-private run would be."""
     facts[RUN] = {"available": True, "found": True, "private": True}
     r = post(client, run_id=RUN)
     assert r.status_code == 201, r.text
     assert r.json()["auth"] == "unverified"
-    assert r.json()["auth_reason"] == "private run"
+    assert r.json()["auth_reason"] == "role mismatch"
 
 
 def test_a_role_mismatch_is_unverified(client, facts):
@@ -455,7 +710,7 @@ def test_an_unknown_run_repo_is_unverified(client, facts):
 
 def test_run_verified_with_a_string_pr_fact_and_a_matching_int_pr_field(
         client, facts):
-    facts[RUN] = _run_verified_facts(pr="42")
+    facts[RUN] = _run_verified_facts(pr="42", posted_pr="42")
     r = post(client, run_id=RUN, pr=42)
     assert r.status_code == 201, r.text
     assert r.json()["auth"] == "run-verified"
@@ -517,7 +772,8 @@ def test_a_repost_with_a_mismatched_pr_cannot_downgrade_a_run_verified_record(
     run-verified record is left exactly as it was: same verdict, same
     auth, same version.
     """
-    facts[RUN] = _run_verified_facts(pr="42")
+    facts[RUN] = _run_verified_facts(pr="42", posted_verdict="REQUEST_CHANGES",
+                                     posted_pr="42")
     first = post(client, run_id=RUN, pr=42, verdict="REQUEST_CHANGES")
     assert first.status_code == 201, first.text
     assert first.json()["auth"] == "run-verified"
@@ -575,7 +831,8 @@ def test_run_verified_over_unverified_on_the_same_key_still_supersedes(
     `unverified`, the upgrade case: a first post whose `pr` mismatches
     lands `unverified`, and a second post on the same key whose `pr`
     matches must still be free to supersede it into `run-verified`."""
-    facts[RUN] = _run_verified_facts(pr="42")
+    facts[RUN] = _run_verified_facts(pr="42", posted_verdict="REQUEST_CHANGES",
+                                     posted_pr="42")
     first = post(client, run_id=RUN, pr=99, verdict="APPROVE")
     assert first.status_code == 201, first.text
     assert first.json()["auth"] == "unverified"
@@ -590,9 +847,10 @@ def test_run_verified_over_unverified_on_the_same_key_still_supersedes(
     assert second.json()["version"] == 2
 
 
-# `run-verified` over `run-verified` still superseding, the fourth pairing,
-# is already pinned above by
-# `test_a_changed_verdict_on_the_same_run_role_ref_supersedes`.
+# `run-verified` over `run-verified` with a DIFFERENT verdict, the fourth
+# pairing, is no longer free to supersede once the existing record's verdict
+# is bound (CQ·217) — see
+# `test_a_changed_verdict_on_the_same_run_role_ref_is_refused_once_bound`.
 
 
 def test_a_git_identity_is_never_run_verified_even_when_every_fact_matches(
@@ -606,12 +864,17 @@ def test_a_git_identity_is_never_run_verified_even_when_every_fact_matches(
 
 
 def test_a_git_identity_with_a_private_run_is_unverified_not_404(client, facts):
+    """A `git:` identity is still never `run-verified` — the check right
+    after `facts.get("found")` catches it before any role/repo/sha/pr
+    comparison runs — and a private run behind it must not turn into a 404;
+    it is simply unverified for the `git:`-cannot-verify reason, same as a
+    non-private run would be."""
     facts[RUN] = {"available": True, "found": True, "private": True}
     r = post(client, run_id=RUN, repo_identity="git:" + "d" * 40,
              product="library")
     assert r.status_code == 201, r.text
     assert r.json()["auth"] == "unverified"
-    assert r.json()["auth_reason"] == "private run"
+    assert r.json()["auth_reason"] == "git identity cannot be verified against a run"
 
 
 def test_a_git_identity_with_a_run_not_found_is_unverified_not_404(client, facts):
@@ -682,7 +945,7 @@ def test_an_unknown_github_repo_is_not_found(client):
 
 
 def test_a_mismatched_payload_product_is_refused(client):
-    r = post(client, repo_identity="github:convivy/library", product="vivy")
+    r = post(client, repo_identity="github:convivy/library", product="fennick")
     assert r.status_code == 400
     assert "product" in r.json()["error"]
 
@@ -837,12 +1100,14 @@ def test_run_facts_reports_a_found_run(sock_dir, monkeypatch):
     monkeypatch.setattr(runs, "SOCKET_PATH", Path(sock_dir) / "r.sock")
     reg = FakeFactsServer(Path(sock_dir) / "r.sock", {
         "found": True, "agent": "coder", "repo": "library",
-        "review_sha": "a" * 40, "pr": 42, "review_role": "reviewer"})
+        "review_sha": "a" * 40, "pr": 42, "review_role": "reviewer",
+        "posted_verdict": "APPROVE", "posted_pr": 42})
     try:
         assert runs.run_facts(RUN) == {
             "available": True, "found": True, "agent": "coder",
             "repo": "library", "review_sha": "a" * 40, "pr": 42,
-            "review_role": "reviewer"}
+            "review_role": "reviewer", "posted_verdict": "APPROVE",
+            "posted_pr": 42}
     finally:
         reg.close()
 
@@ -859,13 +1124,37 @@ def test_run_facts_reports_not_found(sock_dir, monkeypatch):
 def test_run_facts_a_private_runs_facts_carry_nothing_else(sock_dir, monkeypatch):
     """The allowlist is not re-opened downstream: a private run's payload
     naming `repo` and `agent` alongside `private: true` must not leak them —
-    the same discipline `test_runs.py` pins for `/runs` itself."""
+    the same discipline `test_runs.py` pins for `/runs` itself. The default
+    (`include_private_facts` unset) is every caller-facing read's shape,
+    `GET /runs` included."""
     monkeypatch.setattr(runs, "SOCKET_PATH", Path(sock_dir) / "r.sock")
     reg = FakeFactsServer(Path(sock_dir) / "r.sock", {
-        "found": True, "private": True, "repo": "CFO", "agent": "secret-agent"})
+        "found": True, "private": True, "repo": "QUILL", "agent": "secret-agent"})
     try:
         assert runs.run_facts(RUN) == {"available": True, "found": True,
                                        "private": True}
+    finally:
+        reg.close()
+
+
+def test_run_facts_include_private_facts_is_the_internal_path_for_the_write_route(
+        sock_dir, monkeypatch):
+    """CQ·237: `include_private_facts=True` is the one way past the
+    allowlist above, and it is a keyword a caller never gets from a request
+    — `create_review_record` is the only caller in this process that passes
+    it, so `_review_record_auth` can verify a private crew's own review
+    against the run's real facts."""
+    monkeypatch.setattr(runs, "SOCKET_PATH", Path(sock_dir) / "r.sock")
+    reg = FakeFactsServer(Path(sock_dir) / "r.sock", {
+        "found": True, "private": True, "agent": "coder", "repo": "library",
+        "review_sha": "a" * 40, "pr": 42, "review_role": "reviewer",
+        "posted_verdict": "APPROVE", "posted_pr": 42})
+    try:
+        assert runs.run_facts(RUN, include_private_facts=True) == {
+            "available": True, "found": True, "private": True,
+            "agent": "coder", "repo": "library", "review_sha": "a" * 40,
+            "pr": 42, "review_role": "reviewer", "posted_verdict": "APPROVE",
+            "posted_pr": 42}
     finally:
         reg.close()
 

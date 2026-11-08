@@ -1,0 +1,117 @@
+#!/bin/sh
+# lock-requirements — compile requirements.txt into requirements.lock.
+#
+# requirements.txt is the hand-edited list of direct pins and the reasons
+# for them. requirements.lock is what every install reads: each package the
+# pins resolve to, transitive ones included, with the sha256 of every file
+# PyPI publishes for that version. bin/install-library and CI install it
+# with `pip install --require-hashes --only-binary :all:`, so a file whose
+# hash is not listed here is refused rather than installed.
+#
+# The resolution is universal (`--universal`): one lock carries the
+# environment markers for macOS and Linux alike, since the Library must run
+# on both (company/decisions/0010). A plain `pip-compile` resolves for the
+# machine it runs on and would drop a Linux-only dependency.
+#
+# The lock is a function of three inputs and nothing else: requirements.txt,
+# the uv version CI pins, and an --as-of timestamp, passed to uv as
+# --exclude-newer so the resolution sees PyPI as it stood then. The
+# timestamp is recorded in the lock's own header, so a change to it shows in
+# the diff. Every compile here writes into an empty file: uv keeps the
+# versions an existing output file already pins, and compiling over the
+# committed lock would let a hand-edited lock that pins an older release of
+# a transitive package reproduce itself and pass --check.
+#
+# Usage:
+#   bin/lock-requirements                 resolve as of now and rewrite the lock
+#   bin/lock-requirements --as-of <time>  resolve as of <time> (RFC 3339, UTC)
+#   bin/lock-requirements --check         exit 1 unless recompiling at the
+#                                         lock's recorded --as-of reproduces it
+#   bin/lock-requirements --check --base <git-ref>
+#                                         also exit 1 if the --as-of is earlier
+#                                         than the one in <git-ref>'s lock
+#
+# --base exists because recompiling proves only that the lock matches its
+# own --as-of. Moving that time backward and recompiling yields a lock of
+# older, real releases of every transitive package, which --check alone
+# passes. CI passes the commit the change is measured against.
+#
+# Run it after any edit to requirements.txt and commit both files. It needs
+# uv on PATH; CI pins the version it installs (requirements-lock-tool.txt).
+# --check also fails when PyPI yanks a locked version after the --as-of
+# time, since uv skips yanked releases; regenerating is the fix then too.
+set -eu
+
+cd "$(dirname "$0")/.."
+
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+
+compile() {
+    uv pip compile requirements.txt \
+        --universal \
+        --python-version 3.11 \
+        --generate-hashes \
+        --exclude-newer "$1" \
+        --custom-compile-command "bin/lock-requirements --as-of $1" \
+        --quiet \
+        -o "$tmp/requirements.lock"
+}
+
+# The --as-of time from a lock's header on stdin, or nothing when the header
+# does not carry one in the exact format this script writes.
+as_of_in() {
+    sed -n 's|^#    bin/lock-requirements --as-of \([0-9]\{4\}-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z\)$|\1|p' | head -n 1
+}
+
+case "${1:-}" in
+    "")
+        compile "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        mv "$tmp/requirements.lock" requirements.lock
+        ;;
+    --as-of)
+        if [ -z "$(printf '#    bin/lock-requirements --as-of %s\n' "${2:-}" | as_of_in)" ]; then
+            echo "usage: bin/lock-requirements --as-of YYYY-MM-DDTHH:MM:SSZ" >&2
+            exit 2
+        fi
+        compile "$2"
+        mv "$tmp/requirements.lock" requirements.lock
+        ;;
+    --check)
+        as_of="$(as_of_in < requirements.lock)"
+        if [ -z "$as_of" ]; then
+            echo "lock-requirements: requirements.lock records no --as-of time in its header" >&2
+            echo "  in the form YYYY-MM-DDTHH:MM:SSZ; run bin/lock-requirements and commit the result" >&2
+            exit 1
+        fi
+        if [ "${2:-}" = "--base" ]; then
+            [ -n "${3:-}" ] || { echo "usage: bin/lock-requirements --check [--base <git-ref>]" >&2; exit 2; }
+            if git cat-file -e "$3:requirements.lock" 2>/dev/null; then
+                base_as_of="$(git show "$3:requirements.lock" | as_of_in)"
+                # Both match one fixed-width UTC format, so byte order is time order.
+                earlier="$(printf '%s\n%s\n' "$as_of" "$base_as_of" | LC_ALL=C sort | head -n 1)"
+                if [ -z "$base_as_of" ] || { [ "$earlier" = "$as_of" ] && [ "$as_of" != "$base_as_of" ]; }; then
+                    echo "lock-requirements: requirements.lock resolves as of $as_of, earlier than" >&2
+                    echo "  ${base_as_of:-an unreadable time} in $3; the --as-of time may only move forward" >&2
+                    exit 1
+                fi
+            else
+                echo "lock-requirements: $3 has no requirements.lock; nothing to compare --as-of against"
+            fi
+        elif [ -n "${2:-}" ]; then
+            echo "usage: bin/lock-requirements --check [--base <git-ref>]" >&2
+            exit 2
+        fi
+        compile "$as_of"
+        if ! diff -u requirements.lock "$tmp/requirements.lock"; then
+            echo "lock-requirements: requirements.lock is not what requirements.txt resolves to as of $as_of;" >&2
+            echo "  run bin/lock-requirements and commit the result" >&2
+            exit 1
+        fi
+        echo "lock-requirements: requirements.lock matches requirements.txt as of $as_of"
+        ;;
+    *)
+        echo "usage: bin/lock-requirements [--as-of <time> | --check]" >&2
+        exit 2
+        ;;
+esac

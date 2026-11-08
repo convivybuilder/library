@@ -36,28 +36,28 @@ import black_box_tables
 import store
 
 AGENT_UNBOUND = "agent-token-unbound"
-AGENT_BOUND_VIVY = "agent-token-bound-vivy"
+AGENT_BOUND_FENNICK = "agent-token-bound-fennick"
 AGENT_BOUND_COMPANY = "agent-token-bound-company"
 
 ORCHESTRATOR = identity.Identity(actor="co-library-test", kind="orchestrator")
 
-ITEM_VIVY = "item_vivy"
+ITEM_FENNICK = "item_fennick"
 ITEM_COMPANY = "item_company"
-ITEM_VIVY_B = "item_vivy_b"
-ITEM_VIVY_C = "item_vivy_c"
-ITEM_VIVY_D = "item_vivy_d"
+ITEM_FENNICK_B = "item_fennick_b"
+ITEM_FENNICK_C = "item_fennick_c"
+ITEM_FENNICK_D = "item_fennick_d"
 
 # id, kind, project, status, frontmatter_extra (model pin, or None)
 DOCS = [
-    ("vivy/agents/coder", "agent", "vivy", "current", None),
+    ("fennick/agents/coder", "agent", "fennick", "current", None),
     ("company/agents/coder", "agent", "company", "current", None),
     # A unique persona name per project, for `_persona_model`'s scope check
-    # (round-3 fix, issue_01M35QG0VANA5P1XE3PH6A7PS4): `inside-vivy` is the
-    # persona a bound vivy credential's own profile selects, and
-    # `outside-vivy` is one that resolves, unambiguously, to a document
+    # (round-3 fix, issue_01M35QG0VANA5P1XE3PH6A7PS4): `inside-fennick` is the
+    # persona a bound fennick credential's own profile selects, and
+    # `outside-fennick` is one that resolves, unambiguously, to a document
     # another crew's profile selects.
-    ("vivy/agents/inside-vivy", "agent", "vivy", "current", {"model": "haiku"}),
-    ("company/agents/outside-vivy", "agent", "company", "current",
+    ("fennick/agents/inside-fennick", "agent", "fennick", "current", {"model": "haiku"}),
+    ("company/agents/outside-fennick", "agent", "company", "current",
      {"model": "opus"}),
 ]
 
@@ -96,9 +96,10 @@ def client(tmp_path, monkeypatch, vector_index, ledger_tables):
             blocking_root_id TEXT, blocking_holder TEXT, blocks_by TEXT, blocking_taken_for TEXT);
         CREATE TABLE call_slips (
             id TEXT PRIMARY KEY, item_id TEXT, product TEXT, claim_owner_label TEXT,
-            issued_at TEXT, expires_at TEXT, grant_json TEXT);
+            issued_at TEXT, expires_at TEXT, grant_json TEXT, crew TEXT);
         CREATE TABLE roster_agents (
             id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE,
+            source_doc TEXT,
             created_at TEXT NOT NULL, created_by TEXT NOT NULL,
             updated_at TEXT NOT NULL, updated_by TEXT NOT NULL);
         CREATE TABLE profiles (
@@ -114,9 +115,9 @@ def client(tmp_path, monkeypatch, vector_index, ledger_tables):
             issued_by TEXT NOT NULL, issued_at TEXT NOT NULL,
             expires_at TEXT NOT NULL, redeemed_at TEXT, redeemed_by TEXT);
     """ + black_box_tables.DDL)
-    for item_id, product in ((ITEM_VIVY, "vivy"), (ITEM_COMPANY, "company"),
-                             (ITEM_VIVY_B, "vivy"), (ITEM_VIVY_C, "vivy"),
-                             (ITEM_VIVY_D, "vivy")):
+    for item_id, product in ((ITEM_FENNICK, "fennick"), (ITEM_COMPANY, "company"),
+                             (ITEM_FENNICK_B, "fennick"), (ITEM_FENNICK_C, "fennick"),
+                             (ITEM_FENNICK_D, "fennick")):
         conn.execute(
             "INSERT INTO issue_items (id, product, title, type, state, needs, "
             "created_by_kind, parent_id, created_at, refs) VALUES "
@@ -152,8 +153,8 @@ def client(tmp_path, monkeypatch, vector_index, ledger_tables):
     tokens = tmp_path / "api-tokens.json"
     tokens.write_text(json.dumps({
         AGENT_UNBOUND: {"name": "unbound-agent", "products": ["*"]},
-        AGENT_BOUND_VIVY: {"name": "vivy-crew", "products": ["*"],
-                          "profile": "vivy/daytime"},
+        AGENT_BOUND_FENNICK: {"name": "fennick-crew", "products": ["*"],
+                          "profile": "fennick/daytime"},
         AGENT_BOUND_COMPANY: {"name": "company-crew", "products": ["*"],
                              "profile": "company/daytime"},
     }))
@@ -161,15 +162,15 @@ def client(tmp_path, monkeypatch, vector_index, ledger_tables):
     ledger_tables(db)
     monkeypatch.setattr(store, "DB_PATH", db)
     black_box_tables.use_registry(tmp_path, monkeypatch, entries={
-        "_meta": {}, "vivy": {"repos": []}, "company": {"repos": []}})
+        "_meta": {}, "fennick": {"repos": []}, "company": {"repos": []}})
     monkeypatch.setattr(reference, "INDEX_DB", index)
     monkeypatch.setattr(identity, "TOKENS", tokens)
     monkeypatch.setattr(store, "WRITES_ENABLED", True)
     monkeypatch.setattr(lease, "TUNABLES", tmp_path / "absent.json")
     crew_registry.roster_add(ORCHESTRATOR, "coder")
     crew_registry.profile_put(
-        ORCHESTRATOR, "vivy", "daytime",
-        [{"kind": "agent", "project": ["vivy"]}], [])
+        ORCHESTRATOR, "fennick", "daytime",
+        [{"kind": "agent", "project": ["fennick"]}], [])
     crew_registry.profile_put(
         ORCHESTRATOR, "company", "daytime",
         [{"kind": "agent", "project": ["company"]}], [])
@@ -215,23 +216,23 @@ def _delete_company_profile():
 
 
 def test_bound_identity_resolves_its_own_profile(client):
-    r = client.get("/profiles/vivy/daytime", headers=_h(AGENT_BOUND_VIVY))
+    r = client.get("/profiles/fennick/daytime", headers=_h(AGENT_BOUND_FENNICK))
     assert r.status_code == 200, r.text
     assert [d["id"] for d in r.json()["documents"]] == [
-        "vivy/agents/coder", "vivy/agents/inside-vivy"]
+        "fennick/agents/coder", "fennick/agents/inside-fennick"]
 
 
 def test_bound_identity_naming_another_profile_gets_the_same_404_as_nonexistent(
         client):
     other_crews_profile = client.get("/profiles/company/daytime",
-                                     headers=_h(AGENT_BOUND_VIVY))
-    nonexistent = client.get("/profiles/nope/nope", headers=_h(AGENT_BOUND_VIVY))
+                                     headers=_h(AGENT_BOUND_FENNICK))
+    nonexistent = client.get("/profiles/nope/nope", headers=_h(AGENT_BOUND_FENNICK))
     assert other_crews_profile.status_code == nonexistent.status_code == 404
     assert other_crews_profile.json() == nonexistent.json()
 
 
 def test_unbound_identity_resolves_either_profile(client):
-    assert client.get("/profiles/vivy/daytime",
+    assert client.get("/profiles/fennick/daytime",
                       headers=_h(AGENT_UNBOUND)).status_code == 200
     assert client.get("/profiles/company/daytime",
                       headers=_h(AGENT_UNBOUND)).status_code == 200
@@ -248,15 +249,15 @@ def _listed(client, token):
 
 
 def test_bound_identity_lists_only_its_own_profile(client):
-    assert _listed(client, AGENT_BOUND_VIVY) == ([("vivy", "daytime")], 1)
+    assert _listed(client, AGENT_BOUND_FENNICK) == ([("fennick", "daytime")], 1)
 
 
 def test_bound_identity_list_is_the_same_whether_another_profile_exists(client):
     """The listing counterpart of the byte-identical 404: deleting the other
     crew's profile changes nothing a bound caller can see."""
-    before = client.get("/profiles", headers=_h(AGENT_BOUND_VIVY)).json()
+    before = client.get("/profiles", headers=_h(AGENT_BOUND_FENNICK)).json()
     _delete_company_profile()
-    after = client.get("/profiles", headers=_h(AGENT_BOUND_VIVY)).json()
+    after = client.get("/profiles", headers=_h(AGENT_BOUND_FENNICK)).json()
     assert before == after
 
 
@@ -269,26 +270,26 @@ def test_bound_identity_whose_profile_is_gone_lists_nothing(client):
 
 def test_unbound_identity_lists_every_profile(client):
     assert _listed(client, AGENT_UNBOUND) == (
-        [("company", "daytime"), ("vivy", "daytime")], 2)
+        [("company", "daytime"), ("fennick", "daytime")], 2)
 
 
 # --- POST /bundles ------------------------------------------------------------
 
 
 def test_bound_identity_issues_against_its_own_profile(client):
-    r = _issue(client, AGENT_BOUND_VIVY, ITEM_VIVY)
+    r = _issue(client, AGENT_BOUND_FENNICK, ITEM_FENNICK)
     assert r.status_code == 201, r.text
     assert [d["id"] for d in r.json()["documents"]] == [
-        "vivy/agents/coder", "vivy/agents/inside-vivy"]
+        "fennick/agents/coder", "fennick/agents/inside-fennick"]
 
 
 def test_bound_identity_issuing_against_another_profile_gets_the_same_422_as_nonexistent(
         client):
-    """`company/daytime` exists and is simply not `AGENT_BOUND_VIVY`'s own.
+    """`company/daytime` exists and is simply not `AGENT_BOUND_FENNICK`'s own.
     The refusal is byte-identical to the one the same request gets once that
     profile row is gone — a bound caller cannot tell "not mine" from "does
     not exist"."""
-    mismatch = _issue(client, AGENT_BOUND_VIVY, ITEM_COMPANY)
+    mismatch = _issue(client, AGENT_BOUND_FENNICK, ITEM_COMPANY)
     assert mismatch.status_code == 422, mismatch.text
     assert mismatch.json()["error"] == "no profile company/daytime"
 
@@ -299,7 +300,7 @@ def test_bound_identity_issuing_against_another_profile_gets_the_same_422_as_non
 
 
 def test_unbound_identity_issues_against_either_profile(client):
-    assert _issue(client, AGENT_UNBOUND, ITEM_VIVY).status_code == 201
+    assert _issue(client, AGENT_UNBOUND, ITEM_FENNICK).status_code == 201
     assert _issue(client, AGENT_UNBOUND, ITEM_COMPANY).status_code == 201
 
 
@@ -307,23 +308,23 @@ def test_unbound_identity_issues_against_either_profile(client):
 
 
 def test_bound_identity_redeems_its_own_profiles_bundle(client):
-    token_id = _issue(client, AGENT_BOUND_VIVY, ITEM_VIVY).json()["token_id"]
-    r = _redeem(client, token_id, AGENT_BOUND_VIVY)
+    token_id = _issue(client, AGENT_BOUND_FENNICK, ITEM_FENNICK).json()["token_id"]
+    r = _redeem(client, token_id, AGENT_BOUND_FENNICK)
     assert r.status_code == 200, r.text
 
 
 def test_bound_identity_cannot_redeem_another_profiles_bundle(client):
     token_id = _issue(client, AGENT_BOUND_COMPANY, ITEM_COMPANY).json()["token_id"]
-    mismatch = _redeem(client, token_id, AGENT_BOUND_VIVY)
-    absent = _redeem(client, "bundle_NEVER_ISSUED", AGENT_BOUND_VIVY)
+    mismatch = _redeem(client, token_id, AGENT_BOUND_FENNICK)
+    absent = _redeem(client, "bundle_NEVER_ISSUED", AGENT_BOUND_FENNICK)
     assert mismatch.status_code == absent.status_code == 404
     assert mismatch.json() == absent.json()
 
 
 def test_unbound_identity_redeems_either_profiles_bundle(client):
-    vivy_token = _issue(client, AGENT_UNBOUND, ITEM_VIVY).json()["token_id"]
+    fennick_token = _issue(client, AGENT_UNBOUND, ITEM_FENNICK).json()["token_id"]
     company_token = _issue(client, AGENT_UNBOUND, ITEM_COMPANY).json()["token_id"]
-    assert _redeem(client, vivy_token, AGENT_UNBOUND).status_code == 200
+    assert _redeem(client, fennick_token, AGENT_UNBOUND).status_code == 200
     assert _redeem(client, company_token, AGENT_UNBOUND).status_code == 200
 
 
@@ -331,15 +332,15 @@ def test_unbound_identity_redeems_either_profiles_bundle(client):
 
 
 def test_bound_identity_checks_out_naming_its_own_profile(client):
-    r = _checkout(client, AGENT_BOUND_VIVY, ITEM_VIVY, "vivy/daytime")
+    r = _checkout(client, AGENT_BOUND_FENNICK, ITEM_FENNICK, "fennick/daytime")
     assert r.status_code == 200, r.text
     assert [d["id"] for d in r.json()["docs"]] == [
-        "vivy/agents/coder", "vivy/agents/inside-vivy"]
+        "fennick/agents/coder", "fennick/agents/inside-fennick"]
 
 
 def test_bound_identity_checking_out_naming_another_profile_gets_the_same_400_as_nonexistent(
         client):
-    mismatch = _checkout(client, AGENT_BOUND_VIVY, ITEM_COMPANY, "company/daytime")
+    mismatch = _checkout(client, AGENT_BOUND_FENNICK, ITEM_COMPANY, "company/daytime")
     assert mismatch.status_code == 400, mismatch.text
     assert mismatch.json()["error"] == "no profile named company/daytime"
 
@@ -356,8 +357,8 @@ def test_bound_identity_checking_out_naming_another_profile_gets_the_same_400_as
 
 
 def test_unbound_identity_checks_out_naming_either_profile(client):
-    assert _checkout(client, AGENT_UNBOUND, ITEM_VIVY,
-                     "vivy/daytime").status_code == 200
+    assert _checkout(client, AGENT_UNBOUND, ITEM_FENNICK,
+                     "fennick/daytime").status_code == 200
     assert _checkout(client, AGENT_UNBOUND, ITEM_COMPANY,
                      "company/daytime").status_code == 200
 
@@ -375,15 +376,15 @@ def test_unbound_identity_checks_out_naming_either_profile(client):
 
 def test_bound_identity_naming_a_persona_outside_its_profile_gets_the_same_model_as_nonexistent(
         client):
-    """`outside-vivy` resolves, unambiguously, to `company/agents/outside-
-    vivy` — a real document, pinning a real model, that `vivy/daytime`'s
-    `include` rules (`project: [vivy]`) do not select. A bound vivy
+    """`outside-fennick` resolves, unambiguously, to `company/agents/outside-
+    fennick` — a real document, pinning a real model, that `fennick/daytime`'s
+    `include` rules (`project: [fennick]`) do not select. A bound fennick
     credential must learn nothing from it: the same `model` a persona that
     resolves to nothing at all gets."""
-    outside = _checkout_persona(client, AGENT_BOUND_VIVY, ITEM_VIVY,
-                                "outside-vivy")
+    outside = _checkout_persona(client, AGENT_BOUND_FENNICK, ITEM_FENNICK,
+                                "outside-fennick")
     assert outside.status_code == 200, outside.text
-    nonexistent = _checkout_persona(client, AGENT_BOUND_VIVY, ITEM_VIVY_B,
+    nonexistent = _checkout_persona(client, AGENT_BOUND_FENNICK, ITEM_FENNICK_B,
                                     "no-such-persona-at-all", owner="s2")
     assert nonexistent.status_code == 200, nonexistent.text
     assert outside.json()["model"] == nonexistent.json()["model"] == (
@@ -404,11 +405,11 @@ def test_bound_identity_pays_the_same_scope_check_whether_or_not_the_persona_exi
         return real(ident, **kw)
 
     monkeypatch.setattr(libapp, "_bound_scope_clause", counting)
-    assert _checkout_persona(client, AGENT_BOUND_VIVY, ITEM_VIVY,
-                             "outside-vivy").status_code == 200
+    assert _checkout_persona(client, AGENT_BOUND_FENNICK, ITEM_FENNICK,
+                             "outside-fennick").status_code == 200
     outside_calls = len(calls)
     calls.clear()
-    assert _checkout_persona(client, AGENT_BOUND_VIVY, ITEM_VIVY_B,
+    assert _checkout_persona(client, AGENT_BOUND_FENNICK, ITEM_FENNICK_B,
                              "no-such-persona-at-all",
                              owner="s2").status_code == 200
     assert outside_calls > 0
@@ -417,10 +418,10 @@ def test_bound_identity_pays_the_same_scope_check_whether_or_not_the_persona_exi
 
 def test_bound_identity_naming_a_persona_inside_its_profile_gets_its_pinned_model(
         client):
-    """`inside-vivy` resolves to `vivy/agents/inside-vivy`, which `vivy/
+    """`inside-fennick` resolves to `fennick/agents/inside-fennick`, which `fennick/
     daytime`'s own `include` rules select — the model pin is served exactly
     as a persona lookup always has been for a document in scope."""
-    r = _checkout_persona(client, AGENT_BOUND_VIVY, ITEM_VIVY_C, "inside-vivy")
+    r = _checkout_persona(client, AGENT_BOUND_FENNICK, ITEM_FENNICK_C, "inside-fennick")
     assert r.status_code == 200, r.text
     assert r.json()["model"] == "haiku"
 
@@ -431,11 +432,11 @@ def test_unbound_identity_gets_the_pinned_model_for_either_persona(client):
     before this scope check existed, for both the in-scope and the
     out-of-scope document."""
     outside = _checkout_persona(client, AGENT_UNBOUND, ITEM_COMPANY,
-                                "outside-vivy")
+                                "outside-fennick")
     assert outside.status_code == 200, outside.text
     assert outside.json()["model"] == "opus"
-    inside = _checkout_persona(client, AGENT_UNBOUND, ITEM_VIVY_D,
-                               "inside-vivy", owner="s2")
+    inside = _checkout_persona(client, AGENT_UNBOUND, ITEM_FENNICK_D,
+                               "inside-fennick", owner="s2")
     assert inside.status_code == 200, inside.text
     assert inside.json()["model"] == "haiku"
 
@@ -449,14 +450,14 @@ def test_unbound_identity_gets_the_pinned_model_for_either_persona(client):
 
 def test_bound_identity_naming_a_persona_outside_its_profile_gets_no_definition(
         client):
-    outside = _checkout_persona(client, AGENT_BOUND_VIVY, ITEM_VIVY,
-                                "outside-vivy")
+    outside = _checkout_persona(client, AGENT_BOUND_FENNICK, ITEM_FENNICK,
+                                "outside-fennick")
     assert outside.status_code == 200, outside.text
-    nonexistent = _checkout_persona(client, AGENT_BOUND_VIVY, ITEM_VIVY_B,
+    nonexistent = _checkout_persona(client, AGENT_BOUND_FENNICK, ITEM_FENNICK_B,
                                     "no-such-persona-at-all", owner="s2")
     assert nonexistent.status_code == 200, nonexistent.text
     o, n = outside.json(), nonexistent.json()
-    assert o["persona_md"] == libapp._persona_md("outside-vivy")
+    assert o["persona_md"] == libapp._persona_md("outside-fennick")
     assert n["persona_md"] == libapp._persona_md("no-such-persona-at-all")
     assert (o["persona_resolved"], o["persona_unresolved_reason"]) == (
         n["persona_resolved"], n["persona_unresolved_reason"]) == (
@@ -465,7 +466,7 @@ def test_bound_identity_naming_a_persona_outside_its_profile_gets_no_definition(
 
 def test_bound_identity_naming_a_persona_inside_its_profile_gets_its_definition(
         client):
-    r = _checkout_persona(client, AGENT_BOUND_VIVY, ITEM_VIVY_C, "inside-vivy")
+    r = _checkout_persona(client, AGENT_BOUND_FENNICK, ITEM_FENNICK_C, "inside-fennick")
     assert r.status_code == 200, r.text
     assert r.json()["persona_resolved"] is True
-    assert r.json()["persona_md"] != libapp._persona_md("inside-vivy")
+    assert r.json()["persona_md"] != libapp._persona_md("inside-fennick")

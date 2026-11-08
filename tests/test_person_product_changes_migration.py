@@ -65,13 +65,13 @@ def test_the_table_refuses_an_action_other_than_grant_or_revoke(tmp_path):
             conn.execute(
                 "INSERT INTO person_product_changes (person_id, product, "
                 "action, changed_at, changed_by) VALUES "
-                "('person_a', 'vivy', ?, '2026-01-01', 'x')", (action,))
+                "('person_a', 'fennick', ?, '2026-01-01', 'x')", (action,))
         for action in ("GRANT", "delete", ""):
             with pytest.raises(sqlite3.IntegrityError):
                 conn.execute(
                     "INSERT INTO person_product_changes (person_id, product, "
                     "action, changed_at, changed_by) VALUES "
-                    "('person_a', 'vivy', ?, '2026-01-01', 'x')", (action,))
+                    "('person_a', 'fennick', ?, '2026-01-01', 'x')", (action,))
     finally:
         conn.close()
 
@@ -86,7 +86,7 @@ def test_the_same_change_may_be_recorded_twice(tmp_path):
             conn.execute(
                 "INSERT INTO person_product_changes (person_id, product, "
                 "action, changed_at, changed_by) VALUES "
-                "('person_a', 'vivy', ?, '2026-01-01', 'x')", (action,))
+                "('person_a', 'fennick', ?, '2026-01-01', 'x')", (action,))
         assert conn.execute(
             "SELECT COUNT(*) FROM person_product_changes").fetchone()[0] == 3
     finally:

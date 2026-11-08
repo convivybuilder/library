@@ -30,7 +30,7 @@ import projects
 import protocol
 import store
 
-AGENT = "agent-token-vivy"
+AGENT = "agent-token-fennick"
 WIDE = "agent-token-wide"
 
 
@@ -40,8 +40,8 @@ def _ts(**delta):
 
 REGISTRY = {
     "_scopes": {"platform": {}, "commercial": {}},
-    "vivy": {"aliases": ["viv"], "repos": ["vivy-app"]},
-    "constance": {"aliases": [], "repos": []},
+    "fennick": {"aliases": ["viv"], "repos": ["fennick-app"]},
+    "marlow": {"aliases": [], "repos": []},
     "keel": {"aliases": ["steward"], "repos": ["substrate", "agent-platform"]},
 }
 
@@ -83,18 +83,18 @@ def client(tmp_path, monkeypatch, vector_index):
     conn.executemany(
         "INSERT INTO corrections_queues (id, product, created_at) "
         "VALUES (?,?,?)",
-        [("cq_vivy", "vivy", "2026-08-01 00:00:00.000000"),
-         ("cq_constance", "constance", "2026-08-01 00:00:00.000000")])
+        [("cq_fennick", "fennick", "2026-08-01 00:00:00.000000"),
+         ("cq_marlow", "marlow", "2026-08-01 00:00:00.000000")])
     conn.executemany(
         "INSERT INTO issue_items (id, product, title, type, state, created_at, "
         "once_key) VALUES (?,?,?,?,?,?,?)",
-        [("issue_epic_v", "vivy", "A vivy epic", "epic", "open",
+        [("issue_epic_v", "fennick", "A fennick epic", "epic", "open",
           "2026-08-01 12:00:00.000000", "k-epic-v"),
-         ("issue_task_v", "vivy", "A vivy task", "task", "open",
+         ("issue_task_v", "fennick", "A fennick task", "task", "open",
           "2026-08-01 12:01:00.000000", "k-task-v"),
-         # THE PROBE TARGETS. A caller scoped to vivy must not learn anything
+         # THE PROBE TARGETS. A caller scoped to fennick must not learn anything
          # about either row through `parent_id`.
-         ("issue_epic_c", "constance", "A constance epic", "epic", "open",
+         ("issue_epic_c", "marlow", "A marlow epic", "epic", "open",
           "2026-08-01 12:02:00.000000", "k-epic-c"),
          # **THIS ONE IS THE PROBE THAT BITES, AND IT HAS TO BE A NON-EPIC.** A
          # first version of the ordering test used the epic above, which passes
@@ -102,7 +102,7 @@ def client(tmp_path, monkeypatch, vector_index):
          # the scope check moved after the type check — a test that watched the
          # right door and could not see it open. Only a target that would FAIL
          # the type check distinguishes the two orderings.
-         ("issue_task_c", "constance", "A constance task", "task", "open",
+         ("issue_task_c", "marlow", "A marlow task", "task", "open",
           "2026-08-01 12:03:00.000000", "k-task-c")])
     # **A CLAIMED ROW WITH A LIVE LEASE, so the idempotent hit has a real claim to
     # get wrong.** Every other row here is `open`, and `claim_status` answers an
@@ -112,7 +112,7 @@ def client(tmp_path, monkeypatch, vector_index):
     conn.execute(
         "INSERT INTO issue_items (id, product, title, type, state, claimed_by, "
         "claimed_at, created_at, once_key) VALUES (?,?,?,?,?,?,?,?,?)",
-        ("issue_held_v", "vivy", "A vivy task somebody holds", "task",
+        ("issue_held_v", "fennick", "A fennick task somebody holds", "task",
          "claimed", "session-1", _ts(hours=1), _ts(hours=2), "k-held-v"))
     conn.execute(
         "INSERT INTO issue_leases (id, root_id, taken_for, holder, run_id, "
@@ -124,7 +124,7 @@ def client(tmp_path, monkeypatch, vector_index):
 
     tokens = tmp_path / "api-tokens.json"
     tokens.write_text(json.dumps({
-        AGENT: {"name": "vivy-agent", "products": ["vivy"]},
+        AGENT: {"name": "fennick-agent", "products": ["fennick"]},
         WIDE: {"name": "wide-agent", "products": ["*"]},
     }))
     registry = tmp_path / "projects.json"
@@ -150,7 +150,7 @@ def _h(token=AGENT):
 
 
 def _body(**over):
-    out = {"product": "vivy", "title": "something to do", "severity": "medium"}
+    out = {"product": "fennick", "title": "something to do", "severity": "medium"}
     out.update(over)
     return out
 
@@ -158,15 +158,15 @@ def _body(**over):
 # --- the product registry ------------------------------------------------------
 
 
-@pytest.mark.parametrize("given", ["vivy", "VIVY", "Vivy", " vivy ", "viv",
-                                   "vivy-app"])
+@pytest.mark.parametrize("given", ["fennick", "FENNICK", "Fennick", " fennick ", "viv",
+                                   "fennick-app"])
 def test_a_product_resolves_to_its_canonical_slug(client, given):
     """**The bug this closes**: `Substrate` beside `substrate`, one item invisible
     to every view asking for the real slug. A slug, an alias, a repo name or any
     casing resolves, and one canonical value is stored."""
     r = client.post("/items", json=_body(product=given), headers=_h(WIDE))
     assert r.status_code == 201
-    assert r.json()["product"] == "vivy"
+    assert r.json()["product"] == "fennick"
 
 
 def test_a_non_project_scope_is_a_legal_product(client):
@@ -182,15 +182,15 @@ def test_an_unknown_product_is_refused_and_says_what_is_accepted(client):
     r = client.post("/items", json=_body(product="not-a-project"),
                     headers=_h(WIDE))
     assert r.status_code == 400
-    assert "vivy" in r.json()["known"]
+    assert "fennick" in r.json()["known"]
 
 
 def test_scope_is_checked_against_the_resolved_slug(client):
-    """A token scoped to `vivy` must not be refused for writing `viv`, and must
+    """A token scoped to `fennick` must not be refused for writing `viv`, and must
     not be admitted for something that merely resembles its product."""
     assert client.post("/items", json=_body(product="viv"),
                        headers=_h()).status_code == 201
-    assert client.post("/items", json=_body(product="constance"),
+    assert client.post("/items", json=_body(product="marlow"),
                        headers=_h()).status_code == 404
 
 
@@ -203,7 +203,7 @@ def test_an_unreadable_registry_accepts_rather_than_refusing(client, monkeypatch
     projects.reload()
     assert not projects.available()
     assert projects.resolve("anything-at-all") == "anything-at-all"
-    r = client.post("/items", json=_body(product="vivy"), headers=_h())
+    r = client.post("/items", json=_body(product="fennick"), headers=_h())
     assert r.status_code == 201
 
 
@@ -235,7 +235,7 @@ def test_reload_drops_every_cache(client, tmp_path, monkeypatch):
     # the process-wide cache; run alone it passed even with `reload` clearing one
     # cache. Resolving against the fixture registry FIRST is what makes the stale
     # value the assertion looks for actually exist at that point.
-    assert projects.resolve("vivy") == "vivy"
+    assert projects.resolve("fennick") == "fennick"
     assert projects.private_repos() == frozenset()
     assert projects.private_products() == frozenset()
     other = tmp_path / "other.json"
@@ -247,7 +247,7 @@ def test_reload_drops_every_cache(client, tmp_path, monkeypatch):
     monkeypatch.setattr(projects, "REGISTRY_PATH", other)
     projects.reload()
     assert projects.resolve("newproject") == "newproject"
-    assert projects.resolve("vivy") is None, "the resolution map was stale"
+    assert projects.resolve("fennick") is None, "the resolution map was stale"
     assert projects.private_repos() == frozenset({"secretproject", "secret-repo"}), \
         "private_repos was stale"
     assert projects.private_products() == frozenset({"secretproject"}), \
@@ -297,11 +297,11 @@ def test_a_parent_in_another_product_is_refused_once_it_is_visible(client):
     """Past the scope check the caller can already read the parent, so a specific
     error discloses nothing and a vague one would only make a real mistake harder
     to fix."""
-    r = client.post("/items", json=_body(product="vivy",
+    r = client.post("/items", json=_body(product="fennick",
                                          parent_id="issue_epic_c"),
                     headers=_h(WIDE))
     assert r.status_code == 400
-    assert "constance" in r.json()["error"]
+    assert "marlow" in r.json()["error"]
 
 
 def test_a_malformed_parent_id_is_refused(client):
@@ -316,9 +316,9 @@ def test_a_malformed_parent_id_is_refused(client):
 
 
 def test_an_item_can_be_filed_under_its_products_corrections_queue(client):
-    r = client.post("/items", json=_body(parent_id="cq_vivy"), headers=_h())
+    r = client.post("/items", json=_body(parent_id="cq_fennick"), headers=_h())
     assert r.status_code == 201, r.text
-    assert r.json()["parent_id"] == "cq_vivy"
+    assert r.json()["parent_id"] == "cq_fennick"
     # The same sequence a NULL parent gets — `mint_item_key` treats an
     # explicit queue parent and no parent as the one case, "a correction".
     assert r.json()["key"] == "CQ·1"
@@ -331,17 +331,17 @@ def test_another_products_queue_is_refused_exactly_like_a_missing_parent(client)
     either."""
     absent = client.post("/items", json=_body(parent_id="cq_nope"),
                          headers=_h())
-    foreign = client.post("/items", json=_body(parent_id="cq_constance"),
+    foreign = client.post("/items", json=_body(parent_id="cq_marlow"),
                           headers=_h())
     assert absent.status_code == foreign.status_code == 400
     assert absent.json() == {"error": "parent not found: cq_nope"}
-    assert foreign.json() == {"error": "parent not found: cq_constance"}
+    assert foreign.json() == {"error": "parent not found: cq_marlow"}
 
 
 def test_an_epic_with_a_queue_parent_is_refused(client):
     """An epic's parent is an epic or nothing — never a corrections queue,
     which holds work items."""
-    r = client.post("/items", json=_body(type="epic", parent_id="cq_vivy"),
+    r = client.post("/items", json=_body(type="epic", parent_id="cq_fennick"),
                     headers=_h())
     assert r.status_code == 400
     assert "epic" in r.json()["error"]
@@ -352,7 +352,7 @@ def test_a_queue_id_as_a_prerequisite_is_refused_as_an_unknown_item_id(client):
     corrections queue has no row there — the same refusal a made-up id
     gets."""
     r = client.post("/items", json=_body(
-        prerequisites=[{"item": "cq_vivy"}]), headers=_h())
+        prerequisites=[{"item": "cq_fennick"}]), headers=_h())
     assert r.status_code == 400
     assert "unknown item id" in r.json()["error"]
 
@@ -364,7 +364,7 @@ def test_a_queue_id_as_a_prerequisite_is_refused_as_an_unknown_item_id(client):
 def test_a_create_with_no_parent_stores_the_products_queue(client):
     r = client.post("/items", json=_body(), headers=_h())
     assert r.status_code == 201, r.text
-    assert r.json()["parent_id"] == "cq_vivy"
+    assert r.json()["parent_id"] == "cq_fennick"
 
 
 def test_an_epic_created_with_no_parent_stays_top_level(client):
@@ -381,7 +381,7 @@ def test_a_new_products_first_corrections_get_exactly_one_queue(client):
     the_same_scope_never_collide`, just above): `insert_item` already holds
     `BEGIN IMMEDIATE` before either runs. Eight real threads racing to file
     `keel`'s very first correction — a product with no seeded queue, unlike
-    `vivy` and `constance` above — must still end with one queue row, not
+    `fennick` and `marlow` above — must still end with one queue row, not
     eight."""
     results = []
     results_lock = threading.Lock()
@@ -422,7 +422,7 @@ def test_an_item_can_be_filed_with_found_during(client):
     # gets no epic and lands in its product's corrections queue exactly as
     # it would with no `found_during` at all (`library/specs/one-home-per-
     # work-item`, PR 2).
-    assert r.json()["parent_id"] == "cq_vivy"
+    assert r.json()["parent_id"] == "cq_fennick"
 
 
 def test_found_during_absent_is_none(client):
@@ -529,11 +529,11 @@ def test_an_unknown_product_lists_only_names_this_caller_may_use(client):
     (security-reviewer, PR #5)."""
     scoped = client.post("/items", json=_body(product="nope"),
                          headers=_h()).json()["known"]
-    assert "constance" not in scoped
-    assert "vivy" in scoped
+    assert "marlow" not in scoped
+    assert "fennick" in scoped
     wide = client.post("/items", json=_body(product="nope"),
                        headers=_h(WIDE)).json()["known"]
-    assert "constance" in wide
+    assert "marlow" in wide
 
 
 def test_a_registry_holding_only_metadata_is_not_available(client, tmp_path,
@@ -550,7 +550,7 @@ def test_a_registry_holding_only_metadata_is_not_available(client, tmp_path,
     assert projects._snapshot().raw, "the fixture should parse to something non-empty"
     assert not projects.available(), "a metadata-only registry is not usable"
     # Fails open rather than refusing everything.
-    assert projects.resolve("vivy") == "vivy"
+    assert projects.resolve("fennick") == "fennick"
     assert client.post("/items", json=_body(), headers=_h()).status_code == 201
 
 
@@ -611,18 +611,18 @@ def test_a_collision_out_of_scope_carries_nothing(client):
     r = client.post("/items", json=_body(once_key="k-epic-c"), headers=_h())
     assert r.status_code == 409
     assert r.json() == {"error": "once_key already in use"}
-    assert "constance" not in r.text
+    assert "marlow" not in r.text
 
 
 def test_the_gate_asks_for_the_capability_as_well_as_the_scope():
     """The same two halves the signal gate needs, exercised directly because the
     route's own `item.create` check refuses first and would mask it."""
     incapable = identity.Identity(actor="future", kind="reader",
-                                  products=frozenset({"vivy"}))
-    assert not libapp._can_file_into(incapable, {"product": "vivy"})
+                                  products=frozenset({"fennick"}))
+    assert not libapp._can_file_into(incapable, {"product": "fennick"})
     capable = identity.Identity(actor="a", kind="agent",
-                                products=frozenset({"vivy"}))
-    assert libapp._can_file_into(capable, {"product": "vivy"})
+                                products=frozenset({"fennick"}))
+    assert libapp._can_file_into(capable, {"product": "fennick"})
 
 
 def test_a_create_only_caller_is_refused_the_row_at_the_route(
@@ -639,7 +639,7 @@ def test_a_create_only_caller_is_refused_the_row_at_the_route(
     r = client.post("/items", json=_body(once_key="k-task-v"), headers=_h())
     assert r.status_code == 409
     assert r.json() == {"error": "once_key already in use"}
-    assert "A vivy task" not in r.text
+    assert "A fennick task" not in r.text
 
 
 def test_the_gate_asks_for_the_read_capability_as_well(monkeypatch):
@@ -650,10 +650,10 @@ def test_the_gate_asks_for_the_read_capability_as_well(monkeypatch):
         **identity.ROLE_CAPS,
         "create_only": frozenset({"item.create"})})
     create_only = identity.Identity(actor="future-role", kind="create_only",
-                                    products=frozenset({"vivy"}))
+                                    products=frozenset({"fennick"}))
     assert identity.authorized(create_only, "item.create")
     assert not identity.authorized(create_only, "item.read")
-    assert not libapp._can_file_into(create_only, {"product": "vivy"})
+    assert not libapp._can_file_into(create_only, {"product": "fennick"})
 
 
 # --- what lands ----------------------------------------------------------------
@@ -668,7 +668,7 @@ def test_the_creation_event_is_written_with_the_item(client):
         "SELECT actor, from_state, to_state FROM issue_events WHERE item_id = ?",
         (created["id"],)).fetchall()
     conn.close()
-    assert rows == [("vivy-agent", None, "open")]
+    assert rows == [("fennick-agent", None, "open")]
 
 
 def test_a_validation_failure_reaches_no_write_at_all(client):
@@ -725,7 +725,7 @@ def test_the_filer_is_recorded_from_the_token(client):
     stored = conn.execute("SELECT created_by, created_by_kind FROM issue_items "
                           "WHERE id = ?", (created["id"],)).fetchone()
     conn.close()
-    assert stored == ("vivy-agent", "agent")
+    assert stored == ("fennick-agent", "agent")
 
 
 def test_a_created_item_is_readable_back(client):
@@ -800,6 +800,170 @@ def test_refs_is_still_validated_after_the_topics_split(client):
     assert r.status_code == 400 and "refs" in r.json()["error"]
 
 
+# --- a create-time url is source context, not a fix PR (CQ·248) ----------------
+
+
+def test_a_create_time_url_serves_as_source_url_not_pr_url(client):
+    """CQ·576's defect: a url filed as source context must not read as the
+    item's fix PR. A client that predates this change still gets a 201."""
+    r = client.post(
+        "/items",
+        json=_body(refs={"url": "https://github.com/convivy/agent-platform/pull/1038"}),
+        headers=_h(WIDE))
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["pr_url"] is None
+    assert body["pr_repo"] is None
+    assert body["source_url"] == "https://github.com/convivy/agent-platform/pull/1038"
+    assert "url" not in body["refs"]
+    assert body["refs"]["source_url"] == \
+        "https://github.com/convivy/agent-platform/pull/1038"
+
+
+def test_a_create_with_no_refs_serves_source_url_none(client):
+    r = client.post("/items", json=_body(), headers=_h(WIDE))
+    assert r.status_code == 201, r.text
+    assert r.json()["source_url"] is None
+
+
+def test_a_create_time_url_wins_over_a_create_time_source_url(client):
+    """`_refs_with_url_renamed_to_source`'s own precedence rule: when both
+    keys are sent at once, url's value is the one that becomes source_url."""
+    r = client.post(
+        "/items",
+        json=_body(refs={"url": "a", "source_url": "b"}),
+        headers=_h(WIDE))
+    assert r.status_code == 201, r.text
+    assert r.json()["source_url"] == "a"
+
+
+def test_link_pr_after_a_create_time_url_sets_pr_url_and_keeps_source_url(client):
+    create = client.post(
+        "/items",
+        json=_body(refs={"url": "https://github.com/convivy/agent-platform/pull/1038"}),
+        headers=_h(WIDE))
+    assert create.status_code == 201, create.text
+    item_id = create.json()["id"]
+
+    linked = client.post(
+        f"/items/{item_id}/link-pr",
+        json={"pr": 9, "url": "https://github.com/convivy/library/pull/9",
+              "owner": "fennick-agent"},
+        headers=_h(WIDE))
+    assert linked.status_code == 200, linked.text
+    body = linked.json()
+    assert body["pr"] == 9
+    assert body["pr_url"] == "https://github.com/convivy/library/pull/9"
+    assert body["source_url"] == \
+        "https://github.com/convivy/agent-platform/pull/1038"
+
+
+def test_a_resolve_time_url_serves_as_source_url_not_pr_url(client):
+    """The same door as create (`_do_resolve`'s `refs` merge): a url filed
+    through /resolve must not read as the item's fix PR either."""
+    created = client.post("/items", json=_body(), headers=_h(WIDE)).json()
+    r = client.post(
+        f"/items/{created['id']}/resolve",
+        json={"resolution": "fixed",
+              "refs": {"url": "https://github.com/convivy/agent-platform/pull/1038"}},
+        headers=_h(WIDE))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["pr_url"] is None
+    assert body["pr_repo"] is None
+    assert body["source_url"] == "https://github.com/convivy/agent-platform/pull/1038"
+    assert "url" not in body["refs"]
+
+
+def test_a_resolve_time_url_does_not_overwrite_a_linked_pr_url(client):
+    """A url filed through /resolve on an item /link-pr already linked must
+    not disturb the linked pr_url."""
+    created = client.post("/items", json=_body(), headers=_h(WIDE)).json()
+    linked = client.post(
+        f"/items/{created['id']}/link-pr",
+        json={"pr": 9, "url": "https://github.com/convivy/library/pull/9",
+              "owner": "fennick-agent"},
+        headers=_h(WIDE))
+    assert linked.status_code == 200, linked.text
+
+    r = client.post(
+        f"/items/{created['id']}/resolve",
+        json={"resolution": "fixed",
+              "refs": {"url": "https://github.com/convivy/agent-platform/pull/1038"}},
+        headers=_h(WIDE))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["pr_url"] == "https://github.com/convivy/library/pull/9"
+    assert body["source_url"] == "https://github.com/convivy/agent-platform/pull/1038"
+
+
+# --- refs.pr is /link-pr's alone (CQ·248) ---------------------------------------
+
+
+def test_a_create_with_refs_pr_is_refused_and_writes_no_row(client):
+    """`/link-pr` is the only writer of `refs.pr`; a create that names one would
+    read as content rather than a link, with no row to protect yet."""
+    conn = sqlite3.connect(store.DB_PATH)
+    before = conn.execute("SELECT COUNT(*) FROM issue_items").fetchone()[0]
+    conn.close()
+
+    r = client.post("/items", json=_body(refs={"pr": 5}), headers=_h(WIDE))
+    assert r.status_code == 400, r.text
+    assert "link-pr" in r.json()["error"]
+
+    conn = sqlite3.connect(store.DB_PATH)
+    after = conn.execute("SELECT COUNT(*) FROM issue_items").fetchone()[0]
+    conn.close()
+    assert after == before
+
+
+def test_a_resolve_with_refs_pr_is_refused_and_leaves_the_linked_pr_untouched(
+        client):
+    """A resolve naming a different `pr` must not replace the PR `/link-pr`
+    already recorded, leaving `pr` and `pr_url` naming different PRs."""
+    created = client.post("/items", json=_body(), headers=_h(WIDE)).json()
+    linked = client.post(
+        f"/items/{created['id']}/link-pr",
+        json={"pr": 5, "url": "https://github.com/convivy/library/pull/5",
+              "owner": "fennick-agent"},
+        headers=_h(WIDE))
+    assert linked.status_code == 200, linked.text
+
+    r = client.post(
+        f"/items/{created['id']}/resolve",
+        json={"resolution": "fixed", "refs": {"pr": 6}},
+        headers=_h(WIDE))
+    assert r.status_code == 400, r.text
+    assert "link-pr" in r.json()["error"]
+
+    fresh = client.get(f"/items/{created['id']}", headers=_h(WIDE)).json()
+    assert fresh["state"] == store.ITEM_STATE_PR_OPEN
+    assert fresh["pr"] == 5
+    assert fresh["pr_url"] == "https://github.com/convivy/library/pull/5"
+
+
+def test_a_resolve_with_refs_fix_pr_still_works(client):
+    """Only `pr` is refused; another key in `refs` is unaffected."""
+    created = client.post("/items", json=_body(), headers=_h(WIDE)).json()
+    r = client.post(
+        f"/items/{created['id']}/resolve",
+        json={"resolution": "fixed", "refs": {"fix_pr": "some-text"}},
+        headers=_h(WIDE))
+    assert r.status_code == 200, r.text
+    assert r.json()["refs"]["fix_pr"] == "some-text"
+
+
+def test_a_resolve_with_refs_duplicate_of_still_works(client):
+    other = client.post("/items", json=_body(), headers=_h(WIDE)).json()
+    created = client.post("/items", json=_body(), headers=_h(WIDE)).json()
+    r = client.post(
+        f"/items/{created['id']}/resolve",
+        json={"resolution": "duplicate", "refs": {"duplicate_of": other["id"]}},
+        headers=_h(WIDE))
+    assert r.status_code == 200, r.text
+    assert r.json()["refs"]["duplicate_of"] == other["id"]
+
+
 # --- the stable item key (issue_01M2P5CBY5JY8SK5W344CV82AE) --------------------
 
 
@@ -860,13 +1024,13 @@ def test_a_correction_gets_its_own_sequence_independent_of_epics(client):
 
 
 def test_two_products_number_their_epics_independently(client):
-    vivy_epic = client.post("/items", json=_body(type="epic"),
+    fennick_epic = client.post("/items", json=_body(type="epic"),
                             headers=_h(WIDE)).json()
-    constance_epic = client.post(
-        "/items", json=_body(type="epic", product="constance"),
+    marlow_epic = client.post(
+        "/items", json=_body(type="epic", product="marlow"),
         headers=_h(WIDE)).json()
-    assert vivy_epic["key"] == "E1"
-    assert constance_epic["key"] == "E1"
+    assert fennick_epic["key"] == "E1"
+    assert marlow_epic["key"] == "E1"
 
 
 def test_a_sub_items_numbering_is_scoped_to_its_own_epic(client):

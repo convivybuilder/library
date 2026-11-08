@@ -156,14 +156,14 @@ def client(tmp_path, sock_dir, monkeypatch):
     tokens = tmp_path / "t.json"
     tokens.write_text(json.dumps({
         AGENT: {"name": "wide", "products": ["*"]},
-        NARROW: {"name": "vivy-only", "products": ["vivy"]}}))
+        NARROW: {"name": "fennick-only", "products": ["fennick"]}}))
     monkeypatch.setattr(store, "DB_PATH", db)
     monkeypatch.setattr(identity, "TOKENS", tokens)
     monkeypatch.setattr(runs, "SOCKET_PATH", Path(sock_dir) / "r.sock")
     registry = tmp_path / "projects.json"
     registry.write_text(json.dumps({
-        "_meta": {}, "library": {"repos": ["library"]}, "vivy": {"repos": ["vivy"]},
-        "cfo": {"private": True, "task_text_public": False, "repos": ["CFO"]}}))
+        "_meta": {}, "library": {"repos": ["library"]}, "fennick": {"repos": ["fennick"]},
+        "quill": {"private": True, "task_text_public": False, "repos": ["QUILL"]}}))
     monkeypatch.setattr(projects, "REGISTRY_PATH", registry)
     projects.reload()
     yield TestClient(libapp.app)
@@ -191,7 +191,7 @@ def test_it_serves_what_the_register_reports(client, sock_dir):
 
 
 def test_refuses_any_parameter(client):
-    r = client.get("/runs?product=vivy", headers=_headers())
+    r = client.get("/runs?product=fennick", headers=_headers())
     assert r.status_code == 400
     assert r.json()["unknown"] == ["product"]
     assert r.json()["supported"] == []
@@ -314,13 +314,13 @@ def test_a_scoped_caller_does_not_see_another_products_run(client, sock_dir):
     private crew is exactly the content ADR-0043's wall exists to keep in."""
     reg = FakeRegister(os.path.join(sock_dir, "r.sock"),
                        {"runs": [a_run(repo="library"),
-                                 a_run(run_id="run-cccc3333", repo="vivy")]})
+                                 a_run(run_id="run-cccc3333", repo="fennick")]})
     try:
         wide = client.get("/runs", headers=_headers()).json()
         assert wide["count"] == 2
         narrow = client.get("/runs", headers=_headers(NARROW)).json()
         assert narrow["count"] == 1
-        assert narrow["runs"][0]["repo"] == "vivy"
+        assert narrow["runs"][0]["repo"] == "fennick"
     finally:
         reg.close()
 
@@ -385,23 +385,23 @@ def test_a_black_box_crews_run_is_not_served_at_all(client, sock_dir):
     the Library and none of its agents visible to Orient."
 
     **Its agents, not merely its task text** — so the row is dropped rather than
-    a field redacted. `cfo` is `private: true` with `task_text_public: false`,
+    a field redacted. `quill` is `private: true` with `task_text_public: false`,
     which agrees rather than softening it. The register carries live `task` text
     and `worktree` paths, so this route was one wildcard token away from handing
     a black box's working content to a client.
     """
     reg = FakeRegister(os.path.join(sock_dir, "r.sock"),
                        {"runs": [a_run(repo="library"),
-                                 a_run(run_id="run-dddd4444", repo="CFO",
+                                 a_run(run_id="run-dddd4444", repo="QUILL",
                                        task="something confidential",
-                                       worktree="/srv/convivy/worktrees/CFO")]})
+                                       worktree="/srv/convivy/worktrees/QUILL")]})
     try:
         body = client.get("/runs", headers=_headers()).json()
         assert body["count"] == 1
         assert [r["repo"] for r in body["runs"]] == ["library"]
         # Not merely absent from the list — absent from the response entirely.
         assert "confidential" not in json.dumps(body)
-        assert "CFO" not in json.dumps(body)
+        assert "QUILL" not in json.dumps(body)
     finally:
         reg.close()
 
@@ -439,14 +439,14 @@ def test_the_holder_join_does_not_leak_an_item_outside_the_callers_scope(
     which point the id and its existence have already left, which is the
     existence oracle `get_item`'s own comment exists to prevent.
     """
-    _seed_lease(product="vivy")           # the ITEM is vivy's
+    _seed_lease(product="fennick")           # the ITEM is fennick's
     reg = FakeRegister(os.path.join(sock_dir, "r.sock"),
                        {"runs": [a_run(repo="library")]})   # the RUN is library's
     try:
         wide = client.get("/runs", headers=_headers()).json()["runs"][0]
         assert wide["holds"]["item_id"] == "issue_root"
 
-        # NARROW is scoped to vivy: it cannot see the library RUN at all.
+        # NARROW is scoped to fennick: it cannot see the library RUN at all.
         narrow = client.get("/runs", headers=_headers(NARROW)).json()
         assert narrow["count"] == 0
     finally:
@@ -526,5 +526,177 @@ def test_an_oversized_answer_is_refused_rather_than_read_into_memory(client,
         body = client.get("/runs", headers=_headers()).json()
         assert body["available"] is False
         assert "larger than" in body["reason"]
+    finally:
+        reg.close()
+
+
+# --- GET /sessions ------------------------------------------------------------
+
+def a_session(**over):
+    row = {"session": "co-library", "crew": "library", "state": "working",
+           "alive": True, "progressing": True, "last_event_age": 12.5,
+           "ctx_pct": 40.0, "agent_run_count": 1,
+           "working_on": {"text": "building CQ-254", "age": 30.0,
+                           "since": 1_700_000_000.0, "stale": False}}
+    row.update(over)
+    return row
+
+
+def test_sessions_serves_what_the_register_reports(client, sock_dir):
+    reg = FakeRegister(os.path.join(sock_dir, "r.sock"),
+                       {"generated_at": "2026-11-02T13:00:00Z",
+                        "sessions": [a_session(),
+                                     a_session(session="co-fennick",
+                                               crew="fennick")]})
+    try:
+        r = client.get("/sessions", headers=_headers())
+        assert r.status_code == 200
+        body = r.json()
+        assert body["available"] is True
+        assert body["generated_at"] == "2026-11-02T13:00:00Z"
+        assert {s["session"] for s in body["sessions"]} == {
+            "co-library", "co-fennick"}
+        row = next(s for s in body["sessions"] if s["session"] == "co-library")
+        assert row["working_on"] == {"text": "building CQ-254", "age": 30.0,
+                                      "since": 1_700_000_000.0, "stale": False}
+    finally:
+        reg.close()
+
+
+def test_sessions_refuses_any_parameter(client):
+    r = client.get("/sessions?product=fennick", headers=_headers())
+    assert r.status_code == 400
+    assert r.json()["unknown"] == ["product"]
+    assert r.json()["supported"] == []
+
+
+def test_sessions_is_read_fresh_every_request_not_cached(client, sock_dir):
+    """Unlike `/runs`, the Bosun builds `/sessions` fresh with no TTL of its
+    own (the contract), so the Library must not cache it either."""
+    reg = FakeRegister(os.path.join(sock_dir, "r.sock"),
+                       {"sessions": [a_session()]})
+    try:
+        for _ in range(3):
+            assert client.get("/sessions", headers=_headers()).status_code == 200
+        assert reg.reads == 3
+    finally:
+        reg.close()
+
+
+def test_a_missing_register_is_an_empty_sessions_answer_not_an_error(client):
+    r = client.get("/sessions", headers=_headers())
+    assert r.status_code == 200
+    assert r.json()["available"] is False
+    assert r.json()["sessions"] == []
+    assert "no run register" in r.json()["reason"]
+
+
+@pytest.mark.parametrize("behaviour,fragment", [
+    ("not-found", "answered"),
+    ("garbage", "not JSON"),
+    ("wrong-shape", "not the agreed shape"),
+    ("huge", "larger than"),
+])
+def test_sessions_a_bad_answer_degrades_rather_than_raising(client, sock_dir,
+                                                            behaviour, fragment):
+    reg = FakeRegister(os.path.join(sock_dir, "r.sock"), None, behaviour=behaviour)
+    try:
+        r = client.get("/sessions", headers=_headers())
+        assert r.status_code == 200
+        assert r.json()["available"] is False
+        assert fragment in r.json()["reason"]
+        assert r.json()["sessions"] == []
+    finally:
+        reg.close()
+
+
+def test_a_register_that_hangs_degrades_the_sessions_route_too(
+        client, sock_dir, monkeypatch):
+    reg = FakeRegister(os.path.join(sock_dir, "r.sock"), None, behaviour="hang")
+    try:
+        monkeypatch.setattr(runs, "TIMEOUT_SECONDS", 0.3)
+        r = client.get("/sessions", headers=_headers())
+        assert r.status_code == 200
+        assert r.json()["available"] is False
+        assert "did not answer" in r.json()["reason"]
+    finally:
+        reg.close()
+
+
+def test_a_session_field_the_bosun_adds_does_not_reach_a_client(client, sock_dir):
+    """The same allowlist discipline as `/runs`'s `RUN_FIELDS`: a field the
+    contract does not name does not reach a client just because the Bosun
+    started sending it, `working_on`'s own nested fields included."""
+    reg = FakeRegister(os.path.join(sock_dir, "r.sock"),
+                       {"sessions": [a_session(
+                           cwd="/secret/worktree", session_id="abc123",
+                           working_on={"text": "x", "age": 1, "since": 1,
+                                       "stale": False, "transcript": "leak"})]})
+    try:
+        row = client.get("/sessions", headers=_headers()).json()["sessions"][0]
+        assert "cwd" not in row
+        assert "session_id" not in row
+        assert "transcript" not in row["working_on"]
+        assert set(row) == set(runs.SESSION_FIELDS) | {"working_on"}
+        assert set(row["working_on"]) == set(runs.WORKING_ON_FIELDS)
+    finally:
+        reg.close()
+
+
+def test_a_scoped_caller_does_not_see_another_crews_session(client, sock_dir):
+    reg = FakeRegister(os.path.join(sock_dir, "r.sock"),
+                       {"sessions": [a_session(session="co-library", crew="library"),
+                                     a_session(session="co-fennick", crew="fennick")]})
+    try:
+        wide = client.get("/sessions", headers=_headers()).json()
+        assert {s["session"] for s in wide["sessions"]} == {
+            "co-library", "co-fennick"}
+        narrow = client.get("/sessions", headers=_headers(NARROW)).json()
+        assert [s["session"] for s in narrow["sessions"]] == ["co-fennick"]
+    finally:
+        reg.close()
+
+
+def test_a_black_box_crews_session_is_not_served_at_all(client, sock_dir):
+    reg = FakeRegister(os.path.join(sock_dir, "r.sock"),
+                       {"sessions": [
+                           a_session(session="co-library", crew="library"),
+                           a_session(session="co-quill", crew="quill",
+                                     working_on={"text": "confidential work",
+                                                 "age": 1, "since": 1,
+                                                 "stale": False})]})
+    try:
+        body = client.get("/sessions", headers=_headers()).json()
+        assert [s["session"] for s in body["sessions"]] == ["co-library"]
+        assert "confidential" not in json.dumps(body)
+        assert "co-quill" not in json.dumps(body)
+    finally:
+        reg.close()
+
+
+def test_an_unreadable_registry_serves_no_sessions_rather_than_everything(
+        client, sock_dir, monkeypatch):
+    reg = FakeRegister(os.path.join(sock_dir, "r.sock"),
+                       {"sessions": [a_session(crew="library")]})
+    try:
+        monkeypatch.setattr(projects, "REGISTRY_PATH", Path("/nonexistent/reg.json"))
+        projects.reload()
+        body = client.get("/sessions", headers=_headers()).json()
+        assert body["sessions"] == []
+        assert body["available"] is False
+        assert "private crews cannot be identified" in body["reason"]
+    finally:
+        reg.close()
+
+
+def test_a_session_whose_crew_does_not_resolve_is_dropped(client, sock_dir):
+    """A crew the registry does not know cannot be told apart from a private
+    one, so it is dropped rather than shown to a wildcard-scoped caller."""
+    reg = FakeRegister(os.path.join(sock_dir, "r.sock"),
+                       {"sessions": [a_session(crew="no-such-crew")]})
+    try:
+        body = client.get("/sessions", headers=_headers()).json()
+        assert body["sessions"] == []
+        assert body["available"] is True
     finally:
         reg.close()

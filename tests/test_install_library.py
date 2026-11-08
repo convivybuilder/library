@@ -8,8 +8,8 @@ redirected to a temp directory for every run, so nothing here writes to a
 real `~/.local/deploy/library`, a real `~/Library/LaunchAgents`, or a real
 `~/.library` — the last of which is the point of one test below.
 
-The fixture repo's `requirements.txt` is deliberately empty: the installer
-builds a real venv and runs a real `pip install -r requirements.txt` against
+The fixture repo's `requirements.lock` is deliberately empty: the installer
+builds a real venv and runs a real `pip install -r requirements.lock` against
 it, and a requirements file with nothing in it needs no network access to
 satisfy, which is what keeps every case here hermetic and fast. What the
 installer does with a real dependency set is not this file's concern — it is
@@ -138,6 +138,7 @@ from __future__ import annotations
 
 import os
 import plistlib
+import shutil
 import subprocess
 import sys
 import threading
@@ -510,6 +511,29 @@ case "$1" in
 esac
 """
 
+# Stub for INSTALL_LIBRARY_SWITCH_USER_CMD, standing in for `sudo` — see
+# `_compute_migration_state`'s and `_run_as_db_owner`'s own comments in
+# bin/install-library for the argv shape this always receives: `-n -u
+# <owner> -- <real command and its own args...>`. Logs every call it gets
+# (one argument per line, a `---` separator between calls) to
+# STUB_SWITCH_LOG, for the exact-argv assertions below, then either execs
+# the real command for real — dropping only the four sudo-style arguments
+# ahead of it, never a real account switch, which is what lets a case
+# assert the backup/migration it wraps actually ran — or, when
+# STUB_SWITCH_FAIL=1, refuses before running anything at all, the same
+# shape a real `sudo -n` takes when becoming the target account would need
+# a password.
+STUB_SWITCH_USER_CMD = """#!/bin/sh
+printf '%s\\n' "$@" >> "${STUB_SWITCH_LOG:-/dev/null}"
+echo '---' >> "${STUB_SWITCH_LOG:-/dev/null}"
+if [ "${STUB_SWITCH_FAIL:-0}" = "1" ]; then
+    echo "stub switch command: a password would be required" >&2
+    exit 1
+fi
+shift 4
+exec "$@"
+"""
+
 
 def _git(repo, *args, check=True):
     return subprocess.run(
@@ -521,6 +545,7 @@ def _write_fixture_files(repo: Path, version_marker: str, extra: dict[str, str] 
     (repo / "serve.sh").write_text(STUB_SERVE_SH)
     (repo / "serve.sh").chmod(0o755)
     (repo / "requirements.txt").write_text("")
+    (repo / "requirements.lock").write_text("")
     (repo / "app.py").write_text(f"VERSION = {version_marker!r}\n_DRAIN_DEADLINE_SECONDS = 50.0\n")
     (repo / "launchd").mkdir(exist_ok=True)
     (repo / "launchd" / "com.convivy.library.plist").write_text(render_stub_plist(library_db))
@@ -599,6 +624,10 @@ def _stub_launchctl_dir(home: Path) -> Path:
     if not launchctl.exists():
         launchctl.write_text(STUB_LAUNCHCTL)
         launchctl.chmod(0o755)
+    switch = stub_dir / "switch-user-cmd"
+    if not switch.exists():
+        switch.write_text(STUB_SWITCH_USER_CMD)
+        switch.chmod(0o755)
     return stub_dir
 
 
@@ -608,6 +637,24 @@ def launchctl_log(home: Path) -> list[str]:
     if not log.exists():
         return []
     return [line for line in log.read_text().splitlines() if line]
+
+
+def switch_calls(home: Path) -> list[list[str]]:
+    """Every stub switch-command invocation this run made, oldest first,
+    each as its own list of argv elements — split on the `---` separator
+    STUB_SWITCH_USER_CMD writes after each call's logged argv."""
+    log = home.parent / "switch-calls.log"
+    if not log.exists():
+        return []
+    lines = log.read_text().splitlines()
+    calls, current = [], []
+    for line in lines:
+        if line == "---":
+            calls.append(current)
+            current = []
+        else:
+            current.append(line)
+    return calls
 
 
 def serve_check_env_log(home: Path) -> list[str]:
@@ -660,7 +707,7 @@ def plist_environment(path: Path) -> dict[str, str]:
 
 
 def run_installer(*args, home, timeout=120, launchctl_env=None, sync_origin=True,
-                   set_launchd_domain=True):
+                   set_launchd_domain=True, extra_env=None):
     """Every case here passes --python=sys.executable, the interpreter this
     test suite is already running under, instead of install-library's
     hardcoded macOS/Homebrew search — that search finds nothing on CI's
@@ -687,6 +734,8 @@ def run_installer(*args, home, timeout=120, launchctl_env=None, sync_origin=True
     values here — every case that exercises retries controls the outcome via
     `STUB_LAUNCHCTL_WAITING_FOR_CALLS` / `STUB_LAUNCHCTL_STATE`, not via wall
     clock time, so this suite stays fast whether or not a case cares.
+    `extra_env` adds any other variable for one call, e.g. the `PIP_NO_INDEX`
+    and `PIP_FIND_LINKS` the lockfile cases use to keep pip offline.
 
     `INSTALL_LIBRARY_LAUNCHCTL` and `INSTALL_LIBRARY_LAUNCH_AGENTS` are
     always pointed at the stub binary and a scratch directory under `home`;
@@ -749,10 +798,21 @@ def run_installer(*args, home, timeout=120, launchctl_env=None, sync_origin=True
     env["INSTALL_LIBRARY_LAUNCHCTL"] = str(stub_dir / "launchctl")
     env["INSTALL_LIBRARY_LAUNCH_AGENTS"] = str(home / "Library" / "LaunchAgents")
     env["STUB_LAUNCHCTL_EXPECTED_DOMAIN"] = TEST_LAUNCHD_DOMAIN
+    # Always pointed at the stub, the same unconditional shape as
+    # INSTALL_LIBRARY_LAUNCHCTL above: the real `sudo` must never be
+    # reachable from this suite either, and every case that never sets
+    # INSTALL_LIBRARY_TEST_DB_OWNER (almost all of this file) never has the
+    # vault's own owner differ from this test process's own user, so
+    # _run_as_db_owner never actually calls this stub for them at all —
+    # see test_the_single_account_path_never_invokes_the_switch_command.
+    env["INSTALL_LIBRARY_SWITCH_USER_CMD"] = str(stub_dir / "switch-user-cmd")
+    env["STUB_SWITCH_LOG"] = str(home.parent / "switch-calls.log")
     if set_launchd_domain:
         env["INSTALL_LIBRARY_LAUNCHD_DOMAIN"] = TEST_LAUNCHD_DOMAIN
     if launchctl_env:
         env.update(launchctl_env)
+    if extra_env:
+        env.update(extra_env)
     return subprocess.run(
         [str(INSTALLER), f"--python={sys.executable}", *args], env=env,
         capture_output=True, text=True, timeout=timeout, check=False)
@@ -1332,6 +1392,236 @@ def test_a_behind_vault_is_backed_up_migrated_and_installed(seed_repo, home):
     assert rows == [(new,)]
 
 
+# --- the store's owner (company/decisions/0025 point 5, library issue
+# CQ-225) -----------------------------------------------------------------
+
+
+def test_the_single_account_path_never_invokes_the_switch_command(seed_repo, home):
+    """The single-account install's own path is unchanged: with no
+    INSTALL_LIBRARY_TEST_DB_OWNER override, the vault's owner (read from the
+    file itself) is this test process's own user, exactly as it always is on
+    a real single-account machine, so `_run_as_db_owner` never calls the
+    switch command at all — not even once, not even the capability probe.
+    Same scenario as test_a_behind_vault_is_backed_up_migrated_and_installed
+    above, which already proves the backup and migration themselves are
+    unaffected; this proves the new mechanism stays out of their way
+    entirely rather than merely running as a no-op switch."""
+    old, new = "oldrev000001", "newrev000002"
+    repo = seed_repo("v1", alembic_versions={old: None, new: old}, stamp_revision=old)
+    first = run_installer("--repo=" + str(repo), home=home)
+    assert first.returncode == 0, first.stdout + first.stderr
+
+    (repo / "app.py").write_text("VERSION = 'v2'\n_DRAIN_DEADLINE_SECONDS = 50.0\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "v2, vault still at the old revision")
+
+    result = run_installer("--repo=" + str(repo), home=home)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert switch_calls(home) == []
+
+
+def test_a_vault_owned_by_another_account_runs_the_backup_and_migration_as_that_owner(
+        seed_repo, home):
+    """When the vault's owner (INSTALL_LIBRARY_TEST_DB_OWNER, standing in for
+    a real `stat`-read owner this sandbox has no second real account to
+    produce) differs from the invoking user, every store-opening step —
+    the capability probe, the revision reads, the backup, its integrity
+    check, and `alembic upgrade head` — goes through the switch command
+    instead of running directly, each call logged with the exact argv
+    `_run_as_db_owner` built for it: `-n -u <owner> --` ahead of the real
+    command. The stub execs the real command onward after logging (no real
+    account switch), so the backup and migration still happen for real —
+    proving this isn't just a logged no-op."""
+    old, new = "oldrev000001", "newrev000002"
+    repo = seed_repo("v1", alembic_versions={old: None, new: old}, stamp_revision=old)
+    first = run_installer("--repo=" + str(repo), home=home)
+    assert first.returncode == 0, first.stdout + first.stderr
+    db_path = default_db_path(repo)
+
+    (repo / "app.py").write_text("VERSION = 'v2'\n_DRAIN_DEADLINE_SECONDS = 50.0\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "v2, vault still at the old revision")
+
+    result = run_installer("--repo=" + str(repo), home=home,
+                            extra_env={"INSTALL_LIBRARY_TEST_DB_OWNER": "otheruser"})
+    assert result.returncode == 0, result.stdout + result.stderr
+    combined = result.stdout + result.stderr
+    assert "backing it up" in combined
+    assert "Migrated" in combined
+
+    calls = switch_calls(home)
+    assert calls, "expected at least one switch-command call, got none"
+    assert calls[0] == ["-n", "-u", "otheruser", "--", "true"], (
+        "the capability probe must be the first call, and must be a plain "
+        "no-op — the exact argv _run_as_db_owner builds for it")
+    backup_calls = [c for c in calls if len(c) >= 5 and c[4].endswith("sqlite3")
+                    and any(".backup" in a for a in c)]
+    assert len(backup_calls) == 1, f"expected exactly one backup call, found {calls}"
+    assert backup_calls[0][:4] == ["-n", "-u", "otheruser", "--"]
+    migrate_calls = [c for c in calls if "upgrade head" in " ".join(c)]
+    assert len(migrate_calls) == 1, f"expected exactly one migrate call, found {calls}"
+    assert migrate_calls[0][:4] == ["-n", "-u", "otheruser", "--"]
+
+    backups = sorted(db_path.parent.glob(db_path.name + ".pre-deploy-*"))
+    assert len(backups) == 1, f"expected exactly one backup, found {backups}"
+
+    import sqlite3
+    conn = sqlite3.connect(str(db_path))
+    try:
+        rows = conn.execute("SELECT version_num FROM alembic_version").fetchall()
+    finally:
+        conn.close()
+    assert rows == [(new,)]
+
+
+def test_a_vault_owned_by_an_account_the_operator_cannot_switch_to_is_refused(
+        seed_repo, home):
+    """When the switch command itself refuses — STUB_SWITCH_FAIL=1, the same
+    shape a real `sudo -n` takes when becoming the target account would
+    need a password — the install refuses with a message naming the
+    owner, before the capability probe's own command (`true`) is the ONLY
+    call the switch command ever sees: no backup, no revision read, and no
+    migration is ever attempted, and the vault is left exactly as it was."""
+    old, new = "oldrev000001", "newrev000002"
+    repo = seed_repo("v1", alembic_versions={old: None, new: old}, stamp_revision=old)
+    first = run_installer("--repo=" + str(repo), home=home)
+    assert first.returncode == 0, first.stdout + first.stderr
+    db_path = default_db_path(repo)
+
+    (repo / "app.py").write_text("VERSION = 'v2'\n_DRAIN_DEADLINE_SECONDS = 50.0\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "v2, vault still at the old revision")
+
+    result = run_installer(
+        "--repo=" + str(repo), home=home,
+        extra_env={"INSTALL_LIBRARY_TEST_DB_OWNER": "otheruser",
+                   "STUB_SWITCH_FAIL": "1"})
+    assert result.returncode != 0
+    combined = result.stdout + result.stderr
+    assert "otheruser" in combined
+    assert "password" in combined
+
+    calls = switch_calls(home)
+    assert calls == [["-n", "-u", "otheruser", "--", "true"]], (
+        "the only switch-command call must be the refused capability "
+        "probe — nothing else may have been attempted")
+
+    assert list(db_path.parent.glob(db_path.name + ".pre-deploy-*")) == []
+    import sqlite3
+    conn = sqlite3.connect(str(db_path))
+    try:
+        rows = conn.execute("SELECT version_num FROM alembic_version").fetchall()
+    finally:
+        conn.close()
+    assert rows == [(old,)], "the vault must be untouched — still at the old revision"
+
+    deploy_dir = home / DEPLOY.lstrip("/")
+    assert "'v1'" in (deploy_dir / "app.py").read_text(), (
+        "the prior release must be untouched — nothing was installed")
+
+
+@pytest.mark.parametrize("unit", ["launch-agent", "launch-daemon", "systemd"])
+def test_live_db_path_is_read_from_whichever_unit_is_installed(home, unit):
+    """LIBRARY_DB is read from wherever the installed unit declares it
+    (company/decisions/0025 point 5, company/decisions/0010): today's
+    LaunchAgent plist, a LaunchDaemon plist, or a systemd unit. Exercised
+    directly through the hidden --internal-live-db-path entry point, in
+    isolation, rather than through a full install — the path-finding is the
+    same `_live_library_db_path` call either way."""
+    launch_agents = home / "Library" / "LaunchAgents"
+    launch_daemons = home.parent / "LaunchDaemons"
+    systemd_unit = home.parent / "com.convivy.library.service"
+    launch_agents.mkdir(parents=True, exist_ok=True)
+    launch_daemons.mkdir(parents=True, exist_ok=True)
+
+    if unit == "launch-agent":
+        (launch_agents / "com.convivy.library.plist").write_text(
+            render_stub_plist("/from/launch-agent.db"))
+        expected = "/from/launch-agent.db"
+    elif unit == "launch-daemon":
+        (launch_daemons / "com.convivy.library.plist").write_text(
+            render_stub_plist("/from/launch-daemon.db"))
+        expected = "/from/launch-daemon.db"
+    else:
+        systemd_unit.write_text(
+            "[Service]\n"
+            "Environment=LIBRARY_DB=/from/systemd.db\n"
+            "Environment=OTHER=1\n")
+        expected = "/from/systemd.db"
+
+    env = dict(os.environ, HOME=str(home))
+    env["INSTALL_LIBRARY_LAUNCH_AGENTS"] = str(launch_agents)
+    env["INSTALL_LIBRARY_LAUNCH_DAEMONS"] = str(launch_daemons)
+    env["INSTALL_LIBRARY_SYSTEMD_UNIT"] = str(systemd_unit)
+    result = subprocess.run(
+        [str(INSTALLER), "--internal-live-db-path"], env=env,
+        capture_output=True, text=True, timeout=30, check=False)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip() == expected
+
+
+def test_live_db_path_prefers_the_root_owned_unit_over_the_launch_agent(home):
+    """When a LaunchDaemon plist and the operator's LaunchAgent plist both set
+    LIBRARY_DB, the daemon's wins: the operator can write the LaunchAgent
+    plist, and must not steer a service-account install to another file."""
+    launch_agents = home / "Library" / "LaunchAgents"
+    launch_daemons = home.parent / "LaunchDaemons"
+    launch_agents.mkdir(parents=True, exist_ok=True)
+    launch_daemons.mkdir(parents=True, exist_ok=True)
+    (launch_agents / "com.convivy.library.plist").write_text(
+        render_stub_plist("/from/launch-agent.db"))
+    (launch_daemons / "com.convivy.library.plist").write_text(
+        render_stub_plist("/from/launch-daemon.db"))
+    env = dict(os.environ, HOME=str(home))
+    env["INSTALL_LIBRARY_LAUNCH_AGENTS"] = str(launch_agents)
+    env["INSTALL_LIBRARY_LAUNCH_DAEMONS"] = str(launch_daemons)
+    env["INSTALL_LIBRARY_SYSTEMD_UNIT"] = str(home.parent / "no-systemd-unit.service")
+    result = subprocess.run(
+        [str(INSTALLER), "--internal-live-db-path"], env=env,
+        capture_output=True, text=True, timeout=30, check=False)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip() == "/from/launch-daemon.db"
+
+
+def test_the_owner_override_is_ignored_when_the_switch_command_is_sudo(
+        seed_repo, home):
+    """INSTALL_LIBRARY_TEST_DB_OWNER is honoured only under a stub that is not
+    sudo; with a switch command named sudo the owner comes from the file, so
+    a caller cannot choose the account the real sudo switches to. The
+    command here is the logging stub copied under the name `sudo`, never
+    the real one, so a regression logs a call rather than running sudo."""
+    old, new = "oldrev000001", "newrev000002"
+    repo = seed_repo("v1", alembic_versions={old: None, new: old}, stamp_revision=old)
+    first = run_installer("--repo=" + str(repo), home=home)
+    assert first.returncode == 0, first.stdout + first.stderr
+
+    named_sudo = home.parent / "named-sudo" / "sudo"
+    named_sudo.parent.mkdir()
+    shutil.copy2(home.parent / "stubbin" / "switch-user-cmd", named_sudo)
+
+    (repo / "app.py").write_text("VERSION = 'v2'\n_DRAIN_DEADLINE_SECONDS = 50.0\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "v2, vault still at the old revision")
+
+    result = run_installer("--repo=" + str(repo), home=home, extra_env={
+        "INSTALL_LIBRARY_TEST_DB_OWNER": "otheruser",
+        "INSTALL_LIBRARY_SWITCH_USER_CMD": str(named_sudo)})
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert switch_calls(home) == []
+
+
+def test_live_db_path_reports_nothing_when_no_unit_is_installed(home):
+    env = dict(os.environ, HOME=str(home))
+    env["INSTALL_LIBRARY_LAUNCH_AGENTS"] = str(home / "Library" / "LaunchAgents")
+    env["INSTALL_LIBRARY_LAUNCH_DAEMONS"] = str(home.parent / "no-launch-daemons")
+    env["INSTALL_LIBRARY_SYSTEMD_UNIT"] = str(home.parent / "no-systemd-unit.service")
+    result = subprocess.run(
+        [str(INSTALLER), "--internal-live-db-path"], env=env,
+        capture_output=True, text=True, timeout=30, check=False)
+    assert result.returncode == 1
+    assert result.stdout == ""
+
+
 def test_install_proceeds_when_the_migration_leaves_its_revision_only_in_the_wal(
         seed_repo, home):
     """alembic's own write can commit to the WAL and never reach the main
@@ -1757,6 +2047,99 @@ def test_failed_install_leaves_the_previous_deploy_untouched(seed_repo, home):
     leftovers = list(deploy_dir.parent.glob("library.new")) + \
         list(deploy_dir.parent.glob("library.old.*"))
     assert leftovers == [], f"a staging/backup directory survived: {leftovers}"
+
+
+# --- the lockfile's pip flags ---------------------------------------------
+#
+# Every other case installs an empty requirements.lock, which passes whatever
+# flags pip gets. These two each fail only while one flag is present, so
+# deleting --require-hashes or --only-binary :all: from install-library fails
+# one of them. Both stay offline: PIP_NO_INDEX keeps pip off PyPI, and the
+# packages are built here.
+
+
+def _write_demo_wheel(directory: Path) -> Path:
+    """A minimal pure-Python wheel pip will install, written without any
+    build tool."""
+    import base64
+    import hashlib
+    import zipfile
+    files = {
+        "demo_pkg/__init__.py": b"",
+        "demo_pkg-0.1.dist-info/METADATA":
+            b"Metadata-Version: 2.1\nName: demo-pkg\nVersion: 0.1\n",
+        "demo_pkg-0.1.dist-info/WHEEL":
+            b"Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+    }
+    record = "".join(
+        f"{name},sha256="
+        f"{base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b'=').decode()},"
+        f"{len(data)}\n"
+        for name, data in files.items()) + "demo_pkg-0.1.dist-info/RECORD,,\n"
+    wheel = directory / "demo_pkg-0.1-py3-none-any.whl"
+    with zipfile.ZipFile(wheel, "w") as z:
+        for name, data in files.items():
+            z.writestr(name, data)
+        z.writestr("demo_pkg-0.1.dist-info/RECORD", record)
+    return wheel
+
+
+def _write_demo_sdist(directory: Path) -> Path:
+    import io
+    import tarfile
+    members = {
+        "demo_sdist-0.1/pyproject.toml":
+            b'[build-system]\nrequires = ["setuptools"]\n'
+            b'build-backend = "setuptools.build_meta"\n'
+            b'[project]\nname = "demo-sdist"\nversion = "0.1"\n',
+        "demo_sdist-0.1/PKG-INFO": b"Metadata-Version: 2.1\nName: demo-sdist\nVersion: 0.1\n",
+    }
+    sdist = directory / "demo_sdist-0.1.tar.gz"
+    with tarfile.open(sdist, "w:gz") as t:
+        for name, data in members.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            t.addfile(info, io.BytesIO(data))
+    return sdist
+
+
+def _commit_lock(repo: Path, text: str):
+    (repo / "requirements.lock").write_text(text)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "lock")
+
+
+def test_a_lock_entry_without_a_hash_is_refused(seed_repo, home, tmp_path):
+    """Without --require-hashes, pip installs an unhashed requirement; with
+    it, pip refuses before installing anything."""
+    repo = seed_repo("v1")
+    wheel = _write_demo_wheel(tmp_path)
+    _commit_lock(repo, f"{wheel}\n")
+
+    result = run_installer("--repo=" + str(repo), home=home,
+                           extra_env={"PIP_NO_INDEX": "1"})
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "Hashes are required in --require-hashes mode" in result.stdout + result.stderr
+    assert not (home / DEPLOY.lstrip("/")).exists()
+
+
+def test_a_locked_sdist_is_not_built(seed_repo, home, tmp_path):
+    """The sdist's hash is in the lock, so --require-hashes alone lets pip
+    pick it and start a build. --only-binary :all: removes it from the
+    candidates, and pip finds nothing to install."""
+    import hashlib
+    repo = seed_repo("v1")
+    index = tmp_path / "index"
+    index.mkdir()
+    sdist = _write_demo_sdist(index)
+    digest = hashlib.sha256(sdist.read_bytes()).hexdigest()
+    _commit_lock(repo, f"demo-sdist==0.1 --hash=sha256:{digest}\n")
+
+    result = run_installer("--repo=" + str(repo), home=home,
+                           extra_env={"PIP_NO_INDEX": "1", "PIP_FIND_LINKS": str(index)})
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "No matching distribution found for demo-sdist" in result.stdout + result.stderr
+    assert not (home / DEPLOY.lstrip("/")).exists()
 
 
 def test_reinstall_atomically_replaces_the_prior_release_with_no_leftovers(seed_repo, home):

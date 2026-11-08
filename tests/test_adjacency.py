@@ -44,9 +44,9 @@ import protocol
 import store
 import vectors
 
-AGENT = "agent-token-vivy"
+AGENT = "agent-token-fennick"
 WIDE = "agent-token-wide"
-HOLDER = "co-vivy-0912"
+HOLDER = "co-fennick-0912"
 
 # Two items whose text overlaps almost entirely, one in another product that
 # overlaps the same way, and one that shares nothing. The fake embedder makes
@@ -54,10 +54,10 @@ HOLDER = "co-vivy-0912"
 SHARED = ("the overnight worker files the changelog ceremony issue again after "
           "every merge and nothing arbitrates the duplicate filings")
 ITEMS = [
-    ("near_a", "vivy", "Changelog ceremony filed again", SHARED),
-    ("near_b", "vivy", "Changelog ceremony filed again", SHARED + " twice"),
-    ("near_c", "constance", "Changelog ceremony filed again", SHARED),
-    ("far", "vivy", "Spotify token refresh drops the scope",
+    ("near_a", "fennick", "Changelog ceremony filed again", SHARED),
+    ("near_b", "fennick", "Changelog ceremony filed again", SHARED + " twice"),
+    ("near_c", "marlow", "Changelog ceremony filed again", SHARED),
+    ("far", "fennick", "Spotify token refresh drops the scope",
      "renewing the access token loses the playlist scope and the sync stops"),
 ]
 
@@ -107,7 +107,7 @@ def client(tmp_path, monkeypatch, vector_index, ledger_tables):
             id TEXT PRIMARY KEY, product TEXT, state TEXT, refs TEXT);
         CREATE TABLE call_slips (
             id TEXT PRIMARY KEY, item_id TEXT, product TEXT, claim_owner_label TEXT,
-            issued_at TEXT, expires_at TEXT, grant_json TEXT);
+            issued_at TEXT, expires_at TEXT, grant_json TEXT, crew TEXT);
     """)
     conn.executemany(
         "INSERT INTO issue_items (id, product, title, body, type, state, "
@@ -119,7 +119,7 @@ def client(tmp_path, monkeypatch, vector_index, ledger_tables):
 
     tokens = tmp_path / "api-tokens.json"
     tokens.write_text(json.dumps({
-        AGENT: {"name": "vivy-agent", "products": ["vivy"]},
+        AGENT: {"name": "fennick-agent", "products": ["fennick"]},
         WIDE: {"name": "wide-agent", "products": ["*"]},
     }))
     vector_index(db)

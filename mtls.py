@@ -16,6 +16,7 @@ as, and the registry that can revoke it, are `machine_identity.py`'s.
 """
 from __future__ import annotations
 
+import ipaddress
 import os
 import ssl
 import subprocess
@@ -42,6 +43,60 @@ EXTENSION_KEY = "convivy.mtls"
 HOST = "127.0.0.1"
 PLAIN_PORT = 8100
 TLS_PORT = 8443
+
+
+def resolve_plain_host(env=None) -> str:
+    """`LIBRARY_PLAIN_HOST`, or `HOST` (loopback) when it is unset.
+
+    Takes an explicit `env` the way `store.resolve_db` does, so a test can
+    drive "unset" and "set" without needing to re-import this module."""
+    env = os.environ if env is None else env
+    return env.get("LIBRARY_PLAIN_HOST", HOST)
+
+
+def resolve_tls_host(env=None) -> str | None:
+    """`LIBRARY_TLS_HOST`, naming a second address the mutual-TLS listener
+    also binds, or `None` when it is unset — the multi-machine epic's
+    Library clause (issue_01M5FMP5GSE61PVQ4H96RK23FN). The loopback
+    mutual-TLS listener binds `HOST` either way; this only ever adds a
+    second listener, never replaces that one.
+
+    `env.get` returns `None` only when the key is absent, keeping an
+    explicitly empty value distinct from unset so `require_remote_tls_host`
+    can refuse the former rather than silently treating it like the
+    latter."""
+    env = os.environ if env is None else env
+    return env.get("LIBRARY_TLS_HOST")
+
+
+def resolve_tls_remote_port(env=None) -> int | None:
+    """`LIBRARY_TLS_REMOTE_PORT`, or `TLS_PORT` when it is unset — the port
+    the remote mutual-TLS listener binds, read the same way as `TLS_HOST`.
+    `None` when the value is not an integer, which
+    `serve_dual._build_tls_remote_config` refuses; raising here, at import,
+    would take the plain listener down over the optional remote one.
+
+    Kept separate from `TLS_PORT` because the loopback listener keeps that
+    port regardless of what else already owns it on the remote address: when
+    the Library runs on a tailnet, `tailscale serve` may already listen on the
+    tailnet address at 8443 for an unrelated service, so a remote listener
+    sharing that address needs a port of its own."""
+    env = os.environ if env is None else env
+    try:
+        return int(env.get("LIBRARY_TLS_REMOTE_PORT", str(TLS_PORT)))
+    except ValueError:
+        return None
+
+
+# Resolved once, at import, the same way `store.DB_PATH` is: a configuration
+# that is wrong when the process starts should be a refusal to start, not a
+# value re-read per request. `PLAIN_HOST`'s own validity — loopback or
+# nothing — is `require_loopback_plain_host`'s job, and `TLS_HOST`'s is
+# `require_remote_tls_host`'s, both run from `serve_dual.py` rather than
+# here, so that importing this module for a unit test never itself raises.
+PLAIN_HOST = resolve_plain_host()
+TLS_HOST = resolve_tls_host()
+TLS_REMOTE_PORT = resolve_tls_remote_port()
 
 # The Library's own external state area, alongside `identity.CLIENT_TOKENS`
 # and `LIBRARY_DB`'s default — never the deploy area, so an atomic reinstall
@@ -123,6 +178,90 @@ def _log(msg: str) -> None:
     print(f"library.mtls: {msg}", file=sys.stderr)
 
 
+class NonLoopbackPlainHost(RuntimeError):
+    """Raised at startup for a `PLAIN_HOST` (`LIBRARY_PLAIN_HOST`) that is
+    not loopback — the plain listener's own refusal to start.
+
+    The plain listener carries no TLS of its own, so there is no value of
+    this variable under which it may serve cleartext off this host; a
+    remote host reaches the Library through `TLS_HOST`
+    (`LIBRARY_TLS_HOST`) and `machine_identity.MachineIdentityGate`
+    instead.
+    """
+
+
+class NonRemoteTlsHost(RuntimeError):
+    """Raised for a `TLS_HOST` (`LIBRARY_TLS_HOST`) that is empty or itself
+    loopback — the remote mutual-TLS listener's own refusal to build.
+
+    The loopback mutual-TLS listener binds `HOST` unconditionally, so a
+    `LIBRARY_TLS_HOST` naming that same address, or naming none at all,
+    would only duplicate or no-op it rather than reach a second machine.
+    """
+
+
+def is_loopback_host(host: str) -> bool:
+    """Whether `host` is `localhost` by name, or an IPv4/IPv6 literal in the
+    loopback range.
+
+    A hostname other than `localhost` is not treated as loopback even if an
+    operator's own `/etc/hosts` happens to resolve it there — this check has
+    to hold without depending on how, or whether, a name resolves on the
+    host running it.
+    """
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def require_loopback_plain_host(host: str) -> None:
+    """Refuse to start rather than bind the plain listener anywhere but
+    loopback — `serve_dual._build_plain_config`'s own preflight.
+
+    Raises `NonLoopbackPlainHost`, naming the offending value, for anything
+    `is_loopback_host` does not recognise as loopback. Nothing here can be
+    weakened by configuration short of changing `host` itself to a loopback
+    address — the same "refuse rather than serve degraded" shape
+    `build_tls_ssl_context` already uses for the mutual-TLS listener's own
+    material.
+    """
+    if is_loopback_host(host):
+        return
+    _log(f"plain listener not started — LIBRARY_PLAIN_HOST={host!r} is not "
+         "a loopback address; the plain listener serves no transport "
+         "security of its own and refuses to serve cleartext off this "
+         "host. Set LIBRARY_TLS_HOST instead to reach this service "
+         "remotely, over mutual TLS.")
+    raise NonLoopbackPlainHost(
+        f"LIBRARY_PLAIN_HOST={host!r} is not a loopback address")
+
+
+def require_remote_tls_host(host: str) -> None:
+    """Refuse to build the remote mutual-TLS listener for a `host` that is
+    empty or loopback — `serve_dual._build_tls_remote_config`'s own
+    preflight.
+
+    Raises `NonRemoteTlsHost`, naming the offending value, for either case:
+    the loopback mutual-TLS listener already binds `HOST` unconditionally,
+    so neither value reaches a second machine.
+    """
+    if not host:
+        _log("remote mutual-TLS listener not started — LIBRARY_TLS_HOST is "
+             "empty, and the loopback mutual-TLS listener already binds "
+             f"{HOST} unconditionally")
+        raise NonRemoteTlsHost("LIBRARY_TLS_HOST is empty")
+    if is_loopback_host(host):
+        _log(f"remote mutual-TLS listener not started — "
+             f"LIBRARY_TLS_HOST={host!r} is a loopback address, and the "
+             f"loopback mutual-TLS listener already binds {HOST} "
+             "unconditionally")
+        raise NonRemoteTlsHost(
+            f"LIBRARY_TLS_HOST={host!r} is a loopback address")
+
+
 def _trust_anchor_walk_ok() -> bool:
     """Whether `TLS_CA` passes `serve.sh --walk`'s owner/group/mode/ACL walk.
 
@@ -147,7 +286,7 @@ def _trust_anchor_walk_ok() -> bool:
         result = subprocess.run(
             [str(_SERVE_SH), "--walk", str(TLS_CA)],
             capture_output=True, text=True, timeout=30, check=False)
-    except OSError as exc:
+    except (OSError, subprocess.SubprocessError) as exc:
         _log("mutual-TLS listener not started — could not run serve.sh's "
              f"ownership walk against the trust anchor: {exc}")
         return False

@@ -4,6 +4,7 @@ registry project, run for real through the `alembic` CLI (the same way
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 import subprocess
 import sys
@@ -17,10 +18,15 @@ REVISION = "1e5e5078a1c6"
 
 
 def alembic(*args, db):
+    # PROJECTS_JSON always names a file next to `db`, never the real
+    # machine's registry: a test that wants the registry resolvable writes
+    # one there (see `_seed`); a test that wants it unreadable just leaves
+    # it absent, which is the ordinary state of a fresh `tmp_path`.
     return subprocess.run(
         [sys.executable, "-m", "alembic", *args],
         cwd=str(REPO), capture_output=True, text=True,
-        env={"PATH": "/usr/bin:/bin", "HOME": str(db.parent), "LIBRARY_DB": str(db)})
+        env={"PATH": "/usr/bin:/bin", "HOME": str(db.parent), "LIBRARY_DB": str(db),
+             "PROJECTS_JSON": str(db.parent / "projects.json")})
 
 
 def _row(conn, scope_id):
@@ -30,14 +36,33 @@ def _row(conn, scope_id):
         (scope_id,)).fetchone()
 
 
+# The synthetic registry `_seed` writes: each of the 8 projects below, with
+# the extra repository spellings `_seed`'s 12 keys use folded in as
+# `repos`. Resolving a project's own slug always works whether or not it is
+# listed here explicitly — `projects.py`'s resolver maps a slug to itself.
+_REGISTRY = {
+    "bosun": {"repos": ["agent-platform"]},
+    "convivy-deck": {},
+    "convivy-orient": {},
+    "library": {"repos": ["knowledge"]},
+    "thistle": {"repos": ["thistle-backend"]},
+    "shipwright": {},
+    "galley": {},
+    "fennick": {"repos": ["fennick-landing", "fennick-sandbox-tools"]},
+}
+
+
 def _seed(db, *, now="2026-10-13 00:00:00"):
     """The 12 live keys, each with one ledger, one day of spend and one
-    entry — small enough to hand-check, shaped like the real vault."""
+    entry — small enough to hand-check, shaped like the real vault. Also
+    writes the synthetic registry `alembic()` points `PROJECTS_JSON` at, so
+    the migration can resolve all 12."""
+    (db.parent / "projects.json").write_text(json.dumps(_REGISTRY))
     conn = sqlite3.connect(db)
     keys = ["agent-platform", "convivy-deck", "convivy-orient", "knowledge",
-            "library", "selector", "selector-backend", "shipwright",
-            "sous-chef", "vivy", "vivy-landing",
-            "vivy-ownerrez-sandbox-tools"]
+            "library", "thistle", "thistle-backend", "shipwright",
+            "galley", "fennick", "fennick-landing",
+            "fennick-sandbox-tools"]
     for i, key in enumerate(keys):
         ledger_id = f"ldg_{i:02d}"
         conn.execute(
@@ -82,9 +107,9 @@ def test_upgrade_folds_12_live_keys_into_8_projects(seeded):
     # bosun has no pre-existing row, so agent-platform is RENAMED rather
     # than folded into a second row — it is live, not closed.
     assert live == {"bosun", "convivy-deck", "convivy-orient", "library",
-                    "selector", "shipwright", "sous-chef", "vivy"}
-    assert closed == {"knowledge", "selector-backend", "vivy-landing",
-                      "vivy-ownerrez-sandbox-tools"}
+                    "thistle", "shipwright", "galley", "fennick"}
+    assert closed == {"knowledge", "thistle-backend", "fennick-landing",
+                      "fennick-sandbox-tools"}
 
 
 def test_upgrade_keeps_every_entry_and_sums_every_day(seeded):
@@ -96,12 +121,12 @@ def test_upgrade_keeps_every_entry_and_sums_every_day(seeded):
     total_entries = conn.execute(
         "SELECT COUNT(*) c FROM ledger_entries").fetchone()["c"]
 
-    # library = knowledge (4) + library (5); selector = selector (6) +
-    # selector-backend (7); vivy = vivy (10) + vivy-landing (11) +
-    # vivy-ownerrez-sandbox-tools (12); bosun = agent-platform (1) alone.
+    # library = knowledge (4) + library (5); thistle = thistle (6) +
+    # thistle-backend (7); fennick = fennick (10) + fennick-landing (11) +
+    # fennick-sandbox-tools (12); bosun = agent-platform (1) alone.
     library = _row(conn, "library")
-    selector = _row(conn, "selector")
-    vivy = _row(conn, "vivy")
+    thistle = _row(conn, "thistle")
+    fennick = _row(conn, "fennick")
     bosun = _row(conn, "bosun")
 
     def day_total(ledger_id):
@@ -111,15 +136,15 @@ def test_upgrade_keeps_every_entry_and_sums_every_day(seeded):
         return row[0]
 
     library_total = day_total(library["id"])
-    selector_total = day_total(selector["id"])
-    vivy_total = day_total(vivy["id"])
+    thistle_total = day_total(thistle["id"])
+    fennick_total = day_total(fennick["id"])
     bosun_total = day_total(bosun["id"])
     conn.close()
 
     assert total_entries == 12  # nothing deleted — every entry survives
     assert library_total == (4 + 5) * 1_000_000
-    assert selector_total == (6 + 7) * 1_000_000
-    assert vivy_total == (10 + 11 + 12) * 1_000_000
+    assert thistle_total == (6 + 7) * 1_000_000
+    assert fennick_total == (10 + 11 + 12) * 1_000_000
     assert bosun_total == 1 * 1_000_000
 
 
@@ -183,6 +208,9 @@ def test_upgrade_leaves_an_already_correct_ledger_untouched(seeded):
 def test_upgrade_refuses_an_unresolvable_scope_and_writes_nothing(tmp_path):
     db = tmp_path / "library.db"
     assert alembic("upgrade", PREVIOUS_HEAD, db=db).returncode == 0
+    # A registry that can be read, so the refusal below is REFUSAL 2
+    # (unresolvable scope) rather than REFUSAL 1 (unreadable registry).
+    (db.parent / "projects.json").write_text(json.dumps({"library": {}}))
     conn = sqlite3.connect(db)
     now = "2026-10-13 00:00:00"
     conn.execute(
@@ -209,6 +237,8 @@ def test_upgrade_refuses_an_unresolvable_scope_and_writes_nothing(tmp_path):
 def test_upgrade_refuses_disagreeing_caps_and_writes_nothing(tmp_path):
     db = tmp_path / "library.db"
     assert alembic("upgrade", PREVIOUS_HEAD, db=db).returncode == 0
+    (db.parent / "projects.json").write_text(
+        json.dumps({"library": {"repos": ["knowledge"]}}))
     conn = sqlite3.connect(db)
     now = "2026-10-13 00:00:00"
     conn.execute(
@@ -243,6 +273,8 @@ def test_upgrade_moves_a_disagreeing_free_cap_onto_the_survivor(tmp_path):
     ledger carries it forward."""
     db = tmp_path / "library.db"
     assert alembic("upgrade", PREVIOUS_HEAD, db=db).returncode == 0
+    (db.parent / "projects.json").write_text(
+        json.dumps({"library": {"repos": ["knowledge"]}}))
     conn = sqlite3.connect(db)
     now = "2026-10-13 00:00:00"
     conn.execute(
@@ -276,6 +308,46 @@ def test_downgrade_raises_when_anything_actually_folded(seeded):
     assert "no downgrade" in result.stderr
 
 
+def test_downgrade_raises_on_a_bare_rename_with_no_closed_row(tmp_path):
+    """A lone source with no pre-existing project row is RENAMED, never
+    merged: nothing closes, so `state = 'closed'` never fires. This is the
+    one case where `downgrade()`'s detection depends on the `granted_by`
+    stamp alone — seed exactly that shape (one ledger, no sibling to fold
+    it with) so a regression that stopped stamping the rename branch would
+    make this test fail rather than pass by way of a merge elsewhere."""
+    db = tmp_path / "library.db"
+    assert alembic("upgrade", PREVIOUS_HEAD, db=db).returncode == 0
+    (db.parent / "projects.json").write_text(
+        json.dumps({"bosun": {"repos": ["agent-platform"]}}))
+    conn = sqlite3.connect(db)
+    now = "2026-10-13 00:00:00"
+    conn.execute(
+        "INSERT INTO ledgers (id, scope_kind, scope_id, state, granted_by, "
+        " created_at, updated_at) "
+        "VALUES ('ldg_x', 'project', 'agent-platform', 'live', 'operator', "
+        " ?, ?)", (now, now))
+    conn.commit()
+    conn.close()
+
+    assert alembic("upgrade", REVISION, db=db).returncode == 0
+
+    conn = sqlite3.connect(db)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute("SELECT * FROM ledgers").fetchall()
+    conn.close()
+    # Exactly one row exists, renamed and still live — no merge, no closed
+    # row, so the only trace of the fold is the rename's own `granted_by`.
+    assert len(rows) == 1
+    assert rows[0]["scope_id"] == "bosun"
+    assert rows[0]["state"] == "live"
+    assert rows[0]["granted_by"] == "system:ledger-fold-2026-10-13"
+    assert not any(r["state"] == "closed" for r in rows)
+
+    result = alembic("downgrade", PREVIOUS_HEAD, db=db)
+    assert result.returncode != 0
+    assert "no downgrade" in result.stderr
+
+
 def test_downgrade_is_a_clean_no_op_when_nothing_needed_folding(tmp_path):
     """A database with none of the 12 repository keys — every other
     migration test in this tree upgrades to head and downgrades an
@@ -285,3 +357,43 @@ def test_downgrade_is_a_clean_no_op_when_nothing_needed_folding(tmp_path):
     assert alembic("upgrade", "head", db=db).returncode == 0
     result = alembic("downgrade", PREVIOUS_HEAD, db=db)
     assert result.returncode == 0, result.stderr
+
+
+def test_upgrade_needs_no_registry_when_there_is_nothing_to_fold(tmp_path):
+    """No `projects.json` is written at all here — a fresh install's
+    `ledgers` table has no live, project-scoped row, so the migration
+    returns before it ever asks the registry a question."""
+    db = tmp_path / "library.db"
+    assert alembic("upgrade", PREVIOUS_HEAD, db=db).returncode == 0
+    assert not (db.parent / "projects.json").exists()
+
+    result = alembic("upgrade", REVISION, db=db)
+    assert result.returncode == 0, result.stderr
+
+
+def test_upgrade_raises_when_the_registry_is_unreadable_and_a_row_needs_it(tmp_path):
+    db = tmp_path / "library.db"
+    assert alembic("upgrade", PREVIOUS_HEAD, db=db).returncode == 0
+    assert not (db.parent / "projects.json").exists()
+    conn = sqlite3.connect(db)
+    now = "2026-10-13 00:00:00"
+    conn.execute(
+        "INSERT INTO ledgers (id, scope_kind, scope_id, state, granted_by, "
+        " created_at, updated_at) "
+        "VALUES ('ldg_x', 'project', 'knowledge', 'live', 'operator', "
+        " ?, ?)", (now, now))
+    conn.commit()
+    conn.close()
+
+    result = alembic("upgrade", REVISION, db=db)
+    assert result.returncode != 0
+    assert "knowledge" in result.stderr
+    assert "registry is unavailable" in result.stderr
+
+    conn = sqlite3.connect(db)
+    version = conn.execute("SELECT version_num FROM alembic_version").fetchone()
+    row = conn.execute(
+        "SELECT state FROM ledgers WHERE scope_id = 'knowledge'").fetchone()
+    conn.close()
+    assert version[0] == PREVIOUS_HEAD
+    assert row[0] == "live"

@@ -33,10 +33,11 @@ from fastapi.testclient import TestClient
 import app as libapp
 import identity
 import lease
+import projects
 import protocol
 import store
 
-AGENT = "agent-token-vivy"
+AGENT = "agent-token-fennick"
 WIDE = "agent-token-wide"
 
 
@@ -82,43 +83,52 @@ def client(tmp_path, monkeypatch, ledger_tables):
             blocking_root_id TEXT, blocking_holder TEXT, blocks_by TEXT, blocking_taken_for TEXT);
         CREATE TABLE call_slips (
             id TEXT PRIMARY KEY, item_id TEXT, product TEXT, claim_owner_label TEXT,
-            issued_at TEXT, expires_at TEXT, grant_json TEXT);
+            issued_at TEXT, expires_at TEXT, grant_json TEXT, crew TEXT);
     """)
     conn.executemany(
         "INSERT INTO issue_items (id, product, title, type, state, needs, "
-        "created_by_kind, parent_id, claimed_by, created_at, refs) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-        [("epic_v", "vivy", "An epic", "epic", "open", "agent", "agent", None,
-          None, _ts(days=3), "{}"),
-         ("task_a", "vivy", "Task A", "task", "open", "agent", "agent",
-          "epic_v", None, _ts(days=2), "{}"),
-         ("task_b", "vivy", "Task B", "task", "open", "agent", "agent",
-          "epic_v", None, _ts(days=2), "{}"),
+        "created_by_kind, parent_id, claimed_by, created_at, refs, maturity) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        [# Every epic below is seeded `approved` (library/decisions/0005):
+         # `/resolve` now refuses every resolution on an epic that is not,
+         # and these tests are about the lease/fence rules resolving an epic
+         # takes, not about maturity.
+         ("epic_v", "fennick", "An epic", "epic", "open", "agent", "agent", None,
+          None, _ts(days=3), "{}", "approved"),
+         ("task_a", "fennick", "Task A", "task", "open", "agent", "agent",
+          "epic_v", None, _ts(days=2), "{}", None),
+         ("task_b", "fennick", "Task B", "task", "open", "agent", "agent",
+          "epic_v", None, _ts(days=2), "{}", None),
          # A THIRD LEVEL. Two levels cannot distinguish a one-hop lookup from the
          # bidirectional walk, which is exactly how three holes in a row stayed
          # invisible to this file.
-         ("sub_epic", "vivy", "Sub epic", "epic", "open", "agent", "agent",
-          "epic_v", None, _ts(days=2), "{}"),
-         ("deep", "vivy", "Deep task", "task", "open", "agent", "agent",
-          "sub_epic", None, _ts(days=2), "{}"),
+         ("sub_epic", "fennick", "Sub epic", "epic", "open", "agent", "agent",
+          "epic_v", None, _ts(days=2), "{}", "approved"),
+         ("deep", "fennick", "Deep task", "task", "open", "agent", "agent",
+          "sub_epic", None, _ts(days=2), "{}", None),
          # A SIBLING EPIC, so the tree can hold TWO simultaneous live leases
          # under one parent. A linear chain can only ever produce zero or one
          # conflict per walk, which cannot distinguish "checked the conflict
          # correctly" from "only ever finds one and assumes that is all".
-         ("alt_epic", "vivy", "Sibling epic", "epic", "open", "agent", "agent",
-          "epic_v", None, _ts(days=2), "{}"),
-         ("lone", "vivy", "Parentless", "task", "open", "agent", "agent", None,
-          None, _ts(days=1), "{}"),
-         ("done", "vivy", "Already done", "task", "fixed", "agent", "agent",
-          None, None, _ts(days=1), "{}"),
-         ("other", "constance", "Other product", "task", "open", "agent",
-          "agent", None, None, _ts(days=1), "{}")])
+         ("alt_epic", "fennick", "Sibling epic", "epic", "open", "agent", "agent",
+          "epic_v", None, _ts(days=2), "{}", "approved"),
+         ("lone", "fennick", "Parentless", "task", "open", "agent", "agent", None,
+          None, _ts(days=1), "{}", None),
+         ("done", "fennick", "Already done", "task", "fixed", "agent", "agent",
+          None, None, _ts(days=1), "{}", None),
+         ("other", "marlow", "Other product", "task", "open", "agent",
+          "agent", None, None, _ts(days=1), "{}", None),
+         # An epic with no recorded maturity (library/decisions/0005):
+         # proposed, declined and unassessed (NULL — what a resolved epic
+         # predating this decision still carries) are all "not approved".
+         ("epic_unapproved", "fennick", "Not yet approved", "epic", "open",
+          "agent", "agent", None, None, _ts(days=1), "{}", None)])
     conn.commit()
     conn.close()
 
     tokens = tmp_path / "api-tokens.json"
     tokens.write_text(json.dumps({
-        AGENT: {"name": "vivy-agent", "products": ["vivy"]},
+        AGENT: {"name": "fennick-agent", "products": ["fennick"]},
         WIDE: {"name": "wide-agent", "products": ["*"]},
     }))
     ledger_tables(db)
@@ -126,7 +136,12 @@ def client(tmp_path, monkeypatch, ledger_tables):
     monkeypatch.setattr(identity, "TOKENS", tokens)
     monkeypatch.setattr(store, "WRITES_ENABLED", True)
     monkeypatch.setattr(lease, "TUNABLES", tmp_path / "absent.json")
-    return TestClient(libapp.app)
+    registry = tmp_path / "projects.json"
+    registry.write_text(json.dumps({"_meta": {}}))
+    monkeypatch.setattr(projects, "REGISTRY_PATH", registry)
+    projects.reload()
+    yield TestClient(libapp.app)
+    projects.reload()
 
 
 def _h(token=AGENT):
@@ -144,6 +159,14 @@ def _db():
     conn = sqlite3.connect(store.DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def _row(item_id):
+    conn = _db()
+    row = conn.execute("SELECT * FROM issue_items WHERE id = ?",
+                       (item_id,)).fetchone()
+    conn.close()
+    return row
 
 
 # --- resolving ends the hold ---------------------------------------------------
@@ -457,6 +480,55 @@ def test_an_unknown_resolution_is_refused(client):
     assert sorted(store.ITEM_RESOLUTIONS) == r.json()["supported"]
 
 
+# --- an epic is resolved only once approved (library/decisions/0005) ----------
+
+
+@pytest.mark.parametrize("resolution", sorted(store.ITEM_RESOLUTIONS))
+def test_resolving_a_not_approved_epic_is_refused_every_resolution(
+        client, resolution):
+    """`None` here — a resolved epic predating this decision, or one this
+    fixture never approved — reads as "not approved" exactly as `proposed`
+    and `declined` do; every resolution this vault defines is refused,
+    duplicate included."""
+    extra = ({"outcome_note": "moved elsewhere"} if resolution == "redirected"
+            else {})
+    r = _resolve(client, "epic_unapproved", resolution=resolution, **extra)
+    assert r.status_code == 409
+    assert "not approved" in r.json()["error"]
+    assert "approve" in r.json()["hint"] and "decline" in r.json()["hint"]
+    conn = _db()
+    state = conn.execute(
+        "SELECT state FROM issue_items WHERE id='epic_unapproved'"
+    ).fetchone()["state"]
+    conn.close()
+    assert state == "open"
+
+
+def test_an_agent_cannot_create_an_epic_and_resolve_it(client):
+    """`POST /items` stores a fresh epic `proposed` (library/decisions/0005);
+    an ordinary AGENT credential that just filed it still cannot end it."""
+    created = client.post(
+        "/items", json={"product": "fennick", "title": "a brand new epic",
+                        "type": "epic", "severity": "medium"}, headers=_h())
+    assert created.status_code == 201
+    assert created.json()["maturity"] == "proposed"
+    r = _resolve(client, created.json()["id"], resolution="wontfix")
+    assert r.status_code == 409
+    assert "not approved" in r.json()["error"]
+
+
+def test_an_agent_cannot_retype_a_proposed_epic_out_to_resolve_it(client):
+    """Retyping out of epic-hood needs the same gate declining does
+    (library/decisions/0005), so there is no back door from `/resolve`'s
+    refusal through a retype — both doors stay shut together."""
+    r = client.post("/items/epic_unapproved/correct", json={"type": None},
+                    headers=_h())
+    assert r.status_code == 403
+    assert _row("epic_unapproved")["type"] == "epic"
+    assert _resolve(client, "epic_unapproved",
+                    resolution="wontfix").status_code == 409
+
+
 def test_resolving_twice_is_refused(client):
     r = _resolve(client, "done")
     assert r.status_code == 409 and "already fixed" in r.json()["error"]
@@ -470,9 +542,9 @@ def test_the_resolver_is_recorded_from_the_token(client):
     ev = conn.execute("SELECT actor, from_state, to_state, note FROM issue_events "
                       "WHERE item_id='lone'").fetchone()
     conn.close()
-    assert row["resolved_by"] == "vivy-agent"
+    assert row["resolved_by"] == "fennick-agent"
     assert (ev["actor"], ev["from_state"], ev["to_state"]) == (
-        "vivy-agent", "open", "fixed")
+        "fennick-agent", "open", "fixed")
     assert ev["note"] == "all done"
 
 
@@ -543,7 +615,7 @@ def test_a_comment_is_appended_with_its_author(client):
     r = client.post("/items/lone/comments", json={"body": "a note"},
                     headers=_h())
     assert r.status_code == 201
-    assert r.json()["actor"] == "vivy-agent" and r.json()["kind"] == "note"
+    assert r.json()["actor"] == "fennick-agent" and r.json()["kind"] == "note"
 
 
 def test_a_diagnosis_on_an_unclaimed_item_is_refused(client):

@@ -166,7 +166,7 @@ def test_an_item_outside_the_clients_scope_reads_as_absent(client, tmp_path,
     import json
     path = tmp_path / "scoped.json"
     path.write_text(json.dumps({OPERATOR: {"name": "deck",
-                                           "products": ["constance"]}}))
+                                           "products": ["marlow"]}}))
     monkeypatch.setattr(identity, "CLIENT_TOKENS", path)
     assert _set(client, item_id="epic_a").status_code == 404
     _untouched()
@@ -216,7 +216,7 @@ def test_revision_refuses_the_field_by_name(client, token):
 
 def test_item_creation_refuses_the_field_by_name(client):
     r = client.post("/items", json={
-        "product": "vivy", "title": "t", "severity": "low",
+        "product": "fennick", "title": "t", "severity": "low",
         "model_choice": "m"}, headers=_h(AGENT))
     assert r.status_code == 400
     assert r.json()["route"] == "POST /items/{item_id}/model"

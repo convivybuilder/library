@@ -33,7 +33,7 @@ import lease
 import protocol
 import store
 
-AGENT = "agent-token-vivy"
+AGENT = "agent-token-fennick"
 WIDE = "agent-token-wide"
 
 
@@ -64,14 +64,14 @@ def client(tmp_path, monkeypatch):
     conn.executemany(
         "INSERT INTO corrections_queues (id, product, created_at) "
         "VALUES (?,?,?)",
-        [("cq_vivy", "vivy", "2026-08-01 00:00:00.000000"),
-         ("cq_constance", "constance", "2026-08-02 00:00:00.000000")])
+        [("cq_fennick", "fennick", "2026-08-01 00:00:00.000000"),
+         ("cq_marlow", "marlow", "2026-08-02 00:00:00.000000")])
     conn.commit()
     conn.close()
 
     tokens = tmp_path / "api-tokens.json"
     tokens.write_text(json.dumps({
-        AGENT: {"name": "vivy-agent", "products": ["vivy"]},
+        AGENT: {"name": "fennick-agent", "products": ["fennick"]},
         WIDE: {"name": "wide-agent", "products": ["*"]},
     }))
     monkeypatch.setattr(store, "DB_PATH", db)
@@ -91,21 +91,21 @@ def test_list_is_scoped_to_the_callers_products(client):
     r = client.get("/corrections-queues", headers=_h(AGENT))
     assert r.status_code == 200, r.text
     products = {q["product"] for q in r.json()["corrections_queues"]}
-    assert products == {"vivy"}
+    assert products == {"fennick"}
 
 
 def test_a_wide_credential_sees_every_queue(client):
     r = client.get("/corrections-queues", headers=_h(WIDE))
     assert r.status_code == 200
     products = {q["product"] for q in r.json()["corrections_queues"]}
-    assert products == {"vivy", "constance"}
+    assert products == {"fennick", "marlow"}
     assert r.json()["count"] == 2
 
 
 def test_the_product_filter_narrows_within_scope(client):
-    r = client.get("/corrections-queues?product=constance", headers=_h(WIDE))
+    r = client.get("/corrections-queues?product=marlow", headers=_h(WIDE))
     assert r.status_code == 200
-    assert [q["product"] for q in r.json()["corrections_queues"]] == ["constance"]
+    assert [q["product"] for q in r.json()["corrections_queues"]] == ["marlow"]
 
 
 def test_no_credential_is_refused(client):
@@ -118,18 +118,18 @@ def test_no_credential_is_refused(client):
 
 
 def test_get_returns_the_queue(client):
-    r = client.get("/corrections-queues/cq_vivy", headers=_h(AGENT))
+    r = client.get("/corrections-queues/cq_fennick", headers=_h(AGENT))
     assert r.status_code == 200, r.text
-    assert r.json()["id"] == "cq_vivy"
-    assert r.json()["product"] == "vivy"
+    assert r.json()["id"] == "cq_fennick"
+    assert r.json()["product"] == "fennick"
     assert r.json()["created_at"].endswith("Z")
 
 
 def test_an_out_of_scope_queue_reads_exactly_like_a_missing_one(client):
-    """Same status, same body — a caller scoped to vivy must not learn that
-    `cq_constance` exists."""
+    """Same status, same body — a caller scoped to fennick must not learn that
+    `cq_marlow` exists."""
     missing = client.get("/corrections-queues/cq_nope", headers=_h(AGENT))
-    foreign = client.get("/corrections-queues/cq_constance", headers=_h(AGENT))
+    foreign = client.get("/corrections-queues/cq_marlow", headers=_h(AGENT))
     assert missing.status_code == foreign.status_code == 404
     assert missing.json() == foreign.json()
 
@@ -145,12 +145,12 @@ def test_list_refuses_an_unrecognised_parameter(client):
 
 
 def test_list_ordinary_request_still_succeeds(client):
-    r = client.get("/corrections-queues?product=constance", headers=_h(WIDE))
+    r = client.get("/corrections-queues?product=marlow", headers=_h(WIDE))
     assert r.status_code == 200
 
 
 def test_get_one_queue_refuses_any_parameter(client):
-    r = client.get("/corrections-queues/cq_vivy?stream=kb-audit", headers=_h(AGENT))
+    r = client.get("/corrections-queues/cq_fennick?stream=kb-audit", headers=_h(AGENT))
     assert r.status_code == 400
     assert r.json()["unknown"] == ["stream"]
     assert r.json()["supported"] == []
@@ -190,8 +190,8 @@ def test_two_corrections_in_the_same_product_lease_independently(tmp_path):
     conn.executemany(
         "INSERT INTO issue_items (id, product, type, state, claimed_by, "
         "claimed_at, parent_id) VALUES (?,?,?,?,?,?,?)",
-        [("c1", "vivy", "bug", "claimed", "h1", _ts(minutes=1), None),
-         ("c2", "vivy", "bug", "claimed", "h2", _ts(minutes=1), None)])
+        [("c1", "fennick", "bug", "claimed", "h1", _ts(minutes=1), None),
+         ("c2", "fennick", "bug", "claimed", "h2", _ts(minutes=1), None)])
     conn.commit()
     one, two = _row(conn, "c1"), _row(conn, "c2")
     lease.take(conn, one, holder="h1", actor="a")
@@ -212,7 +212,7 @@ def test_a_lease_taken_while_the_parent_was_null_still_reads_as_claimed_once_the
     conn.execute(
         "INSERT INTO issue_items (id, product, type, state, claimed_by, "
         "claimed_at, parent_id) VALUES (?,?,?,?,?,?,?)",
-        ("c1", "vivy", "bug", "claimed", "h1", _ts(minutes=1), None))
+        ("c1", "fennick", "bug", "claimed", "h1", _ts(minutes=1), None))
     conn.commit()
     before = _row(conn, "c1")
     lease.take(conn, before, holder="h1", actor="a")
@@ -223,7 +223,7 @@ def test_a_lease_taken_while_the_parent_was_null_still_reads_as_claimed_once_the
     # The backfill: parent_id alone moves, nothing else — simulated here as
     # PR 2's own migration will do it, without re-touching the lease.
     conn.execute("UPDATE issue_items SET parent_id = ? WHERE id = ?",
-                 ("cq_vivy", "c1"))
+                 ("cq_fennick", "c1"))
     conn.commit()
     after = _row(conn, "c1")
     assert lease.root_id_for(conn, before) == lease.root_id_for(conn, after)

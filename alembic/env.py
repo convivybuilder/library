@@ -49,6 +49,8 @@ from sqlalchemy import create_engine, pool
 # `store` rather than duplicating its resolution.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import store_files  # noqa: E402
+
 try:
     import store  # noqa: E402
 except RuntimeError as exc:
@@ -156,6 +158,9 @@ def attach_cold_if_configured(connection) -> None:
         return
     cold_path = Path(raw).expanduser()
     store._refuse_orients_path(cold_path, os.environ)
+    # ATTACH creates a missing file at the umask's mode, which `serve.sh`
+    # then refuses; `store_files` makes it 0600 first.
+    store_files.create_private(cold_path)
     connection.exec_driver_sql("ATTACH DATABASE ? AS cold", (str(cold_path),))
     found = connection.exec_driver_sql(
         _ORIENT_FINGERPRINT_SQL_COLD, store.ORIENT_ONLY_TABLES).fetchone()
@@ -223,7 +228,12 @@ def run_migrations_offline() -> None:
 
 
 def run_migrations_online() -> None:
-    engine = create_engine(f"sqlite:///{library_database()}",
+    db_path = library_database()
+    # A fresh install's first upgrade is what creates `library.db`. Made at
+    # 0600 here, because SQLite would make it at the umask's mode, which
+    # `serve.sh` refuses (Shipwright's Debian 12 rehearsal, 2026-10-24).
+    store_files.create_private(db_path)
+    engine = create_engine(f"sqlite:///{db_path}",
                            poolclass=pool.NullPool)
     with engine.connect() as connection:
         refuse_unless_ours(connection)

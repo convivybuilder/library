@@ -155,6 +155,12 @@ def connect(path: Path, *, readonly: bool) -> sqlite3.Connection:
     Extension loading is switched off again immediately, so nothing later in the
     process can pull in an arbitrary extension through this handle."""
     import sqlite_vec
+    import store_files
+    if not readonly:
+        # `split` writes the file that becomes the live `LIBRARY_DB`, so it is
+        # made 0600 before SQLite creates it at the umask's mode (see
+        # `store_files`; reviewers, library#324 round 1).
+        store_files.create_private(path)
     uri = _uri(path, readonly=readonly)
     conn = sqlite3.connect(uri, uri=True)
     conn.row_factory = sqlite3.Row

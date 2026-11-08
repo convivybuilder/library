@@ -29,17 +29,17 @@ import reference
 import black_box_tables
 import store
 
-AGENT = "agent-token-vivy"
+AGENT = "agent-token-fennick"
 ORCHESTRATOR = identity.Identity(actor="co-library-test", kind="orchestrator")
 
 # Two documents the profile below selects, and one it does not — so a resolved
 # bundle that quietly returned everything would be visible.
 DOCS = [
-    ("vivy/agents/coder", "agent", "vivy", "current"),
-    ("vivy/agents/reviewer", "agent", "vivy", "current"),
-    ("vivy/specs/unselected", "spec", "vivy", "current"),
+    ("fennick/agents/coder", "agent", "fennick", "current"),
+    ("fennick/agents/reviewer", "agent", "fennick", "current"),
+    ("fennick/specs/unselected", "spec", "fennick", "current"),
 ]
-PROFILE_INCLUDE = [{"kind": "agent", "project": ["vivy"]}]
+PROFILE_INCLUDE = [{"kind": "agent", "project": ["fennick"]}]
 
 
 def _ts(**delta):
@@ -81,9 +81,10 @@ def client(tmp_path, monkeypatch, vector_index, ledger_tables):
             blocking_root_id TEXT, blocking_holder TEXT, blocks_by TEXT, blocking_taken_for TEXT);
         CREATE TABLE call_slips (
             id TEXT PRIMARY KEY, item_id TEXT, product TEXT, claim_owner_label TEXT,
-            issued_at TEXT, expires_at TEXT, grant_json TEXT);
+            issued_at TEXT, expires_at TEXT, grant_json TEXT, crew TEXT);
         CREATE TABLE roster_agents (
             id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE,
+            source_doc TEXT,
             created_at TEXT NOT NULL, created_by TEXT NOT NULL,
             updated_at TEXT NOT NULL, updated_by TEXT NOT NULL);
         CREATE TABLE profiles (
@@ -96,7 +97,7 @@ def client(tmp_path, monkeypatch, vector_index, ledger_tables):
     conn.execute(
         "INSERT INTO issue_items (id, product, title, type, state, needs, "
         "created_by_kind, parent_id, created_at, refs) VALUES (?,?,?,?,?,?,?,?,?,?)",
-        ("task_a", "vivy", "Task A", "task", "open", "agent", "agent", None,
+        ("task_a", "fennick", "Task A", "task", "open", "agent", "agent", None,
          _ts(days=2), "{}"))
     conn.commit()
     conn.close()
@@ -124,7 +125,7 @@ def client(tmp_path, monkeypatch, vector_index, ledger_tables):
 
     tokens = tmp_path / "api-tokens.json"
     tokens.write_text(json.dumps({
-        AGENT: {"name": "vivy-agent", "products": ["vivy"]},
+        AGENT: {"name": "fennick-agent", "products": ["fennick"]},
     }))
     vector_index(db)
     ledger_tables(db)
@@ -134,7 +135,7 @@ def client(tmp_path, monkeypatch, vector_index, ledger_tables):
     monkeypatch.setattr(identity, "TOKENS", tokens)
     monkeypatch.setattr(store, "WRITES_ENABLED", True)
     monkeypatch.setattr(lease, "TUNABLES", tmp_path / "absent.json")
-    crew_registry.profile_put(ORCHESTRATOR, "vivy", "daytime",
+    crew_registry.profile_put(ORCHESTRATOR, "fennick", "daytime",
                               PROFILE_INCLUDE, [])
     return TestClient(libapp.app)
 
@@ -185,34 +186,34 @@ def served(tmp_path, monkeypatch):
     profile_sync.reset()
 
 
-def _write_vivy_daytime(root, include_kind):
-    d = root / "projects" / "vivy" / "profiles"
+def _write_fennick_daytime(root, include_kind):
+    d = root / "projects" / "fennick" / "profiles"
     d.mkdir(parents=True, exist_ok=True)
     (d / "daytime.yaml").write_text(
-        "profile: vivy/daytime\n"
+        "profile: fennick/daytime\n"
         "include:\n"
         f"  - kind: {include_kind}\n"
-        "    project: [vivy]\n")
+        "    project: [fennick]\n")
 
 
 # --- a named profile ----------------------------------------------------------
 
 
 def test_a_named_profile_fills_docs_with_the_resolved_set(client):
-    r = _co(client, profile="vivy/daytime")
+    r = _co(client, profile="fennick/daytime")
     assert r.status_code == 200
     body = r.json()
     assert [d["id"] for d in body["docs"]] == [
-        "vivy/agents/coder", "vivy/agents/reviewer"]
-    assert body["bundle"] == {"profile": "vivy/daytime", "available": True}
+        "fennick/agents/coder", "fennick/agents/reviewer"]
+    assert body["bundle"] == {"profile": "fennick/daytime", "available": True}
 
 
 def test_the_bundle_excludes_what_the_profile_does_not_select(client):
     """A resolver that quietly returned the whole index would satisfy "docs is
     non-empty", so the fixture carries a document the profile's rules exclude
     and this asserts its absence."""
-    docs = _co(client, profile="vivy/daytime").json()["docs"]
-    assert "vivy/specs/unselected" not in [d["id"] for d in docs]
+    docs = _co(client, profile="fennick/daytime").json()["docs"]
+    assert "fennick/specs/unselected" not in [d["id"] for d in docs]
 
 
 def test_a_docs_entry_carries_an_id_and_a_hash_and_nothing_else(client):
@@ -220,7 +221,7 @@ def test_a_docs_entry_carries_an_id_and_a_hash_and_nothing_else(client):
     naming documents by id is that a caller's context stays flat however large
     the bundle grows; a later addition of `title` or `body` here would undo
     that quietly, one convenient field at a time."""
-    docs = _co(client, profile="vivy/daytime").json()["docs"]
+    docs = _co(client, profile="fennick/daytime").json()["docs"]
     assert docs and all(set(d) == {"id", "body_sha256"} for d in docs)
 
 
@@ -228,18 +229,18 @@ def test_the_hash_is_the_indexed_body_hash(client):
     """Same digest the Reference Room serves, so a Individuator can compare a
     grant against a later fetch without knowing they came from two routes."""
     docs = {d["id"]: d["body_sha256"]
-            for d in _co(client, profile="vivy/daytime").json()["docs"]}
-    expected = hashlib.sha256(b"body of vivy/agents/coder").hexdigest()
-    assert docs["vivy/agents/coder"] == expected
+            for d in _co(client, profile="fennick/daytime").json()["docs"]}
+    expected = hashlib.sha256(b"body of fennick/agents/coder").hexdigest()
+    assert docs["fennick/agents/coder"] == expected
 
 
 def test_the_bundle_matches_what_the_profile_route_resolves(client):
     """**Two surfaces, one evaluation.** The grant and `GET /profiles/{project}/
     {variant}` both go through `crew_profiles.resolve`, and this is what would
     fail if one of them ever grew its own copy of the rule."""
-    from_grant = [d["id"] for d in _co(client, profile="vivy/daytime").json()["docs"]]
+    from_grant = [d["id"] for d in _co(client, profile="fennick/daytime").json()["docs"]]
     from_route = [d["id"] for d in client.get(
-        "/profiles/vivy/daytime", headers=_h()).json()["documents"]]
+        "/profiles/fennick/daytime", headers=_h()).json()["documents"]]
     assert from_grant == from_route
 
 
@@ -254,21 +255,21 @@ def test_an_unknown_profile_refuses_the_checkout_and_takes_no_lease(client):
     shape this epic exists to remove. A 400 that still stranded a lease would
     be worse than the silence."""
     assert not _live_leases()
-    r = _co(client, profile="vivy/nosuchvariant")
+    r = _co(client, profile="fennick/nosuchvariant")
     assert r.status_code == 400
-    assert "no profile named vivy/nosuchvariant" in r.json()["error"]
+    assert "no profile named fennick/nosuchvariant" in r.json()["error"]
     assert not _live_leases()
 
 
 def test_an_unknown_profile_leaves_the_item_claimable(client):
     """The other half of costing nothing: the caller can fix the profile name
     and retry, rather than finding the item claimed by its own failed attempt."""
-    _co(client, profile="vivy/nosuchvariant")
-    assert _co(client, profile="vivy/daytime").status_code == 200
+    _co(client, profile="fennick/nosuchvariant")
+    assert _co(client, profile="fennick/daytime").status_code == 200
 
 
 @pytest.mark.parametrize("bad", ["nogap", "too/many/parts", "/novariant",
-                                  "noproject/", 42, ["vivy", "daytime"]])
+                                  "noproject/", 42, ["fennick", "daytime"]])
 def test_a_malformed_profile_is_refused(client, bad):
     r = _co(client, profile=bad)
     assert r.status_code == 400
@@ -298,12 +299,12 @@ def test_an_unreadable_index_costs_the_bundle_and_not_the_lock(client, monkeypat
     caller still gets its lock, and `available: false` tells it the empty
     `docs` is a failure to look rather than an answer."""
     monkeypatch.setattr(reference, "INDEX_DB", tmp_path / "gone.db")
-    r = _co(client, profile="vivy/daytime")
+    r = _co(client, profile="fennick/daytime")
     assert r.status_code == 200
     body = r.json()
     assert body["lease"]["id"]
     assert body["docs"] == []
-    assert body["bundle"] == {"profile": "vivy/daytime", "available": False}
+    assert body["bundle"] == {"profile": "fennick/daytime", "available": False}
     assert len(_live_leases()) == 1
 
 
@@ -323,12 +324,12 @@ def test_a_query_failure_also_costs_the_bundle_and_not_the_lock(client, monkeypa
     def _corrupt(*a, **k):
         raise sqlite3.DatabaseError("database disk image is malformed")
     monkeypatch.setattr(crew_profiles, "resolve", _corrupt)
-    r = _co(client, profile="vivy/daytime")
+    r = _co(client, profile="fennick/daytime")
     assert r.status_code == 200
     body = r.json()
     assert body["lease"]["id"]
     assert body["docs"] == []
-    assert body["bundle"] == {"profile": "vivy/daytime", "available": False}
+    assert body["bundle"] == {"profile": "fennick/daytime", "available": False}
     assert len(_live_leases()) == 1
 
 
@@ -351,20 +352,20 @@ def test_an_unavailable_bundle_leaves_a_line_for_the_operator(client, monkeypatc
         def _corrupt(*a, **k):
             raise sqlite3.DatabaseError("database disk image is malformed")
         monkeypatch.setattr(crew_profiles, "resolve", _corrupt)
-    assert _co(client, profile="vivy/daytime").status_code == 200
+    assert _co(client, profile="fennick/daytime").status_code == 200
     err = capsys.readouterr().err
-    assert "profile bundle unavailable for vivy/daytime" in err
+    assert "profile bundle unavailable for fennick/daytime" in err
 
 
 def test_available_false_is_distinguishable_from_an_empty_profile(client):
     """The distinction `available` exists for: a profile whose rules match
     nothing returns an empty `docs` with `available: true`, which is an answer,
     where the test above returns the same empty list as a failure to look."""
-    crew_registry.profile_put(ORCHESTRATOR, "vivy", "empty",
-                              [{"kind": "runbook", "project": ["vivy"]}], [])
-    body = _co(client, profile="vivy/empty").json()
+    crew_registry.profile_put(ORCHESTRATOR, "fennick", "empty",
+                              [{"kind": "runbook", "project": ["fennick"]}], [])
+    body = _co(client, profile="fennick/empty").json()
     assert body["docs"] == []
-    assert body["bundle"] == {"profile": "vivy/empty", "available": True}
+    assert body["bundle"] == {"profile": "fennick/empty", "available": True}
 
 
 def test_the_resolver_is_not_called_when_no_profile_is_named(client, monkeypatch):
@@ -381,13 +382,13 @@ def test_the_resolver_is_not_called_when_no_profile_is_named(client, monkeypatch
 
 
 def test_a_checkout_naming_a_profile_reads_the_file_as_it_is_now(client, served):
-    """The stored row selects `vivy` agents. The checkout now holds a file
-    selecting `vivy` specs, so a checkout that reads the stored row returns
+    """The stored row selects `fennick` agents. The checkout now holds a file
+    selecting `fennick` specs, so a checkout that reads the stored row returns
     the agents, and one that reconciles first returns the spec."""
-    _write_vivy_daytime(served, "spec")
-    r = _co(client, profile="vivy/daytime")
+    _write_fennick_daytime(served, "spec")
+    r = _co(client, profile="fennick/daytime")
     assert r.status_code == 200, r.text
-    assert [d["id"] for d in r.json()["docs"]] == ["vivy/specs/unselected"]
+    assert [d["id"] for d in r.json()["docs"]] == ["fennick/specs/unselected"]
 
 
 def test_an_out_of_scope_checkout_reconciles_nothing(client, served,
@@ -396,17 +397,17 @@ def test_an_out_of_scope_checkout_reconciles_nothing(client, served,
     so a refused caller cannot make the Library write the profiles table."""
     other = tmp_path / "other-tokens.json"
     other.write_text(json.dumps({
-        AGENT: {"name": "vivy-agent", "products": ["vivy"]},
+        AGENT: {"name": "fennick-agent", "products": ["fennick"]},
         "agent-token-other": {"name": "other-agent", "products": ["other"]},
     }))
     monkeypatch.setattr(identity, "TOKENS", other)
-    _write_vivy_daytime(served, "spec")
+    _write_fennick_daytime(served, "spec")
     reconciles = []
     monkeypatch.setattr(profile_sync, "apply",
                         lambda *args: reconciles.append(args))
 
     r = client.post("/items/task_a/checkout", json={"owner": "session-1",
-                                                    "profile": "vivy/daytime"},
+                                                    "profile": "fennick/daytime"},
                     headers={"Authorization": "Bearer agent-token-other",
                              protocol.HEADER: str(protocol.CURRENT)})
     assert r.status_code == 404, r.text
@@ -420,25 +421,25 @@ def test_a_checkout_refused_for_lacking_item_claim_reconciles_nothing(
     it reconciles once, so the spy is shown to catch a reload that happens."""
     other = tmp_path / "other-tokens.json"
     other.write_text(json.dumps({
-        AGENT: {"name": "vivy-agent", "products": ["vivy"]},
-        "agent-token-unclaimer": {"name": "unclaimer", "products": ["vivy"],
+        AGENT: {"name": "fennick-agent", "products": ["fennick"]},
+        "agent-token-unclaimer": {"name": "unclaimer", "products": ["fennick"],
                                   "withholds": ["item.claim"]},
     }))
     monkeypatch.setattr(identity, "TOKENS", other)
-    _write_vivy_daytime(served, "spec")
+    _write_fennick_daytime(served, "spec")
     reconciles = []
     monkeypatch.setattr(profile_sync, "apply",
                         lambda *args: reconciles.append(args))
 
     r = client.post("/items/task_a/checkout", json={"owner": "session-1",
-                                                    "profile": "vivy/daytime"},
+                                                    "profile": "fennick/daytime"},
                     headers={"Authorization": "Bearer agent-token-unclaimer",
                              protocol.HEADER: str(protocol.CURRENT)})
     assert r.status_code == 403, r.text
     assert "item.claim" in r.text
     assert reconciles == []
 
-    assert _co(client, profile="vivy/daytime").status_code == 200
+    assert _co(client, profile="fennick/daytime").status_code == 200
     assert len(reconciles) == 1
 
 
@@ -449,12 +450,12 @@ def test_a_bundle_refused_for_scope_reconciles_nothing(
     scope reconciles once."""
     other = tmp_path / "other-tokens.json"
     other.write_text(json.dumps({
-        AGENT: {"name": "vivy-agent", "products": ["vivy"]},
+        AGENT: {"name": "fennick-agent", "products": ["fennick"]},
         "agent-token-other": {"name": "other-agent", "products": ["other"]},
     }))
     monkeypatch.setattr(identity, "TOKENS", other)
     crew_registry.roster_add(ORCHESTRATOR, "coder")
-    _write_vivy_daytime(served, "spec")
+    _write_fennick_daytime(served, "spec")
     reconciles = []
     monkeypatch.setattr(profile_sync, "apply",
                         lambda *args: reconciles.append(args))

@@ -117,7 +117,7 @@ def test_a_dedup_key_matching_a_different_ledgers_entry_refuses_without_its_fiel
     this call return `(True, dict(other_entry), None)` instead of raising,
     and `pytest.raises` below catches that.
     """
-    other = make_ledger(scope_id="vivy")
+    other = make_ledger(scope_id="fennick")
     _, other_entry, _ = spend(other["id"], 9_000_000, dedup_key="shared-key")
     with pytest.raises(store.DedupKeyTaken) as caught:
         spend(ledger["id"], 2_000_000, dedup_key="shared-key")
@@ -152,14 +152,14 @@ def test_a_raced_dedup_key_matching_a_different_ledger_still_refuses(
     reverting the race path's check back to "any winner is a replay" makes
     this call return `(True, dict(winner), None)` instead of raising.
     """
-    other = make_ledger(scope_id="vivy")
+    other = make_ledger(scope_id="fennick")
     winner = sqlite3.connect(db)
     winner.execute(
         "INSERT INTO ledger_entries (id, ledger_id, day, usd_micro, at, "
         "ingested_at, source, product, reported_by, dedup_key) "
         "VALUES (?,?,?,?,?,?,?,?,?,?)",
         ("lde_winner", other["id"], DAY, 1_000_000, "2026-08-23 00:00:00",
-         "2026-08-23 00:00:00", "agentctl", "vivy", "agentctl", "race-key"))
+         "2026-08-23 00:00:00", "agentctl", "fennick", "agentctl", "race-key"))
     winner.commit()
     winner.close()
 
@@ -349,6 +349,70 @@ def test_voiding_a_subscription_entry_does_not_touch_the_enforceable_total(ledge
         conn.close()
 
 
+# --- openai-subscription: a second non-enforceable lane, never summed with the
+# first ------------------------------------------------------------------------
+#
+# issue_01M58502RQC0XDAC1D704XQW5B.
+
+def test_an_openai_subscription_entry_moves_neither_the_enforceable_total(ledger):
+    """`openai-subscription` is accepted by `LEDGER_LANES` and excluded from
+    `ledger_days` exactly as `subscription` is — the same split, a second
+    member of `NON_ENFORCEABLE_LEDGER_LANES`."""
+    spend(ledger["id"], 1_000_000, lane="gateway")
+    idempotent, entry, crossed = spend(
+        ledger["id"], 9_000_000, lane="openai-subscription")
+    assert idempotent is False
+    assert entry["lane"] == "openai-subscription"
+    assert crossed is None
+    conn = store.connect()
+    try:
+        assert store.ledger_total(conn, ledger["id"], DAY) == 1_000_000
+        assert store.ledger_lane_total(
+            conn, ledger["id"], DAY, "openai-subscription") == 9_000_000
+        assert conn.execute(
+            "SELECT COUNT(*) c FROM ledger_entries").fetchone()["c"] == 2
+    finally:
+        conn.close()
+
+
+def test_subscription_and_openai_subscription_are_never_folded_together(ledger):
+    """Two separate subscriptions on the same ledger, the same day. Each
+    lane's own total stays its own — the whole reason `openai-subscription`
+    is a second lane rather than sharing `subscription`."""
+    spend(ledger["id"], 4_000_000, lane="subscription")
+    spend(ledger["id"], 9_000_000, lane="openai-subscription")
+    conn = store.connect()
+    try:
+        assert store.ledger_lane_total(conn, ledger["id"], DAY, "subscription") == 4_000_000
+        assert store.ledger_lane_total(
+            conn, ledger["id"], DAY, "openai-subscription") == 9_000_000
+        assert store.ledger_total(conn, ledger["id"], DAY) == 0
+    finally:
+        conn.close()
+
+
+def test_voiding_an_openai_subscription_entry_does_not_touch_the_enforceable_total(ledger):
+    """The mirror of `record_spend`'s split, for the second non-enforceable
+    lane: it never joined `ledger_days`, so voiding it must not subtract
+    from a total it never added to."""
+    spend(ledger["id"], 1_000_000, lane="gateway")
+    _, entry, _ = spend(ledger["id"], 9_000_000, lane="openai-subscription")
+    conn = store.connect()
+    try:
+        before = store.ledger_total(conn, ledger["id"], DAY)
+    finally:
+        conn.close()
+    store.void_spend_entry(entry["id"], "operator", "test")
+    conn = store.connect()
+    try:
+        after = store.ledger_total(conn, ledger["id"], DAY)
+        assert after == before == 1_000_000
+        assert store.ledger_lane_total(
+            conn, ledger["id"], DAY, "openai-subscription") == 0
+    finally:
+        conn.close()
+
+
 # --- an overrun is reported, never refused and never hidden ------------------
 
 def test_spend_past_the_soft_cap_is_recorded_and_the_total_keeps_climbing(ledger):
@@ -376,7 +440,7 @@ def test_a_scope_with_no_ledger_reads_as_none_rather_than_raising(db):
     one."""
     conn = store.connect()
     try:
-        assert store.live_ledger(conn, "project", "vivy") is None
+        assert store.live_ledger(conn, "project", "fennick") is None
     finally:
         conn.close()
 
@@ -396,14 +460,14 @@ def test_an_uncapped_ledger_accumulates_and_is_never_capped(uncapped):
 # nobody capped ---------------------------------------------------------------
 
 def test_ensure_live_ledger_creates_an_uncapped_row_when_none_exists(db):
-    row = store.ensure_live_ledger("project", "vivy")
+    row = store.ensure_live_ledger("project", "fennick")
     assert row["warn_usd_micro"] is None
     assert row["soft_cap_usd_micro"] is None
     assert row["hard_cap_usd_micro"] is None
     assert row["state"] == "live"
     conn = store.connect()
     try:
-        assert store.live_ledger(conn, "project", "vivy")["id"] == row["id"]
+        assert store.live_ledger(conn, "project", "fennick")["id"] == row["id"]
         assert conn.execute("SELECT COUNT(*) c FROM ledgers").fetchone()["c"] == 1
     finally:
         conn.close()
@@ -433,9 +497,9 @@ def test_a_cap_set_after_ensure_live_ledger_accounts_the_spend_already_there(db)
     total is keyed on the ledger id, not on when the cap was set, so it is
     judged against the new cap immediately rather than only from here on.
     """
-    row = store.ensure_live_ledger("project", "vivy")
+    row = store.ensure_live_ledger("project", "fennick")
     spend(row["id"], 500_000_000)
-    capped = make_ledger(scope_id="vivy", soft_cap_usd_micro=100_000_000)
+    capped = make_ledger(scope_id="fennick", soft_cap_usd_micro=100_000_000)
     assert capped["id"] == row["id"]
     conn = store.connect()
     try:

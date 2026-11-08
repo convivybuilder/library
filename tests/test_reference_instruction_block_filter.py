@@ -26,11 +26,11 @@ import protocol
 import reference
 import store
 
-AGENT = "agent-token-vivy"
+AGENT = "agent-token-fennick"
 
 # id, extra dict or raw string (None means no frontmatter_extra at all)
 BLOCK_REVIEWER_PLATFORM = "platform/blocks/review-invariants"
-BLOCK_CODER_VIVY = "platform/blocks/shared-checkout"
+BLOCK_CODER_FENNICK = "platform/blocks/shared-checkout"
 BLOCK_SECURITY_PLATFORM = "platform/blocks/dependency-tiering"
 
 DOCS = [
@@ -38,8 +38,8 @@ DOCS = [
      json.dumps({"binds_crews": ["platform"],
                  "binds_agents": ["reviewer", "coder"],
                  "binds_topics": ["review"]})),
-    (BLOCK_CODER_VIVY, "instruction-block", "vivy",
-     json.dumps({"binds_crews": ["vivy"],
+    (BLOCK_CODER_FENNICK, "instruction-block", "fennick",
+     json.dumps({"binds_crews": ["fennick"],
                  "binds_agents": ["coder"],
                  "binds_topics": ["shared-checkout"]})),
     (BLOCK_SECURITY_PLATFORM, "instruction-block", "platform",
@@ -102,7 +102,7 @@ def client(tmp_path, monkeypatch):
 
     tokens = tmp_path / "api-tokens.json"
     tokens.write_text(json.dumps({
-        AGENT: {"name": "vivy-agent", "products": ["vivy"]},
+        AGENT: {"name": "fennick-agent", "products": ["fennick"]},
     }))
 
     monkeypatch.setattr(store, "DB_PATH", control)
@@ -148,7 +148,7 @@ def no_column_client(tmp_path, monkeypatch):
 
     tokens = tmp_path / "api-tokens.json"
     tokens.write_text(json.dumps({
-        AGENT: {"name": "vivy-agent", "products": ["vivy"]},
+        AGENT: {"name": "fennick-agent", "products": ["fennick"]},
     }))
 
     monkeypatch.setattr(store, "DB_PATH", control)
@@ -175,9 +175,9 @@ def _ids(r):
 
 def test_binds_agents_matches_membership_not_equality(client):
     """`coder` appears in `BLOCK_REVIEWER_PLATFORM`'s two-agent list and as
-    `BLOCK_CODER_VIVY`'s only entry — a naive `=` would only find the second."""
+    `BLOCK_CODER_FENNICK`'s only entry — a naive `=` would only find the second."""
     got = set(_ids(_list(client, binds_agents="coder")))
-    assert got == {BLOCK_REVIEWER_PLATFORM, BLOCK_CODER_VIVY}
+    assert got == {BLOCK_REVIEWER_PLATFORM, BLOCK_CODER_FENNICK}
 
 
 def test_binds_agents_does_not_match_a_substring(client):
@@ -188,11 +188,11 @@ def test_binds_agents_does_not_match_a_substring(client):
 
 
 def test_two_selectors_and(client):
-    """`binds_agents=coder` alone matches two blocks; adding `binds_crews=vivy`
+    """`binds_agents=coder` alone matches two blocks; adding `binds_crews=fennick`
     narrows to the one block naming both, matching how `kind`+`project`
     already compose on this route."""
-    got = set(_ids(_list(client, binds_agents="coder", binds_crews="vivy")))
-    assert got == {BLOCK_CODER_VIVY}
+    got = set(_ids(_list(client, binds_agents="coder", binds_crews="fennick")))
+    assert got == {BLOCK_CODER_FENNICK}
 
 
 def test_all_three_selectors_and(client):
@@ -233,7 +233,7 @@ def test_a_malformed_frontmatter_extra_does_not_500_the_filtered_listing(client)
     r = _list(client, binds_agents="coder")
     assert r.status_code == 200
     got = set(_ids(r))
-    assert got == {BLOCK_REVIEWER_PLATFORM, BLOCK_CODER_VIVY}
+    assert got == {BLOCK_REVIEWER_PLATFORM, BLOCK_CODER_FENNICK}
 
 
 def test_rows_with_unusable_frontmatter_extra_match_no_selector_filter(client):

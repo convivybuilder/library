@@ -133,17 +133,17 @@ def client(db_path, tmp_path, monkeypatch):
 
 
 def test_a_course_with_every_state_reports_exact_counts_and_ids(client, db_path):
-    _insert_item(db_path, id="e_reached", product="vivy", title="reached",
+    _insert_item(db_path, id="e_reached", product="fennick", title="reached",
                 type="epic", state="fixed")
-    _insert_item(db_path, id="e_claimed", product="vivy", title="claimed",
+    _insert_item(db_path, id="e_claimed", product="fennick", title="claimed",
                 type="epic", state="claimed", claimed_by="someone",
                 claimed_at=_ts(minutes=1))
-    _insert_item(db_path, id="e_pr_open", product="vivy", title="pr-open",
+    _insert_item(db_path, id="e_pr_open", product="fennick", title="pr-open",
                 type="epic", state="pr-open")
-    _insert_item(db_path, id="e_open", product="vivy", title="open",
+    _insert_item(db_path, id="e_open", product="fennick", title="open",
                 type="epic", state="open")
     entries = ["e_reached", "e_claimed", "e_pr_open", "e_open", "e_gone"]
-    _insert_course(db_path, id="course1", product="vivy", entries=entries)
+    _insert_course(db_path, id="course1", product="fennick", entries=entries)
 
     r = client.get("/courses/course1", headers=_h())
     assert r.status_code == 200, r.text
@@ -160,19 +160,19 @@ def test_a_course_with_every_state_reports_exact_counts_and_ids(client, db_path)
 
 
 def test_an_open_epic_under_a_live_lease_is_in_flight(client, db_path):
-    _insert_item(db_path, id="e_covered", product="vivy", title="covered",
+    _insert_item(db_path, id="e_covered", product="fennick", title="covered",
                 type="epic", state="open")
-    _insert_item(db_path, id="child", product="vivy", title="a child task",
+    _insert_item(db_path, id="child", product="fennick", title="a child task",
                 type="task", state="claimed", parent_id="e_covered",
                 claimed_by="someone", claimed_at=_ts(minutes=1))
     # THE LEASE ROOTS ON THE EPIC, not the child — `lease.root_id_for`'s own
     # rule for a leaf with a parent. The epic's own row never turns
     # `claimed`; the lease is the only signal that it is spoken for.
     _insert_lease(db_path, id="lease1", root_id="e_covered", taken_for="child")
-    _insert_item(db_path, id="e_bare", product="vivy", title="bare",
+    _insert_item(db_path, id="e_bare", product="fennick", title="bare",
                 type="epic", state="open")
     entries = ["e_covered", "e_bare"]
-    _insert_course(db_path, id="course1", product="vivy", entries=entries)
+    _insert_course(db_path, id="course1", product="fennick", entries=entries)
 
     r = client.get("/courses/course1", headers=_h())
     assert r.status_code == 200, r.text
@@ -185,9 +185,9 @@ def test_an_open_epic_under_a_live_lease_is_in_flight(client, db_path):
 
 
 def test_a_terminal_epic_with_zero_children_is_reached(client, db_path):
-    _insert_item(db_path, id="e_solo", product="vivy", title="solo",
+    _insert_item(db_path, id="e_solo", product="fennick", title="solo",
                 type="epic", state="wontfix")
-    _insert_course(db_path, id="course1", product="vivy", entries=["e_solo"])
+    _insert_course(db_path, id="course1", product="fennick", entries=["e_solo"])
 
     r = client.get("/courses/course1", headers=_h())
     assert r.status_code == 200, r.text
@@ -201,17 +201,17 @@ def test_a_terminal_epic_with_zero_children_is_reached(client, db_path):
 
 
 def test_two_entries_in_flight_at_once_are_both_listed(client, db_path):
-    _insert_item(db_path, id="e_claimed", product="vivy", title="claimed",
+    _insert_item(db_path, id="e_claimed", product="fennick", title="claimed",
                 type="epic", state="claimed", claimed_by="someone",
                 claimed_at=_ts(minutes=1))
-    _insert_item(db_path, id="e_leased", product="vivy", title="leased",
+    _insert_item(db_path, id="e_leased", product="fennick", title="leased",
                 type="epic", state="open")
-    _insert_item(db_path, id="child", product="vivy", title="a child task",
+    _insert_item(db_path, id="child", product="fennick", title="a child task",
                 type="task", state="claimed", parent_id="e_leased",
                 claimed_by="someone", claimed_at=_ts(minutes=1))
     _insert_lease(db_path, id="lease1", root_id="e_leased", taken_for="child")
     entries = ["e_claimed", "e_leased"]
-    _insert_course(db_path, id="course1", product="vivy", entries=entries)
+    _insert_course(db_path, id="course1", product="fennick", entries=entries)
 
     r = client.get("/courses/course1", headers=_h())
     assert r.status_code == 200, r.text
@@ -222,7 +222,7 @@ def test_two_entries_in_flight_at_once_are_both_listed(client, db_path):
 
 
 def test_a_dead_lease_lands_its_open_entry_in_remaining_not_in_flight(client, db_path):
-    _insert_item(db_path, id="e_dead_lease", product="vivy", title="dead lease",
+    _insert_item(db_path, id="e_dead_lease", product="fennick", title="dead lease",
                 type="epic", state="open")
     # heartbeat 5 hours ago outlives the 4-hour grace default, so this lease
     # is unreleased but `is_dead` — the row `course_position` has to route
@@ -230,12 +230,12 @@ def test_a_dead_lease_lands_its_open_entry_in_remaining_not_in_flight(client, db
     _insert_lease(db_path, id="lease_dead", root_id="e_dead_lease",
                  taken_for="e_dead_lease", taken_at=_ts(hours=5),
                  heartbeat_at=_ts(hours=5))
-    _insert_item(db_path, id="e_fresh_lease", product="vivy", title="fresh lease",
+    _insert_item(db_path, id="e_fresh_lease", product="fennick", title="fresh lease",
                 type="epic", state="open")
     _insert_lease(db_path, id="lease_fresh", root_id="e_fresh_lease",
                  taken_for="e_fresh_lease")
     entries = ["e_dead_lease", "e_fresh_lease"]
-    _insert_course(db_path, id="course1", product="vivy", entries=entries)
+    _insert_course(db_path, id="course1", product="fennick", entries=entries)
 
     r = client.get("/courses/course1", headers=_h())
     assert r.status_code == 200, r.text
@@ -248,9 +248,9 @@ def test_a_dead_lease_lands_its_open_entry_in_remaining_not_in_flight(client, db
 
 
 def test_position_carries_no_next_current_or_up_next_key(client, db_path):
-    _insert_item(db_path, id="e_open", product="vivy", title="open",
+    _insert_item(db_path, id="e_open", product="fennick", title="open",
                 type="epic", state="open")
-    _insert_course(db_path, id="course1", product="vivy", entries=["e_open"])
+    _insert_course(db_path, id="course1", product="fennick", entries=["e_open"])
 
     r = client.get("/courses/course1", headers=_h())
     assert r.status_code == 200, r.text
@@ -271,9 +271,9 @@ def test_position_carries_no_next_current_or_up_next_key(client, db_path):
 
 def test_a_synthetic_waypoint_is_reached_only_when_every_member_is_terminal(
         client, db_path):
-    _insert_item(db_path, id="w1", product="vivy", title="one", state="fixed")
-    _insert_item(db_path, id="w2", product="vivy", title="two", state="open")
-    _insert_course(db_path, id="course1", product="vivy", entries=[],
+    _insert_item(db_path, id="w1", product="fennick", title="one", state="fixed")
+    _insert_item(db_path, id="w2", product="fennick", title="two", state="open")
+    _insert_course(db_path, id="course1", product="fennick", entries=[],
                    waypoints=[_waypoint("wp1", "w1", "w2")])
 
     r = client.get("/courses/course1", headers=_h())
@@ -285,12 +285,12 @@ def test_a_synthetic_waypoint_is_reached_only_when_every_member_is_terminal(
     assert detail["terminal"] == 1
 
     # NOW RESOLVE THE SECOND MEMBER TOO.
-    _insert_item(db_path, id="w3", product="vivy", title="three",
+    _insert_item(db_path, id="w3", product="fennick", title="three",
                 state="wontfix")
     # A DIFFERENT PRODUCT, so this second Course does not collide with
     # `course1` on the one-live-Course-per-product index — the member items
     # it names are read by id, not filtered by the Course's own product.
-    _insert_course(db_path, id="course2", product="constance", entries=[],
+    _insert_course(db_path, id="course2", product="marlow", entries=[],
                    waypoints=[_waypoint("wp2", "w1", "w3")])
     r = client.get("/courses/course2", headers=_h())
     detail = r.json()["waypoint_progress"][0]
@@ -299,18 +299,18 @@ def test_a_synthetic_waypoint_is_reached_only_when_every_member_is_terminal(
 
 
 def test_a_mixed_course_reports_position_across_both_kinds(client, db_path):
-    _insert_item(db_path, id="e_reached", product="vivy", title="reached",
+    _insert_item(db_path, id="e_reached", product="fennick", title="reached",
                 type="epic", state="fixed")
-    _insert_item(db_path, id="e_open", product="vivy", title="open",
+    _insert_item(db_path, id="e_open", product="fennick", title="open",
                 type="epic", state="open")
-    _insert_item(db_path, id="w_done", product="vivy", title="done",
+    _insert_item(db_path, id="w_done", product="fennick", title="done",
                 state="fixed")
-    _insert_item(db_path, id="w_claimed", product="vivy", title="claimed",
+    _insert_item(db_path, id="w_claimed", product="fennick", title="claimed",
                 state="claimed", claimed_by="someone", claimed_at=_ts(minutes=1))
-    _insert_item(db_path, id="w_untouched", product="vivy", title="untouched",
+    _insert_item(db_path, id="w_untouched", product="fennick", title="untouched",
                 state="open")
     _insert_course(
-        db_path, id="course1", product="vivy",
+        db_path, id="course1", product="fennick",
         entries=["e_reached", "e_open"],
         waypoints=[
             _waypoint("wp_reached", "w_done"),
@@ -331,9 +331,9 @@ def test_a_mixed_course_reports_position_across_both_kinds(client, db_path):
 
 
 def test_a_missing_member_is_reported_not_dropped(client, db_path):
-    _insert_item(db_path, id="w_here", product="vivy", title="here",
+    _insert_item(db_path, id="w_here", product="fennick", title="here",
                 state="open")
-    _insert_course(db_path, id="course1", product="vivy", entries=[],
+    _insert_course(db_path, id="course1", product="fennick", entries=[],
                    waypoints=[_waypoint("wp1", "w_here", "w_gone")])
 
     r = client.get("/courses/course1", headers=_h())
@@ -351,11 +351,11 @@ def test_an_old_shape_read_sees_entries_unchanged(client, db_path):
     """A Course that also holds a synthetic waypoint still answers `entries`
     with nothing but epic ids — the field a client predating this feature
     reads is exactly what it always was."""
-    _insert_item(db_path, id="e_open", product="vivy", title="open",
+    _insert_item(db_path, id="e_open", product="fennick", title="open",
                 type="epic", state="open")
-    _insert_item(db_path, id="w1", product="vivy", title="member",
+    _insert_item(db_path, id="w1", product="fennick", title="member",
                 state="open")
-    _insert_course(db_path, id="course1", product="vivy", entries=["e_open"],
+    _insert_course(db_path, id="course1", product="fennick", entries=["e_open"],
                    waypoints=[_waypoint("wp1", "w1")])
 
     r = client.get("/courses/course1", headers=_h())
@@ -370,11 +370,11 @@ def test_an_old_shape_read_sees_entries_unchanged(client, db_path):
 
 
 def test_measurement_script_runs_against_the_test_database(db_path):
-    _insert_item(db_path, id="e_reached", product="vivy", title="reached",
+    _insert_item(db_path, id="e_reached", product="fennick", title="reached",
                 type="epic", state="fixed")
-    _insert_item(db_path, id="e_open", product="vivy", title="open",
+    _insert_item(db_path, id="e_open", product="fennick", title="open",
                 type="epic", state="open")
-    _insert_course(db_path, id="course1", product="vivy",
+    _insert_course(db_path, id="course1", product="fennick",
                    entries=["e_reached", "e_open"])
 
     result = subprocess.run(

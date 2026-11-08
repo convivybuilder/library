@@ -47,7 +47,7 @@ def test_upgrade_is_additive_on_a_database_that_holds_items(tmp_path):
     conn = sqlite3.connect(db)
     conn.execute(
         "INSERT INTO issue_items (id, product, title, body, refs, severity, state, "
-        "type, created_by, created_at) VALUES ('i1','vivy','a title','b','{}',"
+        "type, created_by, created_at) VALUES ('i1','fennick','a title','b','{}',"
         "'low','open','task','t','2026-01-01')")
     conn.commit()
     conn.close()

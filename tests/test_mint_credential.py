@@ -32,10 +32,18 @@ REPO = Path(__file__).resolve().parent.parent
 @pytest.fixture
 def fresh_files(tmp_path, monkeypatch):
     """No credential of any kind on disk, in a directory that does not exist
-    yet either."""
+    yet either. Also sets LIBRARY_API_TOKENS and LIBRARY_CLIENT_TOKENS to the
+    same temp paths, so `mint_credential`'s CQ·244 gate — which checks the
+    variable is set, not just that `identity.TOKENS`/`CLIENT_TOKENS` were
+    monkeypatched — sees a target it accepts without every call in this file
+    needing its own `--tokens-file`."""
     state = tmp_path / "state" / ".library"
-    monkeypatch.setattr(identity, "TOKENS", state / "api-tokens.json")
-    monkeypatch.setattr(identity, "CLIENT_TOKENS", state / "client-tokens.json")
+    agents_path = state / "api-tokens.json"
+    clients_path = state / "client-tokens.json"
+    monkeypatch.setattr(identity, "TOKENS", agents_path)
+    monkeypatch.setattr(identity, "CLIENT_TOKENS", clients_path)
+    monkeypatch.setenv("LIBRARY_API_TOKENS", str(agents_path))
+    monkeypatch.setenv("LIBRARY_CLIENT_TOKENS", str(clients_path))
     assert not state.exists()
     return state
 
@@ -103,7 +111,8 @@ def test_a_fresh_shell_with_neither_db_variable_set_does_not_crash(tmp_path):
         [sys.executable, str(REPO / "mint_credential.py"),
          "--file", "agents", "--name", "orient"],
         cwd=str(REPO), capture_output=True, text=True, check=False,
-        env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)})
+        env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path),
+             "LIBRARY_API_TOKENS": str(tmp_path / ".library" / "api-tokens.json")})
     assert result.returncode == 0, result.stderr
     assert "MisconfiguredDatabase" not in result.stderr
     assert "Traceback" not in result.stderr
@@ -138,6 +147,75 @@ def test_minted_into_agents_with_kind_system_resolves_as_system(fresh_files, cap
     assert ident.actor == "the-poller"
     assert ident.products == frozenset({"library", "orient"})
     assert not identity.in_scope(ident, "some-other-product")
+
+
+def test_a_review_record_writer_resolves_to_its_one_capability_and_product(
+        fresh_files, capsys):
+    """CQ·237: the verdict-only credential a private crew's review dispatch
+    is handed holds `review_record.create` for that crew's product alone."""
+    rc, out, _ = _run(capsys, "--file", "agents", "--name", "quillhouse-verdicts",
+                      "--kind", "review_record_writer", "--products", "quillhouse")
+    assert rc == 0
+    ident = identity.resolve(f"Bearer {out.strip()}")
+    assert ident is not None
+    assert ident.kind == "review_record_writer"
+    assert ident.products == frozenset({"quillhouse"})
+    assert identity.authorized(ident, "review_record.create")
+    assert not identity.authorized(ident, "review_record.read")
+    assert not identity.in_scope(ident, "some-other-product")
+
+
+@pytest.mark.parametrize("extra", [
+    ("--products", "*"),
+    ("--products", "quillhouse,ledgerwick"),
+    ("--products", "quillhouse", "--grants", "review_record.read"),
+    ("--products", "quillhouse", "--profile", "quillhouse/daytime"),
+    ("--products", "quillhouse", "--crew", "quillhouse"),
+])
+def test_a_review_record_writer_is_refused_anything_wider(fresh_files, capsys, extra):
+    rc, out, err = _run(capsys, "--file", "agents", "--name", "quillhouse-verdicts",
+                        "--kind", "review_record_writer", *extra)
+    assert rc == 2
+    assert out == ""
+    assert "review_record_writer" in err
+    assert not identity.TOKENS.exists()
+
+
+def test_a_review_record_writer_needs_products_named(fresh_files, capsys):
+    """Without --products the scope defaults to '*', which this kind refuses."""
+    rc, out, err = _run(capsys, "--file", "agents", "--name", "quillhouse-verdicts",
+                        "--kind", "review_record_writer")
+    assert rc == 2
+    assert "exactly one product" in err
+    assert not identity.TOKENS.exists()
+
+
+def test_a_registrar_resolves_to_registry_write_alone(fresh_files, capsys):
+    """CQ·246: the credential agent-platform's crew registration presents
+    holds `registry.write` and nothing else, `registry.read` included."""
+    rc, out, _ = _run(capsys, "--file", "agents", "--name", "the-registrar",
+                      "--kind", "registrar")
+    assert rc == 0
+    ident = identity.resolve(f"Bearer {out.strip()}")
+    assert ident is not None
+    assert ident.kind == "registrar"
+    assert identity.authorized(ident, "registry.write")
+    assert not identity.authorized(ident, "registry.read")
+    assert not identity.authorized(ident, "roster.write")
+
+
+@pytest.mark.parametrize("extra", [
+    ("--grants", "registry.read"),
+    ("--profile", "quillhouse/daytime"),
+    ("--crew", "quillhouse"),
+])
+def test_a_registrar_is_refused_anything_wider(fresh_files, capsys, extra):
+    rc, out, err = _run(capsys, "--file", "agents", "--name", "the-registrar",
+                        "--kind", "registrar", *extra)
+    assert rc == 2
+    assert out == ""
+    assert "registrar" in err
+    assert not identity.TOKENS.exists()
 
 
 def test_minted_into_clients_resolves_as_approved_client(fresh_files, capsys):
@@ -282,14 +360,43 @@ def test_grants_roster_write_on_a_non_orchestrator_kind_is_refused_and_writes_no
     assert identity.TOKENS.read_bytes() == before
 
 
-def test_grants_for_the_clients_file_is_refused_and_writes_nothing(
-        fresh_files, capsys):
+def _authorized(token: str, capability: str) -> bool:
+    return identity.authorized(identity.resolve(f"Bearer {token}"), capability)
+
+
+def test_grants_reach_a_client_entry_and_resolve(fresh_files, capsys):
+    """How an install gives Orient's client credential `signal.post_draft`,
+    which no role carries (`identity.GRANT_ONLY_CAPS`)."""
+    rc, out, _ = _run(capsys, "--file", "clients", "--name", "orient",
+                      "--grants", "signal.post_draft")
+    assert rc == 0
+    assert _authorized(out.strip(), "signal.post_draft")
+
+    rc, out, _ = _run(capsys, "--file", "clients", "--name", "deck")
+    assert rc == 0
+    assert not _authorized(out.strip(), "signal.post_draft")
+
+
+@pytest.mark.parametrize("capability", ["no.such.capability", "roster.write"])
+def test_a_client_grant_identity_refuses_writes_nothing(
+        fresh_files, capsys, capability):
     rc, out, err = _run(capsys, "--file", "clients", "--name", "orient",
-                        "--grants", "review_record.create")
-    assert rc == 2
+                        "--grants", capability)
+    assert rc == 1
     assert out == ""
-    assert "--file agents" in err
+    assert capability in err
     assert not identity.CLIENT_TOKENS.exists()
+
+
+def test_a_client_grant_cannot_win_back_what_holds_reserved_excludes(
+        fresh_files, capsys):
+    """Why `--grants` on a client entry needs no narrower limit: a grant of a
+    role capability changes nothing, and this is the one way it could have."""
+    reserved = sorted(identity.HUMAN_RESERVED_CAPS)[0]
+    rc, out, _ = _run(capsys, "--file", "clients", "--name", "bosun",
+                      "--holds-reserved=", "--grants", reserved)
+    assert rc == 0
+    assert not _authorized(out.strip(), reserved)
 
 
 def test_empty_grants_writes_no_grants_key(fresh_files, capsys):
@@ -591,13 +698,17 @@ def test_out_replace_overwrites_the_existing_file(fresh_files, tmp_path, capsys)
 
 def _run_sub(tmp_path, *argv):
     """Run mint_credential.py as a subprocess with HOME pointed at
-    `tmp_path` and neither token-file env var set, so both stores resolve
-    under `tmp_path/.library` — the same shape
-    `test_a_fresh_shell_with_neither_db_variable_set_does_not_crash` uses."""
+    `tmp_path`, so the default agents store resolves under
+    `tmp_path/.library` — the same shape
+    `test_a_fresh_shell_with_neither_db_variable_set_does_not_crash` uses.
+    LIBRARY_API_TOKENS is set to that same default path, naming it
+    explicitly as CQ·244 now requires rather than relying on the unset
+    variable's fallback; every caller here uses `--file agents`."""
     return subprocess.run(
         [sys.executable, str(REPO / "mint_credential.py"), *argv],
         cwd=str(REPO), capture_output=True, text=True, check=False,
-        env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)})
+        env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path),
+             "LIBRARY_API_TOKENS": str(tmp_path / ".library" / "api-tokens.json")})
 
 
 def test_out_a_directory_at_path_is_refused_and_the_store_is_untouched(tmp_path):
@@ -630,6 +741,27 @@ def test_out_equal_to_the_store_path_is_refused_and_the_store_is_unchanged(
     before = store_path.read_bytes()
 
     result = _run_sub(tmp_path, "--file", "agents", "--name", "orient",
+                      "--out", str(store_path), "--replace")
+
+    assert result.returncode != 0
+    assert "Traceback" not in result.stderr
+    assert "credential store" in result.stderr
+    assert store_path.read_bytes() == before
+
+
+def test_out_equal_to_the_tokens_file_target_is_refused_and_it_is_unchanged(
+        tmp_path):
+    """`--tokens-file` can name a store outside identity's two defaults, so
+    the `--out` check must cover the store this run actually writes."""
+    store_path = tmp_path / "elsewhere" / "api-tokens.json"
+    store_path.parent.mkdir(mode=0o700)
+    store_path.write_text(json.dumps({"an-existing-token":
+                                      {"name": "deck", "products": ["*"]}}))
+    store_path.chmod(0o600)
+    before = store_path.read_bytes()
+
+    result = _run_sub(tmp_path, "--file", "agents", "--name", "orient",
+                      "--tokens-file", str(store_path),
                       "--out", str(store_path), "--replace")
 
     assert result.returncode != 0
@@ -865,7 +997,8 @@ sys.exit(rc)
     result = subprocess.run(
         [sys.executable, "-c", script],
         cwd=str(REPO), capture_output=True, text=True, check=False,
-        env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)})
+        env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path),
+             "LIBRARY_API_TOKENS": str(store_dir / "api-tokens.json")})
 
     assert result.returncode != 0
     assert "Traceback" not in result.stderr
@@ -995,7 +1128,7 @@ def test_revoke_a_duplicated_name_is_refused_and_writes_nothing_and_names_neithe
     identity.TOKENS.parent.mkdir(parents=True)
     duplicated = {
         "token-one": {"name": "orient", "products": ["*"]},
-        "token-two": {"name": "orient", "products": ["vivy"]},
+        "token-two": {"name": "orient", "products": ["fennick"]},
     }
     identity.TOKENS.write_text(json.dumps(duplicated))
     identity.TOKENS.chmod(0o600)
@@ -1017,7 +1150,7 @@ def test_revoke_a_duplicated_name_is_refused_and_writes_nothing_and_names_neithe
 @pytest.mark.parametrize("extra", [
     ["--out", "/tmp/wherever"],
     ["--replace"],
-    ["--products", "vivy"],
+    ["--products", "fennick"],
     ["--kind", "system"],
     ["--grants", "review_record.create"],
     ["--profile", "shipwright/daytime"],
@@ -1133,7 +1266,7 @@ def app_with_writes(fresh_files, tmp_path, monkeypatch, vector_index):
     monkeypatch.setattr(store, "WRITES_ENABLED", True)
 
     registry = tmp_path / "projects.json"
-    registry.write_text(json.dumps({"_meta": {}, "vivy": {"repos": []}}))
+    registry.write_text(json.dumps({"_meta": {}, "fennick": {"repos": []}}))
     monkeypatch.setattr(projects, "REGISTRY_PATH", registry)
     projects.reload()
     yield TestClient(libapp.app)
@@ -1153,7 +1286,7 @@ def test_a_revoked_credential_is_refused_401_on_its_next_request(
     token = out.strip()
 
     body = {"source": "github", "kind": "note", "actor": "a-builder-project",
-            "product": "vivy", "body": "a thing happened"}
+            "product": "fennick", "body": "a thing happened"}
     first = client.post("/signals", json=body, headers=_signal_headers(token))
     assert first.status_code == 201, first.text
 
@@ -1164,3 +1297,116 @@ def test_a_revoked_credential_is_refused_401_on_its_next_request(
 
     second = client.post("/signals", json=body, headers=_signal_headers(token))
     assert second.status_code == 401, second.text
+
+
+# --- CQ·244: refuse a mint or revoke that names no tokens file --------------
+#
+# `mint_credential.py` must never write a credential file the running
+# Library does not read. For `--file agents`/`--file clients` it now refuses,
+# writing nothing, unless `LIBRARY_API_TOKENS`/`LIBRARY_CLIENT_TOKENS` is set
+# or `--tokens-file PATH` names the target — and prints the resolved path,
+# before anything is written, on every mint and every `--revoke`.
+
+
+@pytest.mark.parametrize("file,env_var", [("agents", "LIBRARY_API_TOKENS"),
+                                          ("clients", "LIBRARY_CLIENT_TOKENS")])
+def test_mint_with_neither_variable_nor_tokens_file_is_refused_and_writes_nothing(
+        fresh_files, monkeypatch, capsys, file, env_var):
+    monkeypatch.delenv(env_var, raising=False)
+    rc, out, err = _run(capsys, "--file", file, "--name", "orient")
+    assert rc == 1
+    assert out == ""
+    assert env_var in err
+    assert "--tokens-file" in err
+    target = identity.TOKENS if file == "agents" else identity.CLIENT_TOKENS
+    assert not target.exists()
+
+
+@pytest.mark.parametrize("file,env_var", [("agents", "LIBRARY_API_TOKENS"),
+                                          ("clients", "LIBRARY_CLIENT_TOKENS")])
+def test_revoke_with_neither_variable_nor_tokens_file_is_refused_and_writes_nothing(
+        fresh_files, monkeypatch, capsys, file, env_var):
+    rc, out, _ = _run(capsys, "--file", file, "--name", "orient")
+    assert rc == 0
+    target = identity.TOKENS if file == "agents" else identity.CLIENT_TOKENS
+    before = target.read_bytes()
+
+    monkeypatch.delenv(env_var, raising=False)
+    rc, out, err = _run(capsys, "--file", file, "--revoke", "--name", "orient")
+    assert rc == 1
+    assert out == ""
+    assert env_var in err
+    assert target.read_bytes() == before
+
+
+@pytest.mark.parametrize("file", ["agents", "clients"])
+def test_tokens_file_mints_into_the_named_path_even_with_the_variable_unset(
+        fresh_files, monkeypatch, tmp_path, capsys, file):
+    env_var = "LIBRARY_API_TOKENS" if file == "agents" else "LIBRARY_CLIENT_TOKENS"
+    monkeypatch.delenv(env_var, raising=False)
+    target = tmp_path / "custom-tokens.json"
+
+    rc, out, err = _run(capsys, "--file", file, "--name", "orient",
+                        "--tokens-file", str(target))
+    assert rc == 0, err
+    assert str(target) in err
+    token = out.strip()
+    assert token in json.loads(target.read_text())
+    default = identity.TOKENS if file == "agents" else identity.CLIENT_TOKENS
+    assert not default.exists()
+
+
+def test_tokens_file_revokes_from_the_named_path_even_with_the_variable_unset(
+        fresh_files, monkeypatch, tmp_path, capsys):
+    monkeypatch.delenv("LIBRARY_API_TOKENS", raising=False)
+    target = tmp_path / "custom-tokens.json"
+
+    rc, out, err = _run(capsys, "--file", "agents", "--name", "orient",
+                        "--tokens-file", str(target))
+    assert rc == 0, err
+
+    rc, out, err = _run(capsys, "--file", "agents", "--revoke", "--name", "orient",
+                        "--tokens-file", str(target))
+    assert rc == 0, err
+    assert out == ""
+    assert str(target) in err
+    assert json.loads(target.read_text()) == {}
+
+
+@pytest.mark.parametrize("file,env_var", [("agents", "LIBRARY_API_TOKENS"),
+                                          ("clients", "LIBRARY_CLIENT_TOKENS")])
+def test_the_variable_alone_selects_the_target_in_a_fresh_process(
+        tmp_path, file, env_var):
+    """No --tokens-file and no attribute monkeypatch — a real subprocess, so
+    the variable is read the same way `identity.resolve_tokens()` (and
+    `identity.CLIENT_TOKENS`'s own assignment) read it, at import."""
+    target = tmp_path / "somewhere-else" / "tokens.json"
+    result = subprocess.run(
+        [sys.executable, str(REPO / "mint_credential.py"),
+         "--file", file, "--name", "orient"],
+        cwd=str(REPO), capture_output=True, text=True, check=False,
+        env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), env_var: str(target)})
+    assert result.returncode == 0, result.stderr
+    assert str(target) in result.stderr
+    assert target.exists()
+    assert not (tmp_path / ".library").exists()
+
+
+@pytest.mark.parametrize("file", ["agents", "clients"])
+def test_the_printed_target_path_on_mint_equals_the_file_actually_written(
+        fresh_files, capsys, file):
+    rc, out, err = _run(capsys, "--file", file, "--name", "orient")
+    assert rc == 0
+    target = identity.TOKENS if file == "agents" else identity.CLIENT_TOKENS
+    assert f"target file: {target}" in err
+    assert target.exists()
+
+
+def test_the_printed_target_path_on_revoke_equals_the_file_actually_written(
+        fresh_files, capsys):
+    rc, out, _ = _run(capsys, "--file", "agents", "--name", "orient")
+    assert rc == 0
+
+    rc, out, err = _run(capsys, "--file", "agents", "--revoke", "--name", "orient")
+    assert rc == 0
+    assert f"target file: {identity.TOKENS}" in err

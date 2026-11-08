@@ -84,7 +84,7 @@ def client(tmp_path, monkeypatch):
         ADMIN_TOKEN: {"name": ADMIN, "products": ["*"]},
         PLAIN_TOKEN: {"name": PLAIN, "products": ["*"]},
         ORIENT_TOKEN: {"name": "orient", "products": ["*"]},
-        SCOPED_ADMIN_TOKEN: {"name": SCOPED_ADMIN, "products": ["vivy"]},
+        SCOPED_ADMIN_TOKEN: {"name": SCOPED_ADMIN, "products": ["fennick"]},
     }))
     # Orient's agent file is a store this repo does not own. An entry there can
     # carry any `name`, including an administrator's person id.
@@ -107,7 +107,7 @@ def client(tmp_path, monkeypatch):
     # which is CI.
     registry = tmp_path / "projects.json"
     registry.write_text(json.dumps(
-        {"vivy": {}, "hollis": {}, "constance": {}}))
+        {"fennick": {}, "bramwell": {}, "marlow": {}}))
     monkeypatch.setattr(projects, "REGISTRY_PATH", registry)
     projects.reload()
     test_client = TestClient(libapp.app)
@@ -160,7 +160,7 @@ def test_a_real_administrators_name_in_acting_human_and_nothing_else_is_refused(
     a real administrator in `acting_human`, which is all `attested_human` needs
     to accept. If the route branched on that field this call would succeed."""
     r = _post(client, ORIENT_TOKEN,
-              {"grant": ["vivy"], "acting_human": ADMIN})
+              {"grant": ["fennick"], "acting_human": ADMIN})
     assert r.status_code == 404
     assert _held(client.db) == []
     assert _changes(client.db) == []
@@ -168,7 +168,7 @@ def test_a_real_administrators_name_in_acting_human_and_nothing_else_is_refused(
 
 def test_acting_human_in_a_query_string_or_header_is_no_better(client):
     r = client.post(f"/people/{TARGET}/projects?acting_human={ADMIN}",
-                    json={"grant": ["vivy"]},
+                    json={"grant": ["fennick"]},
                     headers={**_h(ORIENT_TOKEN), "X-Acting-Human": ADMIN})
     assert r.status_code == 404
     assert _held(client.db) == []
@@ -177,7 +177,7 @@ def test_acting_human_in_a_query_string_or_header_is_no_better(client):
 def test_acting_human_naming_someone_else_does_not_change_who_is_recorded(
         client):
     r = _post(client, ADMIN_TOKEN,
-              {"grant": ["vivy"], "acting_human": "somebody-else"})
+              {"grant": ["fennick"], "acting_human": "somebody-else"})
     assert r.status_code == 200
     assert r.json()["changed_by"] == ADMIN
     assert [c["changed_by"] for c in _changes(client.db)] == [ADMIN]
@@ -191,7 +191,7 @@ def test_acting_human_naming_someone_else_does_not_change_who_is_recorded(
 
 def test_a_non_administrator_is_refused_byte_for_byte_like_a_missing_person(
         client):
-    body = {"grant": ["vivy"]}
+    body = {"grant": ["fennick"]}
     non_admin_names_a_real_person = _post(client, PLAIN_TOKEN, body, TARGET)
     admin_names_a_missing_person = _post(client, ADMIN_TOKEN, body, GHOST)
     assert non_admin_names_a_real_person.status_code == 404
@@ -200,7 +200,7 @@ def test_a_non_administrator_is_refused_byte_for_byte_like_a_missing_person(
 
 
 def test_every_refusal_before_the_body_is_one_response(client):
-    body = {"grant": ["vivy"]}
+    body = {"grant": ["fennick"]}
     reference = _wire(_post(client, PLAIN_TOKEN, body))
     callers = {
         "no credential": _post(client, None, body),
@@ -230,7 +230,7 @@ def test_a_malformed_body_never_tells_a_refused_caller_from_an_administrator(
                               headers={**_h(PLAIN_TOKEN),
                                        "Content-Type": "application/json"})
         reference = client.post(f"/people/{TARGET}/projects",
-                                json={"grant": ["vivy"]},
+                                json={"grant": ["fennick"]},
                                 headers=_h(PLAIN_TOKEN))
         assert _wire(refused) == _wire(reference), raw
 
@@ -244,7 +244,7 @@ def test_an_administrator_credential_is_refused_without_person_write(
         **identity.ROLE_CAPS,
         "approved_client": identity.ROLE_CAPS["approved_client"]
         - {"person.write"}})
-    r = _post(client, ADMIN_TOKEN, {"grant": ["vivy"]})
+    r = _post(client, ADMIN_TOKEN, {"grant": ["fennick"]})
     assert r.status_code == 404
     assert _held(client.db) == []
 
@@ -264,7 +264,7 @@ def test_an_administrators_name_on_an_agent_file_entry_is_refused_even_if_the_ca
     monkeypatch.setattr(identity, "ROLE_CAPS", {
         **identity.ROLE_CAPS,
         "agent": identity.ROLE_CAPS["agent"] | {"person.write"}})
-    r = _post(client, FORGED_AGENT_TOKEN, {"grant": ["vivy"]})
+    r = _post(client, FORGED_AGENT_TOKEN, {"grant": ["fennick"]})
     assert r.status_code == 404
     assert _held(client.db) == []
 
@@ -273,23 +273,23 @@ def test_an_administrators_name_on_an_agent_file_entry_is_refused_even_if_the_ca
 
 
 def test_an_administrator_changes_a_set_and_the_read_route_shows_it(client):
-    r = _post(client, ADMIN_TOKEN, {"grant": ["vivy", "hollis"]})
+    r = _post(client, ADMIN_TOKEN, {"grant": ["fennick", "bramwell"]})
     assert r.status_code == 200
-    assert r.json() == {"person_id": TARGET, "granted": ["hollis", "vivy"],
+    assert r.json() == {"person_id": TARGET, "granted": ["bramwell", "fennick"],
                         "revoked": [], "changed_by": ADMIN}
     read = client.get(f"/people/{TARGET}/projects", headers=_h(ADMIN_TOKEN))
-    assert read.json() == {"projects": ["hollis", "vivy"], "count": 2}
+    assert read.json() == {"projects": ["bramwell", "fennick"], "count": 2}
 
-    r = _post(client, ADMIN_TOKEN, {"grant": ["constance"], "revoke": ["vivy"]})
+    r = _post(client, ADMIN_TOKEN, {"grant": ["marlow"], "revoke": ["fennick"]})
     assert r.status_code == 200
     read = client.get(f"/people/{TARGET}/projects", headers=_h(ADMIN_TOKEN))
-    assert read.json() == {"projects": ["constance", "hollis"], "count": 2}
+    assert read.json() == {"projects": ["bramwell", "marlow"], "count": 2}
 
 
 def test_an_administrator_may_change_their_own_set(client):
-    r = _post(client, ADMIN_TOKEN, {"grant": ["vivy"]}, ADMIN)
+    r = _post(client, ADMIN_TOKEN, {"grant": ["fennick"]}, ADMIN)
     assert r.status_code == 200
-    assert _held(client.db, ADMIN) == ["vivy"]
+    assert _held(client.db, ADMIN) == ["fennick"]
 
 
 def test_the_credential_bootstrap_mints_is_the_attested_channel(
@@ -306,7 +306,7 @@ def test_the_credential_bootstrap_mints_is_the_attested_channel(
     monkeypatch.setattr(identity, "CLIENT_TOKENS", tokens)
     monkeypatch.setattr(identity, "TOKENS", tmp_path / "no-agent-tokens.json")
     registry = tmp_path / "projects.json"
-    registry.write_text(json.dumps({"vivy": {}}))
+    registry.write_text(json.dumps({"fennick": {}}))
     monkeypatch.setattr(projects, "REGISTRY_PATH", registry)
     projects.reload()
     person_id, token = bootstrap_library.bootstrap("Ada Lovelace")
@@ -322,11 +322,11 @@ def test_the_credential_bootstrap_mints_is_the_attested_channel(
     assert (ident.kind, ident.actor) == ("approved_client", person_id)
 
     web = TestClient(libapp.app)
-    r = web.post(f"/people/{TARGET}/projects", json={"grant": ["vivy"]},
+    r = web.post(f"/people/{TARGET}/projects", json={"grant": ["fennick"]},
                  headers=_h(token))
     assert r.status_code == 200, r.text
     assert r.json()["changed_by"] == person_id
-    assert _held(db) == ["vivy"]
+    assert _held(db) == ["fennick"]
     projects.reload()
 
 
@@ -334,51 +334,51 @@ def test_the_credential_bootstrap_mints_is_the_attested_channel(
 
 
 def test_a_revocation_leaves_its_history_behind(client):
-    _post(client, ADMIN_TOKEN, {"grant": ["vivy", "hollis"]})
+    _post(client, ADMIN_TOKEN, {"grant": ["fennick", "bramwell"]})
     granted = _rows(client.db, "SELECT * FROM person_products "
-                    "WHERE product = 'vivy'")
+                    "WHERE product = 'fennick'")
     assert len(granted) == 1
-    r = _post(client, ADMIN_TOKEN, {"revoke": ["vivy"]})
+    r = _post(client, ADMIN_TOKEN, {"revoke": ["fennick"]})
     assert r.status_code == 200
-    assert _held(client.db) == ["hollis"]
+    assert _held(client.db) == ["bramwell"]
     # The current-state row, and its granted_by/granted_at with it, are gone...
     assert _rows(client.db, "SELECT * FROM person_products "
-                 "WHERE product = 'vivy'") == []
+                 "WHERE product = 'fennick'") == []
     # ...and the record of the grant and of the revocation both remain.
-    vivy = [c for c in _changes(client.db) if c["product"] == "vivy"]
-    assert [(c["action"], c["changed_by"]) for c in vivy] == [
+    fennick = [c for c in _changes(client.db) if c["product"] == "fennick"]
+    assert [(c["action"], c["changed_by"]) for c in fennick] == [
         ("grant", ADMIN), ("revoke", ADMIN)]
-    assert all(c["changed_at"] for c in vivy)
-    assert vivy[0]["person_id"] == vivy[1]["person_id"] == TARGET
+    assert all(c["changed_at"] for c in fennick)
+    assert fennick[0]["person_id"] == fennick[1]["person_id"] == TARGET
 
 
 def test_an_earlier_record_survives_a_later_change(client):
-    _post(client, ADMIN_TOKEN, {"grant": ["vivy"]})
+    _post(client, ADMIN_TOKEN, {"grant": ["fennick"]})
     first = _changes(client.db)
     assert len(first) == 1
-    _post(client, ADMIN_TOKEN, {"revoke": ["vivy"]})
-    _post(client, ADMIN_TOKEN, {"grant": ["vivy", "hollis"]})
+    _post(client, ADMIN_TOKEN, {"revoke": ["fennick"]})
+    _post(client, ADMIN_TOKEN, {"grant": ["fennick", "bramwell"]})
     later = _changes(client.db)
     assert later[:1] == first, "the earlier record was rewritten"
     assert [(c["product"], c["action"]) for c in later] == [
-        ("vivy", "grant"), ("vivy", "revoke"), ("hollis", "grant"),
-        ("vivy", "grant")]
+        ("fennick", "grant"), ("fennick", "revoke"), ("bramwell", "grant"),
+        ("fennick", "grant")]
     assert [c["id"] for c in later] == sorted(c["id"] for c in later)
 
 
 def test_a_request_that_changes_nothing_records_nothing(client):
-    _post(client, ADMIN_TOKEN, {"grant": ["vivy"]})
+    _post(client, ADMIN_TOKEN, {"grant": ["fennick"]})
     before = _changes(client.db)
-    r = _post(client, ADMIN_TOKEN, {"grant": ["vivy"], "revoke": ["hollis"]})
+    r = _post(client, ADMIN_TOKEN, {"grant": ["fennick"], "revoke": ["bramwell"]})
     assert r.status_code == 200
     assert r.json()["granted"] == [] and r.json()["revoked"] == []
     assert _changes(client.db) == before
 
 
 def test_a_regrant_is_stamped_with_the_regranting_administrator_and_time(client):
-    _post(client, ADMIN_TOKEN, {"grant": ["vivy"]})
-    _post(client, ADMIN_TOKEN, {"revoke": ["vivy"]})
-    _post(client, SCOPED_ADMIN_TOKEN, {"grant": ["vivy"]})
+    _post(client, ADMIN_TOKEN, {"grant": ["fennick"]})
+    _post(client, ADMIN_TOKEN, {"revoke": ["fennick"]})
+    _post(client, SCOPED_ADMIN_TOKEN, {"grant": ["fennick"]})
     row = _rows(client.db, "SELECT * FROM person_products")[0]
     assert row["granted_by"] == SCOPED_ADMIN
     assert [c["changed_by"] for c in _changes(client.db)] == [
@@ -389,9 +389,9 @@ def test_a_regrant_is_stamped_with_the_regranting_administrator_and_time(client)
 
 
 @pytest.mark.parametrize("body", [
-    {}, {"grant": []}, {"grant": "vivy"}, {"grant": [5]}, {"grant": [""]},
-    {"grant": ["  "]}, {"grant": [["vivy"]]}, {"revoke": {"a": 1}},
-    {"grant": ["x" * (store.MAX_IDENT + 1)]}, {"grant": ["vivy"], "revoke": ["vivy"]},
+    {}, {"grant": []}, {"grant": "fennick"}, {"grant": [5]}, {"grant": [""]},
+    {"grant": ["  "]}, {"grant": [["fennick"]]}, {"revoke": {"a": 1}},
+    {"grant": ["x" * (store.MAX_IDENT + 1)]}, {"grant": ["fennick"], "revoke": ["fennick"]},
 ])
 def test_a_malformed_change_is_a_400_for_an_administrator(client, body):
     r = _post(client, ADMIN_TOKEN, body)
@@ -411,9 +411,9 @@ def test_a_body_that_is_not_an_object_is_a_400_for_an_administrator(client):
 
 
 def test_names_are_stripped_and_deduplicated(client):
-    r = _post(client, ADMIN_TOKEN, {"grant": [" vivy ", "vivy"]})
+    r = _post(client, ADMIN_TOKEN, {"grant": [" fennick ", "fennick"]})
     assert r.status_code == 200
-    assert _held(client.db) == ["vivy"]
+    assert _held(client.db) == ["fennick"]
     assert len(_changes(client.db)) == 1
 
 
@@ -421,17 +421,17 @@ def test_names_are_stripped_and_deduplicated(client):
 
 
 def test_a_scoped_administrator_cannot_name_a_product_outside_its_scope(client):
-    r = _post(client, SCOPED_ADMIN_TOKEN, {"grant": ["vivy", "constance"]})
+    r = _post(client, SCOPED_ADMIN_TOKEN, {"grant": ["fennick", "marlow"]})
     assert r.status_code == 403
-    assert r.json()["projects"] == ["constance"]
+    assert r.json()["projects"] == ["marlow"]
     assert _held(client.db) == [], "a refused request must write nothing"
     assert _changes(client.db) == []
 
 
 def test_a_scoped_administrator_may_change_a_product_inside_its_scope(client):
-    r = _post(client, SCOPED_ADMIN_TOKEN, {"grant": ["vivy"]})
+    r = _post(client, SCOPED_ADMIN_TOKEN, {"grant": ["fennick"]})
     assert r.status_code == 200
-    assert _held(client.db) == ["vivy"]
+    assert _held(client.db) == ["fennick"]
 
 
 # --- the read-only shadow and the race -------------------------------------
@@ -439,7 +439,7 @@ def test_a_scoped_administrator_may_change_a_product_inside_its_scope(client):
 
 def test_the_write_is_refused_while_the_library_is_read_only(client, monkeypatch):
     monkeypatch.setattr(store, "WRITES_ENABLED", False)
-    r = _post(client, ADMIN_TOKEN, {"grant": ["vivy"]})
+    r = _post(client, ADMIN_TOKEN, {"grant": ["fennick"]})
     assert r.status_code == 503
     assert _held(client.db) == []
 
@@ -460,16 +460,16 @@ def test_an_administrator_removed_before_the_write_lock_writes_nothing(
         return real(*args)
 
     monkeypatch.setattr(store, "change_person_products", remove_then_write)
-    r = _post(client, ADMIN_TOKEN, {"grant": ["vivy"]})
+    r = _post(client, ADMIN_TOKEN, {"grant": ["fennick"]})
     monkeypatch.setattr(store, "change_person_products", real)
-    assert _wire(r) == _wire(_post(client, PLAIN_TOKEN, {"grant": ["vivy"]}))
+    assert _wire(r) == _wire(_post(client, PLAIN_TOKEN, {"grant": ["fennick"]}))
     assert _held(client.db) == []
     assert _changes(client.db) == []
 
 
 def test_the_store_change_refuses_a_non_administrator_and_a_missing_person(
         client):
-    assert store.change_person_products(PLAIN, TARGET, ["vivy"], []) is None
-    assert store.change_person_products(ADMIN, GHOST, ["vivy"], []) is None
+    assert store.change_person_products(PLAIN, TARGET, ["fennick"], []) is None
+    assert store.change_person_products(ADMIN, GHOST, ["fennick"], []) is None
     assert _held(client.db) == []
     assert _changes(client.db) == []

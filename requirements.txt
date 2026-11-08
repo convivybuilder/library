@@ -1,3 +1,7 @@
+# The direct pins and their reasons. Nothing installs from this file:
+# bin/lock-requirements compiles it into requirements.lock, which carries
+# every transitive package with its hashes, and the installer and CI install
+# that. After editing a pin here, run bin/lock-requirements and commit both.
 fastapi==0.121.2
 # **TLS 1.3 0-RTT EARLY DATA MUST STAY UNREACHABLE FROM THIS PIN**
 # (platform/decisions/0066): it is replayable by construction (RFC 8446 §8)

@@ -82,7 +82,7 @@
     {
       "id": "q14",
       "kind": "finding",
-      "query": "why doesn't a window event listener catch unhandled promise rejections in vivy's frontend tests",
+      "query": "why doesn't a window event listener catch unhandled promise rejections in fennick's frontend tests",
       "right_answers": ["sig_01KZ5E3V39T5FJBJGW0WVHB97Z"]
     },
     {
@@ -112,7 +112,7 @@
     {
       "id": "q19",
       "kind": "memory",
-      "query": "where should a hollis to svc handoff contract be dropped",
+      "query": "where should a bramwell to loom handoff contract be dropped",
       "right_answers": ["sig_01M3RXTJ4P797GS7VQJG6AGDSF"]
     },
     {
@@ -124,8 +124,8 @@
     {
       "id": "q21",
       "kind": "memory",
-      "query": "what was Personal Assistant renamed to and why",
-      "right_answers": ["sig_01M3RXTM0NSCYN8Y4QPBJMKGA4"]
+      "query": "why does a script started by a launchd job crash with FileNotFoundError when it runs claude by bare name",
+      "right_answers": ["sig_01M3RXTP8R5NG1DXH2YDF4W234"]
     },
     {
       "id": "q22",
@@ -178,7 +178,7 @@
     {
       "id": "q30",
       "kind": "note",
-      "query": "why hasn't OwnerRez been asked again to pass lock events to Vivy",
+      "query": "why hasn't OwnerRez been asked again to pass lock events to Fennick",
       "right_answers": ["sig_01M26Z1ZQNAGPB2JQABD37EYH6"]
     }
   ]

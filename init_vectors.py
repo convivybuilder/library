@@ -146,7 +146,11 @@ def connect_rw(path: Path) -> sqlite3.Connection:
     """
     import sqlite_vec
     import store
+    import store_files
 
+    # Made at 0600 before SQLite opens it: SQLite would create it at the
+    # umask's mode, which `serve.sh` refuses (see `store_files`).
+    store_files.create_private(path)
     conn = sqlite3.connect(str(path))
     try:
         found = conn.execute(

@@ -193,6 +193,27 @@ refuse_component() {
             esac ;;
     esac
 
+    # A SECOND, STRICTER STANDARD, FOR A PATH THAT IS ITSELF THE LIBRARY'S OWN
+    # STORE OR A CREDENTIAL FILE ($2 = "private", set only by
+    # require_private_path below, never by the interpreter-chain walk). The
+    # checks just above tolerate a group- or world-READABLE component —
+    # Homebrew's own prefix is group-writable by `admin`, and refusing a
+    # merely-readable ancestor would refuse to start on a stock install — but
+    # there is no reason this process's own database, blob store or token
+    # file should be reachable by anyone else at all, administrators
+    # included, so "private" refuses on ANY group or other permission bit,
+    # not only a writable one, with no admin-group carve-out.
+    if [ "${2:-}" = private ]; then
+        case "$_other" in
+            0) ;;
+            *) die "$WHAT: $_path is accessible by other (mode $_perms) — refusing; only the account serve.sh runs as may hold this file" ;;
+        esac
+        case "$_group" in
+            0) ;;
+            *) die "$WHAT: $_path is accessible by its group (mode $_perms) — refusing; only the account serve.sh runs as may hold this file" ;;
+        esac
+    fi
+
     # THE MODE BITS ARE NOT THE WHOLE ANSWER ON EITHER FILESYSTEM. Both macOS
     # and Linux grant access through ACLs as well, independently of the bits
     # read above, and each platform is checked in its own right below.
@@ -357,6 +378,21 @@ walk_checked() {
     printf '%s\n' "$_done"
 }
 
+# Walk every ancestor exactly as the interpreter chain is walked above — a
+# writable directory upstream is a directory whose entries can be replaced,
+# whatever the leaf itself looks like — then hold the resolved leaf to
+# refuse_component's "private" standard: owned by this account, no group or
+# other permission bit, no ACL entry granting anybody else access. Used for
+# the Library's own store and credential files below, never for the
+# interpreter or TLS_CA, which both keep the lenient walk a stock Homebrew
+# or macOS install needs.
+require_private_path() {
+    _rpp_what="$2"
+    _rpp_resolved="$(walk_checked "$1" "$_rpp_what")" || exit 78
+    WHAT="$_rpp_what"
+    refuse_component "$_rpp_resolved" private
+}
+
 # --- where we are and what we run -----------------------------------------------
 
 # RESOLVED, not merely absolute. `cd "$(dirname "$0")" && pwd` gives an absolute
@@ -434,7 +470,7 @@ cd "$DIR"
 
 if [ ! -x "$PY" ]; then
     echo "serve: no interpreter at $PY — create it with:" >&2
-    echo "  python3 -m venv .venv && .venv/bin/pip install -r requirements.txt" >&2
+    echo "  python3 -m venv .venv && .venv/bin/pip install --require-hashes --only-binary :all: -r requirements.lock" >&2
     exit 78
 fi
 
@@ -468,32 +504,50 @@ if missing:
     for m in missing:
         print(f"  missing: {m}", file=sys.stderr)
     print(f"  interpreter: {sys.executable}", file=sys.stderr)
-    print("  fix: .venv/bin/pip install -r requirements.txt", file=sys.stderr)
+    print("  fix: .venv/bin/pip install --require-hashes --only-binary :all: -r requirements.lock", file=sys.stderr)
     sys.exit(1)
 print(f"serve: preflight ok on {sys.executable}")
 PREFLIGHT
 
-# --- the app's own import-time configuration refusals ---------------------
+# --- the plist this install is about to make live, parsed once -------------
 #
-# WHY THIS EXISTS. On 2026-10-01 `bin/install-library` installed cd9693a
-# after the preflight above passed, and every start then died at `app.py`
-# import: `store.resolve_cold_db_path()` raised `MisconfiguredColdDB`
-# because the service plist lacked `LIBRARY_COLD_DB`. The preflight above
-# imports `fastapi`/`uvicorn`/`sqlite_vec`/`fastembed` and never `app`
-# itself, so an import-time configuration refusal inside `app.py` — or
-# anything it imports: `store.resolve_db`, `vectors.resolve_vectors_db_path`,
-# `blobs.resolve_blob_dir` — got past `--check` every time. The Library was
-# down from 16:28Z to 16:31Z. This imports `app` for real, so the next
-# missing variable fails the install instead of the service.
+# Shared by the store/credential ownership guard below and the app-import
+# refusal further down: both need to judge the candidate's OWN environment,
+# never this process's, and parsing it once means there is exactly one
+# parser to keep correct rather than two drifting copies.
 #
 # UNDER THE PLIST'S OWN ENVIRONMENT, NEVER THIS PROCESS'S. The installer's
 # own shell is not what runs the service — the plist `launchd` loads is —
-# so judging the import on the installer's exported variables would pass or
-# fail on the wrong environment entirely. `LIBRARY_CHECK_PLIST` names the
+# so judging either check on the installer's exported variables would pass
+# or fail on the wrong environment entirely. `LIBRARY_CHECK_PLIST` names the
 # plist to read; `bin/install-library` sets it to the staged candidate
 # before the swap. Unset — an ordinary `serve.sh --check` with no plist to
-# check against — this step is skipped rather than guessing at an
-# environment nobody named.
+# check against, or a real start under `launchd`, which never sets this —
+# both checks fall back to this process's own environment instead, which is
+# what an ordinary start already has.
+#
+# The same parser `bin/install-library`'s own `_plist_env_pairs` uses, kept
+# as a second copy rather than a shared one: the two scripts are never
+# sourced into each other — this one also runs standalone under launchd,
+# with no `bin/install-library` alongside it to source from — and the
+# parser is small enough that keeping two copies correct costs less than
+# the coupling a shared one would add.
+_plist_env_pairs() {
+    awk '
+      /<key>EnvironmentVariables<\/key>/ { in_env=1; next }
+      in_env && /<\/dict>/ { in_env=0 }
+      in_env && /<key>/ {
+        k=$0; sub(/.*<key>/,"",k); sub(/<\/key>.*/,"",k); pending=k; next
+      }
+      in_env && pending != "" && /<string>/ {
+        v=$0; sub(/.*<string>/,"",v); sub(/<\/string>.*/,"",v)
+        print pending "=" v
+        pending=""
+      }
+    ' "$1"
+}
+
+_plist_envfile=""
 if [ "$CHECK_ONLY" = 1 ] && [ -n "${LIBRARY_CHECK_PLIST:-}" ]; then
     [ -f "$LIBRARY_CHECK_PLIST" ] \
         || die "LIBRARY_CHECK_PLIST names $LIBRARY_CHECK_PLIST, which does not exist"
@@ -506,7 +560,7 @@ if [ "$CHECK_ONLY" = 1 ] && [ -n "${LIBRARY_CHECK_PLIST:-}" ]; then
     # an XML plist whose dict is present but yields no pairs, such as an empty
     # <dict></dict>. The awk parser itself exits 0 either way, so there is no
     # success signal distinct from "found nothing" without these.
-    # Die here, naming the plist, rather than importing app under an
+    # Die here, naming the plist, rather than judging either check against an
     # environment emptier than what this plist actually sets; relying on
     # every module app.py imports to keep having no default for its own
     # required variable is not a check, it is luck.
@@ -525,31 +579,10 @@ if [ "$CHECK_ONLY" = 1 ] && [ -n "${LIBRARY_CHECK_PLIST:-}" ]; then
     # ~/Library/LaunchAgents/com.convivy.library.plist, and by
     # grepping bin/, launchd/, serve.sh and the top-level Python for
     # plistlib or a written <dict/>: zero hits against a positive control of
-    # one); if either ever did, --check would import app with the truncated
-    # or the spurious extra pairs, not refuse.
+    # one); if either ever did, --check would judge the truncated or the
+    # spurious extra pairs, not refuse.
     grep -qF '<key>EnvironmentVariables</key>' "$LIBRARY_CHECK_PLIST" \
-        || die "$LIBRARY_CHECK_PLIST has no EnvironmentVariables dict — refusing to import app under an environment this plist never names"
-
-    # The same parser `bin/install-library`'s own `_plist_env_pairs` uses, kept
-    # as a second copy rather than a shared one: the two scripts are never
-    # sourced into each other — this one also runs standalone under launchd,
-    # with no `bin/install-library` alongside it to source from — and the
-    # parser is small enough that keeping two copies correct costs less than
-    # the coupling a shared one would add.
-    _plist_env_pairs() {
-        awk '
-          /<key>EnvironmentVariables<\/key>/ { in_env=1; next }
-          in_env && /<\/dict>/ { in_env=0 }
-          in_env && /<key>/ {
-            k=$0; sub(/.*<key>/,"",k); sub(/<\/key>.*/,"",k); pending=k; next
-          }
-          in_env && pending != "" && /<string>/ {
-            v=$0; sub(/.*<string>/,"",v); sub(/<\/string>.*/,"",v)
-            print pending "=" v
-            pending=""
-          }
-        ' "$1"
-    }
+        || die "$LIBRARY_CHECK_PLIST has no EnvironmentVariables dict — refusing to judge an environment this plist never names"
 
     _plist_envfile="$(mktemp)" \
         || die "cannot create a temp file to hold $LIBRARY_CHECK_PLIST's environment — refusing"
@@ -557,8 +590,94 @@ if [ "$CHECK_ONLY" = 1 ] && [ -n "${LIBRARY_CHECK_PLIST:-}" ]; then
         || { rm -f "$_plist_envfile"; die "cannot parse EnvironmentVariables out of $LIBRARY_CHECK_PLIST — refusing"; }
 
     [ -s "$_plist_envfile" ] \
-        || { rm -f "$_plist_envfile"; die "$LIBRARY_CHECK_PLIST's EnvironmentVariables dict parsed to zero variables — refusing to import app under an environment this plist never names"; }
+        || { rm -f "$_plist_envfile"; die "$LIBRARY_CHECK_PLIST's EnvironmentVariables dict parsed to zero variables — refusing to judge an environment this plist never names"; }
+fi
 
+# Reads $1's effective value: from the plist parsed above when
+# LIBRARY_CHECK_PLIST named one — the environment the candidate is about to
+# run under, which is what bin/install-library's pre-swap --check is for —
+# and from this process's own environment otherwise, which is what an
+# ordinary start, or an ordinary --check with no plist named, already has.
+# Prints nothing when the variable is unset either way.
+guarded_env() {
+    _ge_name="$1"
+    if [ -n "$_plist_envfile" ]; then
+        awk -F= -v k="$_ge_name" '$1==k{sub(/^[^=]*=/,""); print; exit}' "$_plist_envfile"
+    else
+        eval "printf '%s\\n' \"\${$_ge_name:-}\""
+    fi
+}
+
+# --- the store and credential ownership guard -------------------------------
+#
+# Company/decisions/0025 point 5 (2026-10-21): in the two- and
+# three-account installs the Library runs as its own no-login service
+# account, which owns its store. Anything else that can reach the database,
+# the vectors index, the blob store, the cold tier, or either credential
+# file is exactly the hazard the interpreter-chain walk above exists to
+# close, aimed at the Library's data instead of its code.
+#
+# CHECKED "WHEN PRESENT", NEVER REQUIRED OUTRIGHT. `LIBRARY_DB`,
+# `LIBRARY_VECTORS_DB`, `LIBRARY_BLOB_DIR` and `LIBRARY_COLD_DB` all have no
+# default (`store.resolve_db`'s own docstring: "LIBRARY_DB HAS NO DEFAULT");
+# a variable nothing has configured, or a `-wal`/`-shm` sidecar sqlite has
+# not written yet, is not this guard's business — it refuses what IS there,
+# not what COULD be. `identity.CLIENT_TOKENS` and the API token file do have
+# defaults, matching `identity.py`'s own `resolve_tokens()` and `CLIENT_TOKENS`,
+# but are checked the same "when present" way: a fresh checkout with no
+# bootstrapped credential file yet has nothing here to refuse.
+#
+# THE SINGLE-ACCOUNT INSTALL PASSES AS TODAY, because there the account that
+# owns these files already is the account serve.sh runs as — this guard
+# checks permission bits and ACLs, not which install topology is in use.
+check_store_path() {
+    _csp_path="$1"
+    _csp_what="$2"
+    [ -e "$_csp_path" ] || return 0
+    require_private_path "$_csp_path" "$_csp_what"
+}
+
+_guarded_home="$(guarded_env HOME)"
+[ -n "$_guarded_home" ] || _guarded_home="$HOME"
+
+_g_library_db="$(guarded_env LIBRARY_DB)"
+if [ -n "$_g_library_db" ]; then
+    check_store_path "$(dirname "$_g_library_db")" "the directory holding LIBRARY_DB"
+    check_store_path "$_g_library_db" "LIBRARY_DB"
+    check_store_path "$_g_library_db-wal" "LIBRARY_DB's -wal file"
+    check_store_path "$_g_library_db-shm" "LIBRARY_DB's -shm file"
+fi
+
+_g_vectors_db="$(guarded_env LIBRARY_VECTORS_DB)"
+[ -z "$_g_vectors_db" ] || check_store_path "$_g_vectors_db" "LIBRARY_VECTORS_DB (the vectors database)"
+
+_g_blob_dir="$(guarded_env LIBRARY_BLOB_DIR)"
+[ -z "$_g_blob_dir" ] || check_store_path "$_g_blob_dir" "LIBRARY_BLOB_DIR (the blob store)"
+
+_g_cold_db="$(guarded_env LIBRARY_COLD_DB)"
+[ -z "$_g_cold_db" ] || check_store_path "$_g_cold_db" "LIBRARY_COLD_DB (the cold-tier database)"
+
+_g_client_tokens="$(guarded_env LIBRARY_CLIENT_TOKENS)"
+[ -n "$_g_client_tokens" ] || _g_client_tokens="$_guarded_home/.library/client-tokens.json"
+check_store_path "$_g_client_tokens" "identity.CLIENT_TOKENS"
+
+_g_api_tokens="$(guarded_env LIBRARY_API_TOKENS)"
+[ -n "$_g_api_tokens" ] || _g_api_tokens="$_guarded_home/.library/api-tokens.json"
+check_store_path "$_g_api_tokens" "the API token file"
+
+# --- the app's own import-time configuration refusals ---------------------
+#
+# WHY THIS EXISTS. On 2026-10-01 `bin/install-library` installed cd9693a
+# after the preflight above passed, and every start then died at `app.py`
+# import: `store.resolve_cold_db_path()` raised `MisconfiguredColdDB`
+# because the service plist lacked `LIBRARY_COLD_DB`. The preflight above
+# imports `fastapi`/`uvicorn`/`sqlite_vec`/`fastembed` and never `app`
+# itself, so an import-time configuration refusal inside `app.py` — or
+# anything it imports: `store.resolve_db`, `vectors.resolve_vectors_db_path`,
+# `blobs.resolve_blob_dir` — got past `--check` every time. The Library was
+# down from 16:28Z to 16:31Z. This imports `app` for real, so the next
+# missing variable fails the install instead of the service.
+if [ "$CHECK_ONLY" = 1 ] && [ -n "${LIBRARY_CHECK_PLIST:-}" ]; then
     echo "serve: importing app under $LIBRARY_CHECK_PLIST's own environment"
 
     # A SUBSHELL, so the `set --` below only ever touches positional

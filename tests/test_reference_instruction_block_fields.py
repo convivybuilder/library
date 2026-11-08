@@ -31,7 +31,7 @@ import protocol
 import reference
 import store
 
-AGENT = "agent-token-vivy"
+AGENT = "agent-token-fennick"
 
 BLOCK_ID = "platform/blocks/verify-before-report"
 BLOCK_EXTRA = {"binds_crews": ["platform"],
@@ -43,7 +43,7 @@ BLOCK_EXTRA = {"binds_crews": ["platform"],
                "source_author": "steward"}
 
 PARTIAL_ID = "platform/blocks/floor-only"
-PARTIAL_EXTRA = {"binds_crews": ["platform", "vivy"]}  # no binds_agents/topics
+PARTIAL_EXTRA = {"binds_crews": ["platform", "fennick"]}  # no binds_agents/topics
 
 DECISION_ID = "platform/decisions/0022-library-repo"
 DECISION_EXTRA = {"source_author": "operator"}  # non-block; must not leak selectors
@@ -112,7 +112,7 @@ def client(tmp_path, monkeypatch):
 
     tokens = tmp_path / "api-tokens.json"
     tokens.write_text(json.dumps({
-        AGENT: {"name": "vivy-agent", "products": ["vivy"]},
+        AGENT: {"name": "fennick-agent", "products": ["fennick"]},
     }))
 
     monkeypatch.setattr(store, "DB_PATH", control)
@@ -173,7 +173,7 @@ def test_a_selector_key_frontmatter_extra_does_not_carry_is_null(client):
     r = client.get(f"/reference/documents/{PARTIAL_ID}", headers=_h())
     assert r.status_code == 200
     body = r.json()
-    assert body["binds_crews"] == ["platform", "vivy"]
+    assert body["binds_crews"] == ["platform", "fennick"]
     assert body["binds_agents"] is None
     assert body["binds_topics"] is None
 
@@ -285,7 +285,7 @@ def no_column_client(tmp_path, monkeypatch):
 
     tokens = tmp_path / "api-tokens.json"
     tokens.write_text(json.dumps({
-        AGENT: {"name": "vivy-agent", "products": ["vivy"]},
+        AGENT: {"name": "fennick-agent", "products": ["fennick"]},
     }))
 
     monkeypatch.setattr(store, "DB_PATH", control)

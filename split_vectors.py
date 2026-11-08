@@ -93,7 +93,7 @@ def _writes_note() -> str:
 
 def _health_url() -> str:
     import mtls  # local: split_vectors runs before LIBRARY_DB need be set
-    return f"http://{mtls.HOST}:{mtls.PLAIN_PORT}/health"
+    return f"http://{mtls.PLAIN_HOST}:{mtls.PLAIN_PORT}/health"
 
 
 def _service_running() -> tuple[bool, str]:
@@ -105,8 +105,8 @@ def _service_running() -> tuple[bool, str]:
     (company/decisions/0010): a PID file is whatever `launchd` or `systemd`
     happens to be tracking and can outlive a crashed process on either
     platform, where "does something answer this port" is the same question
-    and the same answer on both. `mtls.HOST`/`mtls.PLAIN_PORT` name the one
-    port the plain listener always binds (`serve_dual.py`), so no
+    and the same answer on both. `mtls.PLAIN_HOST`/`mtls.PLAIN_PORT` name the
+    one port the plain listener always binds (`serve_dual.py`), so no
     configuration has to be guessed.
 
     **Cannot say WHICH database the answering process serves** — `/health`
@@ -208,6 +208,12 @@ def _uri(path: Path, *, readonly: bool) -> str:
 def connect(path: Path, *, readonly: bool) -> sqlite3.Connection:
     """A connection with `sqlite-vec` loaded, which the vec0 tables require."""
     import sqlite_vec
+    import store_files
+    if not readonly:
+        # `export_vectors` writes the file that becomes the live
+        # `LIBRARY_VECTORS_DB`, so it is made 0600 before SQLite creates it at
+        # the umask's mode (see `store_files`; reviewers, library#324 round 1).
+        store_files.create_private(path)
     conn = sqlite3.connect(_uri(path, readonly=readonly), uri=True)
     conn.row_factory = sqlite3.Row
     conn.enable_load_extension(True)

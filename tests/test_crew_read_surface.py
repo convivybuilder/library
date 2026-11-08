@@ -30,7 +30,7 @@ import reference
 import black_box_tables
 import store
 
-AGENT = "agent-token-vivy"
+AGENT = "agent-token-fennick"
 ORCHESTRATOR = identity.Identity(actor="co-library-test", kind="orchestrator")
 
 # id, kind, project, status, audience — chosen so every rule shape below has
@@ -38,13 +38,13 @@ ORCHESTRATOR = identity.Identity(actor="co-library-test", kind="orchestrator")
 # uses for its own corpus.
 DOCS = [
     ("deck/agents/scout", "agent", "deck", "current", ["daytime"]),
-    ("hollis/agents/coder", "agent", "hollis", "current", []),
-    ("vivy/agents/archived-thing", "agent", "vivy", "archived", ["daytime"]),
-    ("vivy/agents/coder", "agent", "vivy", "current", ["daytime"]),
-    ("vivy/agents/draft-thing", "agent", "vivy", "draft", []),
-    ("vivy/agents/reviewer", "agent", "vivy", "current",
+    ("bramwell/agents/coder", "agent", "bramwell", "current", []),
+    ("fennick/agents/archived-thing", "agent", "fennick", "archived", ["daytime"]),
+    ("fennick/agents/coder", "agent", "fennick", "current", ["daytime"]),
+    ("fennick/agents/draft-thing", "agent", "fennick", "draft", []),
+    ("fennick/agents/reviewer", "agent", "fennick", "current",
      ["daytime", "overnight"]),
-    ("vivy/skills/dataviz", "skill", "vivy", "current", []),
+    ("fennick/skills/dataviz", "skill", "fennick", "current", []),
 ]
 
 
@@ -70,6 +70,7 @@ def client(tmp_path, monkeypatch):
         CREATE TABLE roster_agents (
             id INTEGER PRIMARY KEY,
             name TEXT NOT NULL UNIQUE,
+            source_doc TEXT,
             created_at TEXT NOT NULL,
             created_by TEXT NOT NULL,
             updated_at TEXT NOT NULL,
@@ -113,7 +114,7 @@ def client(tmp_path, monkeypatch):
 
     tokens = tmp_path / "api-tokens.json"
     tokens.write_text(json.dumps({
-        AGENT: {"name": "vivy-agent", "products": ["vivy"]},
+        AGENT: {"name": "fennick-agent", "products": ["fennick"]},
     }))
 
     monkeypatch.setattr(store, "DB_PATH", db)
@@ -180,14 +181,14 @@ def test_roster_refuses_any_parameter(client):
 
 
 def test_profiles_lists_project_variant_ordered_never_include(client):
-    _seed_profile("vivy", "daytime", [{"kind": "agent", "project": ["vivy"]}])
-    _seed_profile("hollis", "overnight",
-                  [{"kind": "agent", "project": ["hollis"]}])
+    _seed_profile("fennick", "daytime", [{"kind": "agent", "project": ["fennick"]}])
+    _seed_profile("bramwell", "overnight",
+                  [{"kind": "agent", "project": ["bramwell"]}])
     r = client.get("/profiles", headers=_h())
     assert r.status_code == 200
     body = r.json()
     assert [(p["project"], p["variant"]) for p in body["profiles"]] == [
-        ("hollis", "overnight"), ("vivy", "daytime")]
+        ("bramwell", "overnight"), ("fennick", "daytime")]
     assert body["count"] == 2
     assert "include" not in json.dumps(body)
 
@@ -201,7 +202,7 @@ def test_profiles_refuses_without_roster_read(client, monkeypatch):
 
 
 def test_profiles_list_refuses_any_parameter(client):
-    r = client.get("/profiles?project=vivy", headers=_h())
+    r = client.get("/profiles?project=fennick", headers=_h())
     assert r.status_code == 400
     assert r.json()["unknown"] == ["project"]
     assert r.json()["supported"] == []
@@ -216,18 +217,18 @@ def test_the_route_matches_an_independent_resolution_inside_the_library(
     profile resolved a second time inside the Library, using the module the
     route itself calls rather than a copy of its logic."""
     include = [
-        {"kind": "agent", "project": ["vivy", "hollis"]},
+        {"kind": "agent", "project": ["fennick", "bramwell"]},
         {"kind": "agent", "audience_contains": ["daytime"]},
     ]
-    _seed_profile("vivy", "daytime", include)
+    _seed_profile("fennick", "daytime", include)
 
-    r = client.get("/profiles/vivy/daytime", headers=_h())
+    r = client.get("/profiles/fennick/daytime", headers=_h())
     assert r.status_code == 200
     route_ids = [d["id"] for d in r.json()["documents"]]
 
     conn = store.connect()
     try:
-        row = crew_profiles.profile_row(conn, "vivy", "daytime")
+        row = crew_profiles.profile_row(conn, "fennick", "daytime")
     finally:
         conn.close()
     index_conn = reference.connect()
@@ -240,25 +241,25 @@ def test_the_route_matches_an_independent_resolution_inside_the_library(
 
 
 def test_multi_rule_union_dedupes_overlap_and_orders_by_id(client):
-    """Two rules whose matches overlap (`vivy/agents/coder` and
-    `vivy/agents/reviewer` both carry `daytime` audience AND sit under
-    `vivy`), plus a document each rule alone would miss: `deck/agents/scout`
-    is reached only through `audience_contains`, and `vivy/agents/draft-
-    thing` and `hollis/agents/coder` only through `project`."""
+    """Two rules whose matches overlap (`fennick/agents/coder` and
+    `fennick/agents/reviewer` both carry `daytime` audience AND sit under
+    `fennick`), plus a document each rule alone would miss: `deck/agents/scout`
+    is reached only through `audience_contains`, and `fennick/agents/draft-
+    thing` and `bramwell/agents/coder` only through `project`."""
     include = [
-        {"kind": "agent", "project": ["vivy", "hollis"]},
+        {"kind": "agent", "project": ["fennick", "bramwell"]},
         {"kind": "agent", "audience_contains": ["daytime"]},
     ]
-    _seed_profile("vivy", "daytime", include)
-    r = client.get("/profiles/vivy/daytime", headers=_h())
+    _seed_profile("fennick", "daytime", include)
+    r = client.get("/profiles/fennick/daytime", headers=_h())
     assert r.status_code == 200
     ids = [d["id"] for d in r.json()["documents"]]
     assert ids == [
+        "bramwell/agents/coder",
         "deck/agents/scout",
-        "hollis/agents/coder",
-        "vivy/agents/coder",
-        "vivy/agents/draft-thing",
-        "vivy/agents/reviewer",
+        "fennick/agents/coder",
+        "fennick/agents/draft-thing",
+        "fennick/agents/reviewer",
     ]
     assert r.json()["count"] == 5
     # Each rule's own count, before the union dedupes: the project rule
@@ -271,32 +272,32 @@ def test_multi_rule_union_dedupes_overlap_and_orders_by_id(client):
 
 def test_status_default_excludes_archived_and_a_named_status_reaches_it(
         client):
-    _seed_profile("vivy", "no-status",
-                  [{"kind": "agent", "project": ["vivy"]}])
-    _seed_profile("vivy", "with-archived",
-                  [{"kind": "agent", "project": ["vivy"],
+    _seed_profile("fennick", "no-status",
+                  [{"kind": "agent", "project": ["fennick"]}])
+    _seed_profile("fennick", "with-archived",
+                  [{"kind": "agent", "project": ["fennick"],
                     "status": "archived"}])
 
-    r1 = client.get("/profiles/vivy/no-status", headers=_h())
+    r1 = client.get("/profiles/fennick/no-status", headers=_h())
     ids1 = [d["id"] for d in r1.json()["documents"]]
-    assert "vivy/agents/archived-thing" not in ids1
+    assert "fennick/agents/archived-thing" not in ids1
 
-    r2 = client.get("/profiles/vivy/with-archived", headers=_h())
+    r2 = client.get("/profiles/fennick/with-archived", headers=_h())
     ids2 = [d["id"] for d in r2.json()["documents"]]
-    assert ids2 == ["vivy/agents/archived-thing"]
+    assert ids2 == ["fennick/agents/archived-thing"]
 
 
 def test_audience_contains_matches_membership_any_of(client):
-    """`overnight` matches `vivy/agents/reviewer` (which carries both
+    """`overnight` matches `fennick/agents/reviewer` (which carries both
     `daytime` and `overnight`); `nonexistent` matches nothing — any-of, not
     all-of, over the two values in the rule."""
-    _seed_profile("vivy", "audience-any",
-                  [{"kind": "agent", "project": ["vivy"],
+    _seed_profile("fennick", "audience-any",
+                  [{"kind": "agent", "project": ["fennick"],
                     "audience_contains": ["overnight", "nonexistent"]}])
-    r = client.get("/profiles/vivy/audience-any", headers=_h())
+    r = client.get("/profiles/fennick/audience-any", headers=_h())
     assert r.status_code == 200
     ids = [d["id"] for d in r.json()["documents"]]
-    assert ids == ["vivy/agents/reviewer"]
+    assert ids == ["fennick/agents/reviewer"]
 
 
 def test_audience_contains_does_not_match_a_substring(client):
@@ -304,10 +305,10 @@ def test_audience_contains_does_not_match_a_substring(client):
     element equality, not substring — mirrors `test_reference_reads.py`'s
     `test_audience_does_not_match_a_substring_of_another_audience` for the
     single-value filter."""
-    _seed_profile("vivy", "audience-substr",
-                  [{"kind": "agent", "project": ["vivy"],
+    _seed_profile("fennick", "audience-substr",
+                  [{"kind": "agent", "project": ["fennick"],
                     "audience_contains": ["day"]}])
-    r = client.get("/profiles/vivy/audience-substr", headers=_h())
+    r = client.get("/profiles/fennick/audience-substr", headers=_h())
     assert r.status_code == 200
     assert r.json()["documents"] == []
 
@@ -339,29 +340,29 @@ def test_an_unusable_audience_row_neither_500s_nor_matches(client, tmp_path,
         "INSERT INTO docs (id, source_ref, kind, project, title, status, "
         "topics, audience, body, last_reviewed, updated_at) "
         "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-        ("vivy/agents/unusable-audience", "x.md", "agent", "vivy",
+        ("fennick/agents/unusable-audience", "x.md", "agent", "fennick",
          "unusable", "current", "[]", audience, "body", "2026-08-01",
          "2026-08-02"))
     iconn.commit()
     iconn.close()
-    _seed_profile("vivy", "audience-guard",
-                  [{"kind": "agent", "project": ["vivy"],
+    _seed_profile("fennick", "audience-guard",
+                  [{"kind": "agent", "project": ["fennick"],
                     "audience_contains": ["daytime"]}])
-    r = client.get("/profiles/vivy/audience-guard", headers=_h())
+    r = client.get("/profiles/fennick/audience-guard", headers=_h())
     assert r.status_code == 200
     ids = [d["id"] for d in r.json()["documents"]]
-    assert "vivy/agents/unusable-audience" not in ids
+    assert "fennick/agents/unusable-audience" not in ids
     # The rule still resolves the documents it should, so a passing assertion
     # above cannot be an empty answer masquerading as a working guard.
-    assert "vivy/agents/coder" in ids
+    assert "fennick/agents/coder" in ids
 
 
 def test_profile_with_zero_matching_documents_is_200_not_404(client):
     """A profile that exists and selects nothing is a different fact from a
     profile that does not exist — both must not collapse to the same
     answer."""
-    _seed_profile("vivy", "empty", [{"kind": "runbook", "project": ["vivy"]}])
-    r = client.get("/profiles/vivy/empty", headers=_h())
+    _seed_profile("fennick", "empty", [{"kind": "runbook", "project": ["fennick"]}])
+    r = client.get("/profiles/fennick/empty", headers=_h())
     assert r.status_code == 200
     body = r.json()
     assert body["documents"] == []
@@ -373,10 +374,10 @@ def test_claude_md_extras_is_returned(client):
     """The one field this route returns that is content rather than a
     resolved document — withholding it would leave a caller with no way to
     obtain it at all, since nothing else in this service serves it."""
-    _seed_profile("vivy", "with-extras",
-                  [{"kind": "agent", "project": ["vivy"]}],
+    _seed_profile("fennick", "with-extras",
+                  [{"kind": "agent", "project": ["fennick"]}],
                   ["# some extra CLAUDE.local.md content"])
-    r = client.get("/profiles/vivy/with-extras", headers=_h())
+    r = client.get("/profiles/fennick/with-extras", headers=_h())
     assert r.status_code == 200
     assert r.json()["claude_md_extras"] == [
         "# some extra CLAUDE.local.md content"]
@@ -388,24 +389,24 @@ def test_404_on_an_unknown_project_and_variant(client):
 
 
 def test_404_on_a_known_project_with_an_unknown_variant(client):
-    _seed_profile("vivy", "daytime", [{"kind": "agent", "project": ["vivy"]}])
-    r = client.get("/profiles/vivy/overnight", headers=_h())
+    _seed_profile("fennick", "daytime", [{"kind": "agent", "project": ["fennick"]}])
+    r = client.get("/profiles/fennick/overnight", headers=_h())
     assert r.status_code == 404
 
 
 def test_resolve_refuses_without_roster_read(client, monkeypatch):
-    _seed_profile("vivy", "daytime", [{"kind": "agent", "project": ["vivy"]}])
+    _seed_profile("fennick", "daytime", [{"kind": "agent", "project": ["fennick"]}])
     monkeypatch.setattr(identity, "ROLE_CAPS", {
         **identity.ROLE_CAPS,
         "agent": identity.ROLE_CAPS["agent"] - {"roster.read"}})
-    r = client.get("/profiles/vivy/daytime", headers=_h())
+    r = client.get("/profiles/fennick/daytime", headers=_h())
     assert r.status_code == 403
     assert "roster.read" in r.json()["error"]
 
 
 def test_resolve_refuses_any_parameter(client):
-    _seed_profile("vivy", "daytime", [{"kind": "agent", "project": ["vivy"]}])
-    r = client.get("/profiles/vivy/daytime?status=all", headers=_h())
+    _seed_profile("fennick", "daytime", [{"kind": "agent", "project": ["fennick"]}])
+    r = client.get("/profiles/fennick/daytime?status=all", headers=_h())
     assert r.status_code == 400
     assert r.json()["unknown"] == ["status"]
     assert r.json()["supported"] == []
@@ -418,9 +419,9 @@ def test_resolve_refuses_503_when_the_index_is_unreadable(
     the whole app; this confirms `GET /profiles/{project}/{variant}`,
     the one new route that calls `reference.connect()`, is covered by it
     rather than needing a second one."""
-    _seed_profile("vivy", "daytime", [{"kind": "agent", "project": ["vivy"]}])
+    _seed_profile("fennick", "daytime", [{"kind": "agent", "project": ["fennick"]}])
     monkeypatch.setattr(reference, "INDEX_DB", tmp_path / "gone.db")
-    r = client.get("/profiles/vivy/daytime", headers=_h())
+    r = client.get("/profiles/fennick/daytime", headers=_h())
     assert r.status_code == 503
     assert "knowledge index" in r.json()["error"]
 
@@ -431,11 +432,11 @@ def test_resolve_refuses_503_when_the_index_opens_but_cannot_be_read(
     file it cannot yet tell is broken, and the read raises `sqlite3.Error`,
     which reached the client as a 500. A file that is not a database stands
     in for an index the watcher replaced mid-request."""
-    _seed_profile("vivy", "daytime", [{"kind": "agent", "project": ["vivy"]}])
+    _seed_profile("fennick", "daytime", [{"kind": "agent", "project": ["fennick"]}])
     broken = tmp_path / "broken.db"
     broken.write_bytes(b"not a database, " * 256)
     monkeypatch.setattr(reference, "INDEX_DB", broken)
-    r = client.get("/profiles/vivy/daytime", headers=_h())
+    r = client.get("/profiles/fennick/daytime", headers=_h())
     assert r.status_code == 503
     assert r.json()["error"] == "the knowledge index is unavailable"
     assert str(broken) not in r.text
@@ -446,14 +447,14 @@ def test_resolve_refuses_503_when_the_index_opens_but_cannot_be_read(
 
 
 def test_include_never_appears_in_any_route_response(client):
-    _seed_profile("vivy", "daytime",
-                  [{"kind": "agent", "project": ["vivy"],
+    _seed_profile("fennick", "daytime",
+                  [{"kind": "agent", "project": ["fennick"],
                     "audience_contains": ["daytime"]}],
                   ["some extra content"])
     responses = [
         client.get("/roster", headers=_h()),
         client.get("/profiles", headers=_h()),
-        client.get("/profiles/vivy/daytime", headers=_h()),
+        client.get("/profiles/fennick/daytime", headers=_h()),
     ]
     for r in responses:
         assert r.status_code == 200

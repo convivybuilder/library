@@ -2,7 +2,7 @@
 matches the crew registry (issue_01M2K33M9NG0S9HCJQJ2EPD7RP). Every
 assertion here runs against a temporary database and a temporary registry
 file, never the live `~/.library/library.db` or the real
-`agent-platform/config/projects.json`."""
+`<root>/install/projects.json`."""
 from __future__ import annotations
 
 import json
@@ -53,7 +53,7 @@ def db(tmp_path, monkeypatch):
         "_meta": {},
         "library": {"repos": ["library"]},
         "convivy-deck": {"repos": ["convivy-deck"]},
-        "vivy": {"repos": ["vivy"]},
+        "fennick": {"repos": ["fennick"]},
     }))
     monkeypatch.setattr(projects, "REGISTRY_PATH", registry)
     projects.reload()
@@ -95,7 +95,7 @@ def test_a_platform_row_whose_repo_resolves_elsewhere_is_corrected(db):
 
 def test_a_row_already_matching_the_registry_is_untouched(db):
     conn = _conn(db)
-    _insert(conn, "sig_b", product="vivy", repo="convivy/vivy")
+    _insert(conn, "sig_b", product="fennick", repo="convivy/fennick")
     conn.commit()
     conn.close()
 
@@ -107,7 +107,7 @@ def test_a_row_already_matching_the_registry_is_untouched(db):
     conn = _conn(db)
     row = conn.execute("SELECT product FROM signals WHERE id = 'sig_b'").fetchone()
     conn.close()
-    assert row["product"] == "vivy"
+    assert row["product"] == "fennick"
 
 
 def test_an_unresolvable_repo_is_untouched_reported_and_exits_nonzero(db, capsys):
@@ -244,9 +244,9 @@ def test_a_narrow_reader_holding_a_moved_product_fails_the_precondition(db, tmp_
 
 
 def test_a_narrow_reader_on_an_untouched_product_meets_the_precondition(db, tmp_path, capsys):
-    """The live case on 2026-09-16: two `vivy`-scoped readers, and no `vivy`
+    """The live case on 2026-09-16: two `fennick`-scoped readers, and no `fennick`
     row moving."""
-    _narrow_reader(tmp_path, ["vivy"])
+    _narrow_reader(tmp_path, ["fennick"])
     conn = _conn(db)
     _insert(conn, "sig_a", product="platform", repo="convivy/library")
     conn.commit()

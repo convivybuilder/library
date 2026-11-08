@@ -1,16 +1,23 @@
-"""`POST /merge/admission` and `POST /merge/outcome` — the Library's half of
-merge admission (`issue_01M0EQTMZMAB93V9FFP4AD52JK`).
+"""`POST /merge/admission`, `PUT`/`GET /merge/admission/enforcement` and
+`POST /merge/outcome` (CQ·219, issue_01M5FM2W1JV82A3XH3P0R5TX8J): the
+route now calls `merge_admission.evaluate` (CQ·218) and enforces by
+default, and turning enforcement off is a recorded operator write shown
+on `/health`.
 
-**The whole design is the enforcement switch.** `LIBRARY_MERGE_ADMISSION_ENFORCED`
-unset (today's default) approves every request; set, no evaluator exists yet, so
-the route answers an honest refusal rather than keep approving under a flag that
-claims to be a gate. Both branches answer the same `{approved, reason}` shape, so
-most of this file is proving that shape holds and that the flag is the only thing
-that moves between the two answers.
+**`merge_admission.evaluate` itself is monkeypatched here.** It is tested
+against the real schema and a real git checkout in
+`test_merge_admission_evaluator.py`; this file is about the route's own
+wiring — the enforcement switch, the response shape, the capability gates
+— and stubbing the evaluator keeps it from needing a knowledge checkout or
+review-record fixtures of its own.
 
-`/merge/outcome`'s reconciliation is a deliberate no-op — it validates, records a
-signal, and answers — so its tests only cover that surface, not a lease or a work
-item it does not touch.
+`merge_admission_enforced` itself (an empty table enforces, the newest row
+wins, append-only) is tested directly against `store.py` in
+`test_merge_admission_settings.py`; this file exercises it only through
+the routes.
+
+`/merge/outcome`'s reconciliation is unchanged by CQ·219 and still a
+deliberate no-op — it validates, records a signal, and answers.
 """
 from __future__ import annotations
 
@@ -23,6 +30,7 @@ from fastapi.testclient import TestClient
 
 import app as libapp
 import identity
+import merge_admission
 import projects
 import protocol
 import store
@@ -30,7 +38,24 @@ import store
 AGENT = "agent-token-library"
 SYSTEM = "system-token"
 NOSCOPE = "agent-token-noscope"
-OTHER_PRODUCT = "agent-token-vivy"
+OTHER_PRODUCT = "agent-token-fennick"
+OPERATOR = "deck-token"
+HUMAN = "operator@example.com"
+
+# The evaluator's answer when a pull request has no run-verified review on
+# file — the shape a caller with no reviews sees against an empty settings
+# table (enforced by default).
+MISSING_REVIEW = [{"kind": "review", "role": "reviewer", "workflow": None,
+                   "detail": "no run-verified review from reviewer",
+                   "retryable": False}]
+
+
+def _refuses(repo, pr, head_sha, *, conn=None):
+    return {"approved": False, "missing": MISSING_REVIEW}
+
+
+def _approves(repo, pr, head_sha, *, conn=None):
+    return {"approved": True, "missing": []}
 
 
 @pytest.fixture
@@ -43,6 +68,10 @@ def client(tmp_path, monkeypatch):
             ingested_by TEXT, product TEXT, refs TEXT, body TEXT, meta TEXT,
             privacy_class TEXT, produced_at TEXT, ingested_at TEXT,
             embedded_at TEXT, dedup_key TEXT UNIQUE, acting_human TEXT);
+        CREATE TABLE merge_admission_settings (
+            id INTEGER PRIMARY KEY, enforced BOOLEAN NOT NULL,
+            set_by_client TEXT NOT NULL, acting_human TEXT NOT NULL,
+            reason TEXT, set_at TEXT NOT NULL);
     """)
     conn.commit()
     conn.close()
@@ -56,17 +85,28 @@ def client(tmp_path, monkeypatch):
         NOSCOPE: {"name": "scopeless", "products": []},
         # Scoped to a real product, but not the one `_admission_body()` asks
         # about — the "wrong scope" case, distinct from NOSCOPE's "no scope".
-        OTHER_PRODUCT: {"name": "vivy-agent", "products": ["vivy"]},
+        OTHER_PRODUCT: {"name": "fennick-agent", "products": ["fennick"]},
+    }))
+    clients = tmp_path / "client-tokens.json"
+    clients.write_text(json.dumps({
+        OPERATOR: {"name": "deck", "products": ["*"]},
     }))
     registry = tmp_path / "projects.json"
     registry.write_text(json.dumps({
-        "library": {"repos": ["library"]}, "vivy": {"repos": ["vivy"]}}))
+        "library": {"repos": ["library"]}, "fennick": {"repos": ["fennick"]}}))
     monkeypatch.setattr(store, "DB_PATH", db)
     monkeypatch.setattr(identity, "TOKENS", tokens)
+    monkeypatch.setattr(identity, "CLIENT_TOKENS", clients)
     monkeypatch.setattr(projects, "REGISTRY_PATH", registry)
     projects.reload()
     monkeypatch.setattr(store, "WRITES_ENABLED", True)
-    monkeypatch.setattr(store, "MERGE_ADMISSION_ENFORCED", False)
+    monkeypatch.setattr(merge_admission, "evaluate", _refuses)
+    # `_merge_admission_cache` is normally seeded by `lifespan`, which this
+    # fixture's plain `TestClient(...)` never runs — reset it here so a
+    # previous test's `PUT` cannot leak into this one through the module
+    # global `/health` reads.
+    monkeypatch.setattr(libapp, "_merge_admission_cache",
+                        dict(store.MERGE_ADMISSION_DEFAULT_HEALTH))
     yield TestClient(libapp.app)
     projects.reload()
 
@@ -87,6 +127,12 @@ def _outcome_body(**over):
     out = {**_admission_body(), "merged": True}
     out.update(over)
     return out
+
+
+def _put_enforcement(client, *, token=OPERATOR, **over):
+    body = {"enforced": False, "acting_human": HUMAN}
+    body.update(over)
+    return client.put("/merge/admission/enforcement", json=body, headers=_h(token))
 
 
 def _signal_rows(db_path):
@@ -146,6 +192,16 @@ def test_admission_accepts_a_string_pr(client):
     assert r.status_code == 200
 
 
+def test_a_non_numeric_string_pr_fails_closed_not_500(client):
+    """`_validate_merge_identity` accepts any non-empty string, so a `pr` that
+    is not a number reaches the evaluator's `int()`. It must answer 200 with
+    `approved: false`, never a 500 (CQ·219 round 1, reviewer)."""
+    r = client.post("/merge/admission", json=_admission_body(pr="abc"), headers=_h())
+    assert r.status_code == 200, r.text
+    assert r.json()["approved"] is False
+    assert any(m["kind"] == "unreadable" for m in r.json()["missing"])
+
+
 def test_admission_refuses_an_empty_string_pr(client):
     r = client.post("/merge/admission", json=_admission_body(pr="  "), headers=_h())
     assert r.status_code == 400
@@ -191,35 +247,60 @@ def test_outcome_accepts_a_false_merge_with_a_reason(client):
     assert r.status_code == 200
 
 
-# --- the stub approves when the flag is unset ------------------------------------
+# --- an empty table enforces, and names what the evaluator found ----------------
 
 
-def test_unset_flag_approves(client):
-    r = client.post("/merge/admission", json=_admission_body(), headers=_h())
-    body = r.json()
-    assert body["approved"] is True
-    assert "not yet enforced" in body["reason"]
-
-
-# --- the flag, set, refuses honestly rather than approve blind -------------------
-
-
-def test_enforced_flag_refuses_honestly(client, monkeypatch):
-    monkeypatch.setattr(store, "MERGE_ADMISSION_ENFORCED", True)
+def test_an_empty_table_refuses_and_names_the_missing_review(client):
+    """The done-when: with no variable and an empty table, the route refuses
+    a PR lacking reviews and names them."""
     r = client.post("/merge/admission", json=_admission_body(), headers=_h())
     assert r.status_code == 200
     body = r.json()
     assert body["approved"] is False
-    assert "no evaluator" in body["reason"]
+    assert body["enforced"] is True
+    assert body["head_sha"] == "a" * 40
+    assert body["missing"] == MISSING_REVIEW
+    assert "no run-verified review from reviewer" in body["reason"]
 
 
-def test_the_enforced_answer_is_the_same_shape_as_the_stub(client, monkeypatch):
-    """Same request, same response shape either way — flipping the flag is a
-    Library-only deploy change, never one the Bosun has to coordinate with."""
-    unset = client.post("/merge/admission", json=_admission_body(), headers=_h()).json()
-    monkeypatch.setattr(store, "MERGE_ADMISSION_ENFORCED", True)
-    enforced = client.post("/merge/admission", json=_admission_body(), headers=_h()).json()
-    assert set(unset.keys()) == set(enforced.keys()) == {"approved", "reason"}
+def test_the_response_is_the_v1_shape_plus_three_fields(client):
+    body = client.post("/merge/admission", json=_admission_body(),
+                       headers=_h()).json()
+    assert set(body.keys()) == {"approved", "reason", "head_sha", "enforced",
+                                "missing"}
+
+
+def test_an_approving_evaluator_approves(client, monkeypatch):
+    monkeypatch.setattr(merge_admission, "evaluate", _approves)
+    r = client.post("/merge/admission", json=_admission_body(), headers=_h())
+    body = r.json()
+    assert body["approved"] is True
+    assert body["enforced"] is True
+    assert body["missing"] == []
+    assert "satisfied" in body["reason"]
+
+
+def test_enforcement_off_approves_regardless_of_the_evaluator(client, tmp_path):
+    _put_enforcement(client, enforced=False, reason="incident")
+    r = client.post("/merge/admission", json=_admission_body(), headers=_h())
+    body = r.json()
+    assert body["approved"] is True
+    assert body["enforced"] is False
+    # Still reported — turning enforcement off does not hide what the
+    # evaluator actually found.
+    assert body["missing"] == MISSING_REVIEW
+    assert "enforcement is off" in body["reason"]
+    assert "no run-verified review from reviewer" in body["reason"]
+
+
+def test_enforcement_off_with_nothing_missing_says_so_plainly(client, monkeypatch):
+    monkeypatch.setattr(merge_admission, "evaluate", _approves)
+    _put_enforcement(client, enforced=False)
+    r = client.post("/merge/admission", json=_admission_body(), headers=_h())
+    body = r.json()
+    assert body["approved"] is True
+    assert body["missing"] == []
+    assert body["reason"] == "approved: merge admission enforcement is off"
 
 
 # --- capability -------------------------------------------------------------------
@@ -327,6 +408,8 @@ def test_admission_writes_a_signal(client, tmp_path, monkeypatch):
     assert meta["repo"] == "convivy/library"
     assert meta["pr"] == 53
     assert meta["requester"] == "co-bosun-0912"
+    assert meta["enforced"] is True
+    assert meta["approved"] is False
 
 
 def test_outcome_writes_a_signal(client, tmp_path, monkeypatch):
@@ -388,9 +471,8 @@ def test_each_call_writes_its_own_signal_with_no_dedup_key(client, tmp_path, mon
 def test_a_failed_audit_write_does_not_turn_an_approval_into_a_refusal(
         client, monkeypatch):
     """`insert_signal` raises `WritesDisabled` whenever the vault write path is
-    off, which is every deploy today. The merge answer must not depend on
-    Archives being writable — coupling the two would make `/merge/admission`
-    refuse every call for the whole read-only shadow."""
+    off. The merge answer must not depend on Archives being writable."""
+    monkeypatch.setattr(merge_admission, "evaluate", _approves)
     monkeypatch.setattr(store, "WRITES_ENABLED", False)
     r = client.post("/merge/admission", json=_admission_body(), headers=_h())
     assert r.status_code == 200
@@ -413,30 +495,214 @@ def test_outcome_reports_recorded_true_on_a_successful_write(client):
     assert r.json()["recorded"] is True
 
 
+# --- PUT /merge/admission/enforcement: human-reserved -----------------------
+
+
+def test_the_capability_is_human_reserved():
+    assert "merge.enforcement" in identity.HUMAN_RESERVED_CAPS
+    assert "merge.enforcement" in identity.ROLE_CAPS["approved_client"]
+    assert "merge.enforcement" not in identity.ROLE_CAPS["agent"]
+    assert "merge.enforcement" not in identity.ROLE_CAPS["system"]
+
+
+@pytest.mark.parametrize("token", [AGENT, SYSTEM])
+def test_put_refuses_an_agent_or_system_credential(client, token):
+    """The done-when: an `agent` credential (and, parametrized, `system`) is
+    refused 403 on the PUT."""
+    r = _put_enforcement(client, token=token)
+    assert r.status_code == 403
+    assert "merge.enforcement" in r.json()["error"]
+
+
+def test_put_refuses_no_credential(client):
+    r = client.put("/merge/admission/enforcement",
+                   json={"enforced": False, "acting_human": HUMAN},
+                   headers={protocol.HEADER: str(protocol.CURRENT)})
+    assert r.status_code == 401
+
+
+def test_put_requires_acting_human(client):
+    r = client.put("/merge/admission/enforcement", json={"enforced": False},
+                   headers=_h(OPERATOR))
+    assert r.status_code == 403
+    assert "acting_human" in r.json()["error"]
+
+
+@pytest.mark.parametrize("value", [None, "yes", 1])
+def test_put_requires_an_enforced_boolean(client, value):
+    r = _put_enforcement(client, enforced=value)
+    assert r.status_code == 400
+
+
+def test_put_refuses_a_non_object_body(client):
+    r = client.put("/merge/admission/enforcement", content="not json",
+                   headers=_h(OPERATOR))
+    assert r.status_code == 400
+
+
+def test_put_appends_a_row_and_returns_it(client):
+    r = _put_enforcement(client, enforced=False, reason="incident")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["enforced"] is False
+    assert body["changed_by_client"] == "deck"
+    assert body["acting_human"] == HUMAN
+    assert body["reason"] == "incident"
+    assert body["changed_at"]
+
+
+def test_put_refuses_while_writes_are_disabled(client, monkeypatch):
+    monkeypatch.setattr(store, "WRITES_ENABLED", False)
+    r = _put_enforcement(client)
+    assert r.status_code == 503
+
+
+def test_the_newest_put_wins(client):
+    _put_enforcement(client, enforced=False)
+    _put_enforcement(client, enforced=True)
+    r = client.post("/merge/admission", json=_admission_body(), headers=_h())
+    assert r.json()["enforced"] is True
+
+
+# --- GET /merge/admission/enforcement: gated on merge.enforcement, like PUT -
+
+
+def test_get_enforcement_requires_a_credential(client):
+    r = client.get("/merge/admission/enforcement",
+                   headers={protocol.HEADER: str(protocol.CURRENT)})
+    assert r.status_code == 401
+
+
+@pytest.mark.parametrize("token", [AGENT, SYSTEM])
+def test_get_enforcement_refuses_an_agent_or_system_credential(client, token):
+    """`merge.enforcement` gates the `GET` too, the same reserved capability
+    as the `PUT` — `/health` already shows everything but `acting_human`
+    with no credential at all, so an agent gains nothing this route
+    withholds from it elsewhere."""
+    r = client.get("/merge/admission/enforcement", headers=_h(token))
+    assert r.status_code == 403
+    assert "merge.enforcement" in r.json()["error"]
+
+
+def test_get_enforcement_defaults_to_enforced_for_an_empty_table(client):
+    r = client.get("/merge/admission/enforcement", headers=_h(OPERATOR))
+    assert r.status_code == 200
+    assert r.json() == {"enforced": True, "changed_at": None,
+                        "changed_by_client": None, "acting_human": None,
+                        "reason": None}
+
+
+def test_get_enforcement_reflects_a_put_including_acting_human(client):
+    _put_enforcement(client, enforced=False, reason="incident")
+    r = client.get("/merge/admission/enforcement", headers=_h(OPERATOR))
+    body = r.json()
+    assert body["enforced"] is False
+    assert body["changed_by_client"] == "deck"
+    assert body["acting_human"] == HUMAN
+    assert body["reason"] == "incident"
+
+
+# --- /health: enforced, changed_at, changed_by_client, reason — never acting_human
+
+
+def test_health_shows_enforced_true_for_an_empty_table(client):
+    r = client.get("/health")
+    assert r.status_code == 200
+    assert r.json()["merge_admission"] == {
+        "enforced": True, "changed_at": None, "changed_by_client": None,
+        "reason": None}
+
+
+def test_health_shows_enforced_false_with_the_time_and_client_after_a_put(client):
+    """The done-when: after an approved-client PUT, `/health` shows
+    `enforced: false` with the time and client — and never `acting_human`."""
+    _put_enforcement(client, enforced=False, reason="incident")
+    r = client.get("/health")
+    assert r.status_code == 200
+    state = r.json()["merge_admission"]
+    assert state["enforced"] is False
+    assert state["changed_by_client"] == "deck"
+    assert state["changed_at"]
+    assert state["reason"] == "incident"
+    assert "acting_human" not in state
+
+
+def test_health_needs_no_credential(client):
+    _put_enforcement(client, enforced=False)
+    r = client.get("/health")
+    assert r.status_code == 200
+    assert r.json()["merge_admission"]["enforced"] is False
+
+
 # --- the boot line ------------------------------------------------------------------
 
 
-def test_boot_line_says_stubbed_when_unset(capsys, monkeypatch):
+def _boot_db(tmp_path):
+    db = tmp_path / "control.db"
+    conn = sqlite3.connect(db)
+    conn.executescript("""
+        CREATE TABLE merge_admission_settings (
+            id INTEGER PRIMARY KEY, enforced BOOLEAN NOT NULL,
+            set_by_client TEXT NOT NULL, acting_human TEXT NOT NULL,
+            reason TEXT, set_at TEXT NOT NULL);
+    """)
+    conn.commit()
+    conn.close()
+    return db
+
+
+def _run_lifespan():
     import asyncio
-    monkeypatch.setattr(store, "MERGE_ADMISSION_ENFORCED", False)
 
     async def _run():
         async with libapp.lifespan(libapp.app):
             pass
 
     asyncio.run(_run())
+
+
+def test_boot_line_says_enforced_for_an_empty_table(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(store, "DB_PATH", _boot_db(tmp_path))
+    monkeypatch.delenv("LIBRARY_MERGE_ADMISSION_ENFORCED", raising=False)
+    _run_lifespan()
     err = capsys.readouterr().err
-    assert "merge admission STUBBED (always approves)" in err
+    assert "library: merge admission ENFORCED" in err
 
 
-def test_boot_line_says_enforced_when_set(capsys, monkeypatch):
-    import asyncio
-    monkeypatch.setattr(store, "MERGE_ADMISSION_ENFORCED", True)
-
-    async def _run():
-        async with libapp.lifespan(libapp.app):
-            pass
-
-    asyncio.run(_run())
+def test_boot_line_names_the_client_when_a_put_has_turned_it_off(
+        tmp_path, capsys, monkeypatch):
+    db = _boot_db(tmp_path)
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "INSERT INTO merge_admission_settings "
+        "(enforced, set_by_client, acting_human, reason, set_at) "
+        "VALUES (0, 'deck', 'op@example.com', 'incident', '2026-01-01 00:00:00')")
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(store, "DB_PATH", db)
+    monkeypatch.delenv("LIBRARY_MERGE_ADMISSION_ENFORCED", raising=False)
+    _run_lifespan()
     err = capsys.readouterr().err
-    assert "merge admission ENFORCED" in err
+    assert "NOT enforced" in err
+    assert "deck" in err
+
+
+def test_boot_line_says_the_env_variable_is_ignored_when_set(
+        tmp_path, capsys, monkeypatch):
+    """The done-when: the startup message when `LIBRARY_MERGE_ADMISSION_
+    ENFORCED` is set names it as ignored — enforcement is a vault setting
+    now, not an environment flag."""
+    monkeypatch.setattr(store, "DB_PATH", _boot_db(tmp_path))
+    monkeypatch.setenv("LIBRARY_MERGE_ADMISSION_ENFORCED", "1")
+    _run_lifespan()
+    err = capsys.readouterr().err
+    assert "LIBRARY_MERGE_ADMISSION_ENFORCED is set but ignored" in err
+
+
+def test_boot_line_says_nothing_about_the_env_variable_when_unset(
+        tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(store, "DB_PATH", _boot_db(tmp_path))
+    monkeypatch.delenv("LIBRARY_MERGE_ADMISSION_ENFORCED", raising=False)
+    _run_lifespan()
+    err = capsys.readouterr().err
+    assert "LIBRARY_MERGE_ADMISSION_ENFORCED" not in err

@@ -32,14 +32,14 @@ import projects
 import protocol
 import store
 
-AGENT = "agent-token-vivy"
+AGENT = "agent-token-fennick"
 WIDE = "agent-token-wide"
 NOSCOPE = "agent-token-noscope"
 
 REGISTRY = {
     "_scopes": {"platform": {}},
-    "vivy": {"aliases": ["viv"], "repos": ["vivy-app"]},
-    "constance": {"aliases": [], "repos": []},
+    "fennick": {"aliases": ["viv"], "repos": ["fennick-app"]},
+    "marlow": {"aliases": [], "repos": []},
     "keel": {"aliases": ["steward"], "repos": ["substrate", "agent-platform"]},
 }
 
@@ -90,15 +90,15 @@ def db_path(tmp_path):
     conn.executemany(
         "INSERT INTO issue_items (id, product, title, type, state, created_at) "
         "VALUES (?,?,?,?,?,?)",
-        [("issue_epic_v", "vivy", "A vivy epic", "epic", "open",
+        [("issue_epic_v", "fennick", "A fennick epic", "epic", "open",
           "2026-08-01 12:00:00.000000"),
-         ("issue_epic_v2", "vivy", "Another vivy epic", "epic", "open",
+         ("issue_epic_v2", "fennick", "Another fennick epic", "epic", "open",
           "2026-08-01 12:01:00.000000"),
-         ("issue_task_v", "vivy", "A vivy task", "task", "open",
+         ("issue_task_v", "fennick", "A fennick task", "task", "open",
           "2026-08-01 12:02:00.000000"),
-         # THE PROBE TARGET. A caller scoped to vivy must not be able to tell
+         # THE PROBE TARGET. A caller scoped to fennick must not be able to tell
          # this id from one that was never issued.
-         ("issue_epic_c", "constance", "A constance epic", "epic", "open",
+         ("issue_epic_c", "marlow", "A marlow epic", "epic", "open",
           "2026-08-01 12:03:00.000000")])
     conn.commit()
     conn.close()
@@ -109,7 +109,7 @@ def db_path(tmp_path):
 def client(db_path, tmp_path, monkeypatch):
     tokens = tmp_path / "api-tokens.json"
     tokens.write_text(json.dumps({
-        AGENT: {"name": "vivy-agent", "products": ["vivy"]},
+        AGENT: {"name": "fennick-agent", "products": ["fennick"]},
         WIDE: {"name": "wide-agent", "products": ["*"]},
         NOSCOPE: {"name": "scopeless", "products": []},
     }))
@@ -132,12 +132,12 @@ def _h(token=AGENT):
 
 
 def _body(**over):
-    out = {"product": "vivy", "title": "The route to the bead"}
+    out = {"product": "fennick", "title": "The route to the bead"}
     out.update(over)
     return out
 
 
-def _courses(db_path, product="vivy"):
+def _courses(db_path, product="fennick"):
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     try:
@@ -175,7 +175,7 @@ def test_a_new_plan_comes_back_in_protocol_shape(client):
     assert r.status_code == 201, r.text
     out = r.json()
     assert out["id"].startswith("course_")
-    assert out["product"] == "vivy"
+    assert out["product"] == "fennick"
     assert out["title"] == "The route to the bead"
     assert out["status"] == store.COURSE_LIVE
     assert out["entries"] == []
@@ -196,7 +196,7 @@ def test_a_plan_can_be_created_with_its_order_already_set(client, db_path):
     assert r.json()["entries"] == ["issue_epic_v2", "issue_epic_v"]
     stored = _courses(db_path)[0]
     assert json.loads(stored["entries"]) == ["issue_epic_v2", "issue_epic_v"]
-    assert stored["created_by"] == "vivy-agent"
+    assert stored["created_by"] == "fennick-agent"
 
 
 def test_the_title_is_trimmed_before_it_is_stored(client):
@@ -213,7 +213,7 @@ def test_creation_is_recorded_as_an_event(client, db_path):
                     headers=_h())
     events = _events(db_path, r.json()["id"])
     assert [e["action"] for e in events] == [store.COURSE_ACTION_CREATED]
-    assert events[0]["actor"] == "vivy-agent"
+    assert events[0]["actor"] == "fennick-agent"
     assert json.loads(events[0]["entries"]) == ["issue_epic_v"]
 
 
@@ -248,8 +248,8 @@ def test_a_missing_capability_is_403_naming_the_capability(client, monkeypatch):
 
 def test_an_out_of_scope_product_is_404_rather_than_403(client):
     """The same wording an absent row gets. Splitting them would tell a
-    `vivy`-scoped caller which products exist."""
-    r = client.post("/courses", json=_body(product="constance"), headers=_h())
+    `fennick`-scoped caller which products exist."""
+    r = client.post("/courses", json=_body(product="marlow"), headers=_h())
     assert r.status_code == 404
 
 
@@ -261,15 +261,15 @@ def test_an_identity_scoped_to_nothing_creates_nothing(client):
 # --- the product registry ------------------------------------------------------
 
 
-@pytest.mark.parametrize("given", ["vivy", "VIVY", "Vivy", " vivy ", "viv",
-                                   "vivy-app"])
+@pytest.mark.parametrize("given", ["fennick", "FENNICK", "Fennick", " fennick ", "viv",
+                                   "fennick-app"])
 def test_a_product_resolves_to_its_canonical_slug(client, db_path, given):
     """The bug this closes is the one `POST /items` closes: `Substrate` beside
     `substrate`, a plan invisible to every view asking for the real slug."""
     r = client.post("/courses", json=_body(product=given), headers=_h(WIDE))
     assert r.status_code == 201, r.text
-    assert r.json()["product"] == "vivy"
-    assert _courses(db_path)[0]["product"] == "vivy"
+    assert r.json()["product"] == "fennick"
+    assert _courses(db_path)[0]["product"] == "fennick"
 
 
 def test_an_unknown_product_is_refused_and_names_only_what_this_caller_may_use(
@@ -280,8 +280,8 @@ def test_an_unknown_product_is_refused_and_names_only_what_this_caller_may_use(
     # oracle into a directory dump. Every spelling of the caller's own product is
     # offered — the slug, its alias and its repo all resolve — and nothing that
     # resolves to a product this token cannot see.
-    assert set(r.json()["known"]) == {"vivy", "viv", "vivy-app"}
-    assert {projects.resolve(n) for n in r.json()["known"]} == {"vivy"}
+    assert set(r.json()["known"]) == {"fennick", "viv", "fennick-app"}
+    assert {projects.resolve(n) for n in r.json()["known"]} == {"fennick"}
 
 
 # --- the one-live-Course slot --------------------------------------------------
@@ -311,9 +311,9 @@ def test_a_superseded_plan_does_not_hold_the_slot(client, db_path):
 
 
 def test_the_slot_is_per_product(client):
-    assert client.post("/courses", json=_body(product="vivy"),
+    assert client.post("/courses", json=_body(product="fennick"),
                        headers=_h(WIDE)).status_code == 201
-    assert client.post("/courses", json=_body(product="constance"),
+    assert client.post("/courses", json=_body(product="marlow"),
                        headers=_h(WIDE)).status_code == 201
 
 
@@ -376,7 +376,7 @@ def test_a_lost_race_still_names_the_plan_that_won(client, db_path):
     winner.execute(
         "INSERT INTO courses (id, product, title, entries, status, version, "
         "created_by, created_at) VALUES (?,?,?,?,?,?,?,?)",
-        ("course_winner", "vivy", "the winning plan", "[]", store.COURSE_LIVE,
+        ("course_winner", "fennick", "the winning plan", "[]", store.COURSE_LIVE,
          1, "other", "2026-08-01 00:00:00"))
     winner.commit()
     winner.close()
@@ -513,7 +513,7 @@ def test_a_course_contains_only_epics(client):
 
 def test_an_epic_from_another_product_is_refused_when_the_caller_can_see_it(
         client):
-    """A wildcard caller can already read the constance epic, so naming its
+    """A wildcard caller can already read the marlow epic, so naming its
     product discloses nothing and makes the mistake fixable."""
     r = client.post("/courses",
                     json=_body(entries=["issue_epic_v", "issue_epic_c"]),
@@ -640,7 +640,7 @@ def test_a_rename_stamps_who_and_when(client, db_path):
     client.patch(f"/courses/{course['id']}", json={"title": "renamed"},
                  headers=_h())
     stored = _courses(db_path)[0]
-    assert stored["updated_by"] == "vivy-agent"
+    assert stored["updated_by"] == "fennick-agent"
     assert stored["updated_at"] is not None
 
 
@@ -663,9 +663,9 @@ def test_a_superseded_plan_cannot_be_renamed(client, db_path):
 
 
 def test_an_out_of_scope_plan_is_404_and_matches_an_absent_one(client):
-    """The paired assertion is the whole point: a `vivy`-scoped caller must not
-    be able to tell a real constance Course from an id nobody ever minted."""
-    other = _make(client, product="constance")
+    """The paired assertion is the whole point: a `fennick`-scoped caller must not
+    be able to tell a real marlow Course from an id nobody ever minted."""
+    other = _make(client, product="marlow")
     real = client.patch(f"/courses/{other['id']}", json={"title": "renamed"},
                         headers=_h())
     invented = client.patch("/courses/course_never_minted",
@@ -742,13 +742,13 @@ def test_a_rename_ignores_every_field_but_the_title(client, db_path):
     r = client.patch(f"/courses/{course['id']}",
                      json={"title": "renamed", "version": 99,
                            "status": store.COURSE_SUPERSEDED,
-                           "product": "constance", "id": "course_elsewhere"},
+                           "product": "marlow", "id": "course_elsewhere"},
                      headers=_h())
     assert r.status_code == 200
     stored = _courses(db_path)[0]
     assert stored["version"] == 1
     assert stored["status"] == store.COURSE_LIVE
-    assert stored["product"] == "vivy"
+    assert stored["product"] == "fennick"
     assert stored["id"] == course["id"]
 
 
@@ -853,7 +853,7 @@ def test_a_reorder_stamps_who_and_when(client, db_path):
     course = _make(client)
     _order(client, course, ["issue_epic_v"])
     stored = _courses(db_path)[0]
-    assert stored["updated_by"] == "vivy-agent"
+    assert stored["updated_by"] == "fennick-agent"
     assert stored["updated_at"] is not None
 
 
@@ -1057,7 +1057,7 @@ def test_a_superseded_plan_cannot_be_reordered(client, db_path):
 
 
 def test_an_out_of_scope_reorder_is_404_and_matches_an_absent_one(client):
-    other = _make(client, product="constance")
+    other = _make(client, product="marlow")
     real = _order(client, other, [], token=AGENT)
     invented = client.put("/courses/course_never_minted/order",
                           json={"version": 1, "entries": []}, headers=_h())
@@ -1241,7 +1241,7 @@ def test_superseding_stamps_who_and_when(client, db_path):
     course = _make(client)
     _supersede(client, course)
     stored = _courses(db_path)[0]
-    assert stored["updated_by"] == "vivy-agent"
+    assert stored["updated_by"] == "fennick-agent"
     assert stored["updated_at"] is not None
 
 
@@ -1345,7 +1345,7 @@ def test_a_lost_supersede_race_is_idempotent_rather_than_a_conflict(client,
 
 
 def test_an_out_of_scope_supersede_is_404_and_matches_an_absent_one(client):
-    other = _make(client, product="constance")
+    other = _make(client, product="marlow")
     real = _supersede(client, other)
     invented = client.post("/courses/course_never_minted/supersede", json={},
                            headers=_h())
@@ -1440,7 +1440,7 @@ def test_retiring_a_corrupted_row_reports_the_anomaly_to_the_archives(
     sigs = _signals(db_path)
     assert len(sigs) == 1, "the anomaly went unreported"
     assert sigs[0]["kind"] == "course_status_anomaly_retired"
-    assert sigs[0]["product"] == "vivy"
+    assert sigs[0]["product"] == "fennick"
     assert json.loads(sigs[0]["meta"])["prior_status"] == "archived"
     assert course["id"] in sigs[0]["body"]
 
@@ -1640,7 +1640,7 @@ def test_an_approved_epic_carried_into_the_successor_is_not_stranded(
 
     successor = r.json()["successor"]
     assert successor["status"] == store.COURSE_LIVE
-    assert successor["product"] == "vivy"
+    assert successor["product"] == "fennick"
     assert successor["title"] == "the next route"
     assert successor["entries"] == ["issue_epic_v"]
 
@@ -1740,7 +1740,7 @@ def test_a_successors_entries_take_the_same_membership_rules_as_create(
     assert r.status_code == 400
     assert r.json()["unknown"] == ["issue_nope"]
     assert _courses(db_path)[0]["status"] == store.COURSE_LIVE
-    assert _courses(db_path, "vivy").__len__() == 1, (
+    assert _courses(db_path, "fennick").__len__() == 1, (
         "a refused successor must not be created")
 
 
@@ -1861,7 +1861,7 @@ def test_adding_a_waypoint_is_recorded_as_an_event(client, db_path):
     assert [e["action"] for e in events] == [
         store.COURSE_ACTION_CREATED, store.COURSE_ACTION_WAYPOINT_ADDED]
     added = events[-1]
-    assert added["actor"] == "vivy-agent"
+    assert added["actor"] == "fennick-agent"
     assert added["entries"] is None, "this action never touches entries"
     assert json.loads(added["waypoints"]) == r.json()["waypoints"]
 
@@ -1927,7 +1927,7 @@ def test_a_superseded_course_cannot_take_a_new_waypoint(client):
 
 
 def test_an_out_of_scope_course_is_404_and_matches_an_absent_one(client):
-    other = _make(client, product="constance")
+    other = _make(client, product="marlow")
     real = _waypoint(client, other, ["issue_epic_v"], token=AGENT)
     invented = client.post("/courses/course_never_minted/waypoints",
                            json={"members": ["issue_epic_v"]}, headers=_h())

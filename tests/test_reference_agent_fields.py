@@ -32,7 +32,7 @@ import protocol
 import reference
 import store
 
-AGENT = "agent-token-vivy"
+AGENT = "agent-token-fennick"
 ORCHESTRATOR = identity.Identity(actor="co-library-test", kind="orchestrator")
 
 CODER_ID = "agent-platform/agents/coder"
@@ -79,6 +79,7 @@ def client(tmp_path, monkeypatch):
     conn.executescript("""
         CREATE TABLE roster_agents (
             id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE,
+            source_doc TEXT,
             created_at TEXT NOT NULL, created_by TEXT NOT NULL,
             updated_at TEXT NOT NULL, updated_by TEXT NOT NULL);
         CREATE TABLE profiles (
@@ -144,7 +145,7 @@ def client(tmp_path, monkeypatch):
 
     tokens = tmp_path / "api-tokens.json"
     tokens.write_text(json.dumps({
-        AGENT: {"name": "vivy-agent", "products": ["vivy"]},
+        AGENT: {"name": "fennick-agent", "products": ["fennick"]},
     }))
 
     monkeypatch.setattr(store, "DB_PATH", control)
@@ -321,7 +322,7 @@ def no_column_client(tmp_path, monkeypatch):
 
     tokens = tmp_path / "api-tokens.json"
     tokens.write_text(json.dumps({
-        AGENT: {"name": "vivy-agent", "products": ["vivy"]},
+        AGENT: {"name": "fennick-agent", "products": ["fennick"]},
     }))
 
     monkeypatch.setattr(store, "DB_PATH", control)

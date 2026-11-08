@@ -32,9 +32,9 @@ which is why this module has no `touch`.
 ## Deriving `TTL_SECONDS`
 
 The window a slip must survive is mint-at-checkout to redeem-by-the
-Individuator. `POST /tokens/redeem` does not exist yet
-(issue_01M12NE13P3FEY3HF7732QX03F), so there is no in-system measurement of
-that exact gap; the nearest real proxy is dispatch latency in the fleet as it
+Individuator. `POST /tokens/redeem` exists now (app.py) but no client calls
+it yet, so there is still no in-system measurement of that exact gap; the
+nearest real proxy is dispatch latency in the fleet as it
 runs today — the time between an `agentctl spawn` command being issued and
 the spawned run's own `started_at`, which is the same kind of cost: queueing
 plus process startup before the run can make its first move.
@@ -113,7 +113,7 @@ def _parse(value):
 
 
 def mint(conn, *, item_id: str, product: str, claim_owner_label: str, now=None,
-         grant: dict | None = None) -> str:
+         grant: dict | None = None, crew: str | None = None) -> str:
     """Insert a new call slip for `item_id` and return its id.
 
     `expires_at` is computed and written HERE, once. Unlike `lease.expires_at`,
@@ -128,16 +128,22 @@ def mint(conn, *, item_id: str, product: str, claim_owner_label: str, now=None,
     this slip, every field but `slip_id`, and `POST /tokens/redeem` returns it
     as issued. Re-building it at redemption would read a profile, a ledger
     and an index that may all have moved since. `None` stores no grant.
+
+    **`crew` is the checkout credential's own `ident.crew`, never a request
+    body field** (library/specs/library-card-credential-and-revocation-plan
+    §3, CQ·210): a checkout made under a crewless credential mints a
+    crewless slip, which is today's behaviour unchanged. `library_cards.issue`
+    reads this off the redeemed slip and copies it onto the card it mints.
     """
     now = now or _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None)
     slip_id = f"slip_{new_ulid()}"
     expires_at = now + _dt.timedelta(seconds=TTL_SECONDS)
     conn.execute(
         "INSERT INTO call_slips (id, item_id, product, claim_owner_label, "
-        "issued_at, expires_at, grant_json) VALUES (?,?,?,?,?,?,?)",
+        "issued_at, expires_at, grant_json, crew) VALUES (?,?,?,?,?,?,?,?)",
         (slip_id, item_id, product, claim_owner_label, now.isoformat(" "),
          expires_at.isoformat(" "),
-         json.dumps(grant) if grant is not None else None))
+         json.dumps(grant) if grant is not None else None, crew))
     return slip_id
 
 

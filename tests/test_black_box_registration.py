@@ -22,7 +22,7 @@ import identity
 import protocol
 import store
 
-AGENT = "agent-token-vivy"
+AGENT = "agent-token-fennick"
 SYSTEM = "system-token"
 CLIENT = "orient-token"
 
@@ -53,7 +53,7 @@ def client(tmp_path, monkeypatch):
 
     tokens = tmp_path / "api-tokens.json"
     tokens.write_text(json.dumps({
-        AGENT: {"name": "vivy-agent", "products": ["vivy"]},
+        AGENT: {"name": "fennick-agent", "products": ["fennick"]},
         SYSTEM: {"name": "capture", "products": ["*"], "kind": "system"},
     }))
     client_tokens = tmp_path / "client-tokens.json"
@@ -75,7 +75,7 @@ def _h(token):
 
 def _body(**over):
     body = {
-        "acting_human": "operator", "crew": "cfo", "model": "sonnet",
+        "acting_human": "operator", "crew": "quill", "model": "sonnet",
         "gateway": "anthropic",
         "permissions": [
             {"agent": "scout", "model": "sonnet", "target": "WebFetch",
@@ -233,13 +233,13 @@ def test_permissions_land_in_tool_policy_readable_through_resolve(client):
 
     scout = client.get(
         "/policy/resolve",
-        params={"agent": "scout", "crew": "cfo", "model": "sonnet"},
+        params={"agent": "scout", "crew": "quill", "model": "sonnet"},
         headers=_h(AGENT)).json()
     assert scout["explicit"] == {"WebFetch": "allow"}
 
     consultant = client.get(
         "/policy/resolve",
-        params={"agent": "consultant", "crew": "cfo", "model": "sonnet"},
+        params={"agent": "consultant", "crew": "quill", "model": "sonnet"},
         headers=_h(AGENT)).json()
     assert consultant["explicit"] == {"claude_ai_Gmail": "deny"}
 
@@ -279,7 +279,7 @@ def test_re_registering_the_same_crew_upserts(client):
 
 
 def test_a_crew_the_registry_does_not_know_registers_successfully(client):
-    """`projects.private_repos()` narrows to `{'cfo', 'ea'}`-shaped registry
+    """`projects.private_repos()` narrows to `{'quill', 'osprey'}`-shaped registry
     entries and ADR-0043 is explicit that Ask is deliberately UNREGISTERED —
     it is a black box with no registry entry at all. This route must not
     gate on that registry, or it would refuse the registration of a crew
@@ -347,20 +347,20 @@ REGISTRATION_KEYS = {"crew", "model", "gateway", "created_by", "created_at",
 
 
 def test_a_registered_crews_model_and_gateway_read_back_exactly(client):
-    r = _register(client, crew="cfo", model="sonnet", gateway="anthropic")
+    r = _register(client, crew="quill", model="sonnet", gateway="anthropic")
     assert r.status_code == 200
 
-    got = client.get("/black-box/registrations/cfo", headers=_h(CLIENT))
+    got = client.get("/black-box/registrations/quill", headers=_h(CLIENT))
     assert got.status_code == 200
     body = got.json()
-    assert body["crew"] == "cfo"
+    assert body["crew"] == "quill"
     assert body["model"] == "sonnet"
     assert body["gateway"] == "anthropic"
 
 
 def test_the_single_registration_key_set_is_exactly_the_documented_set(client):
-    _register(client, crew="cfo")
-    got = client.get("/black-box/registrations/cfo", headers=_h(CLIENT))
+    _register(client, crew="quill")
+    got = client.get("/black-box/registrations/quill", headers=_h(CLIENT))
     assert set(got.json().keys()) == REGISTRATION_KEYS
 
 
@@ -376,8 +376,8 @@ def test_a_caller_without_policy_read_is_refused(client, monkeypatch):
                          "approved_client":
                              identity.ROLE_CAPS["approved_client"]
                              - {"policy.read"}})
-    _register(client, crew="cfo")
-    got = client.get("/black-box/registrations/cfo", headers=_h(CLIENT))
+    _register(client, crew="quill")
+    got = client.get("/black-box/registrations/quill", headers=_h(CLIENT))
     assert got.status_code == 403
     assert "policy.read" in got.json()["error"]
 
@@ -390,9 +390,9 @@ def test_an_agent_kind_credential_is_refused_on_both_routes(client):
     # `policy.read` is held by `agent` by default (see `identity.ROLE_CAPS`),
     # so this exercises the `ident.kind != "approved_client"` refusal, not
     # the capability check above it — security-reviewer, PR #174 round 1.
-    _register(client, crew="cfo")
+    _register(client, crew="quill")
 
-    got = client.get("/black-box/registrations/cfo", headers=_h(AGENT))
+    got = client.get("/black-box/registrations/quill", headers=_h(AGENT))
     assert got.status_code == 403
     assert "policy.read" in got.json()["error"]
 
@@ -402,9 +402,9 @@ def test_an_agent_kind_credential_is_refused_on_both_routes(client):
 
 
 def test_a_system_kind_credential_is_refused_on_both_routes(client):
-    _register(client, crew="cfo")
+    _register(client, crew="quill")
 
-    got = client.get("/black-box/registrations/cfo", headers=_h(SYSTEM))
+    got = client.get("/black-box/registrations/quill", headers=_h(SYSTEM))
     assert got.status_code == 403
     assert "policy.read" in got.json()["error"]
 
@@ -414,11 +414,11 @@ def test_a_system_kind_credential_is_refused_on_both_routes(client):
 
 
 def test_an_approved_client_reads_both_routes(client):
-    _register(client, crew="cfo", model="sonnet", gateway="anthropic")
+    _register(client, crew="quill", model="sonnet", gateway="anthropic")
 
-    got = client.get("/black-box/registrations/cfo", headers=_h(CLIENT))
+    got = client.get("/black-box/registrations/quill", headers=_h(CLIENT))
     assert got.status_code == 200
-    assert got.json()["crew"] == "cfo"
+    assert got.json()["crew"] == "quill"
 
     listed = client.get("/black-box/registrations", headers=_h(CLIENT))
     assert listed.status_code == 200
@@ -426,49 +426,49 @@ def test_an_approved_client_reads_both_routes(client):
 
 
 def test_list_registrations_refuses_any_parameter(client):
-    r = client.get("/black-box/registrations?crew=cfo", headers=_h(CLIENT))
+    r = client.get("/black-box/registrations?crew=quill", headers=_h(CLIENT))
     assert r.status_code == 400
     assert r.json()["unknown"] == ["crew"]
     assert r.json()["supported"] == []
 
 
 def test_get_registration_refuses_any_parameter(client):
-    _register(client, crew="cfo", model="sonnet", gateway="anthropic")
-    r = client.get("/black-box/registrations/cfo?model=opus", headers=_h(CLIENT))
+    _register(client, crew="quill", model="sonnet", gateway="anthropic")
+    r = client.get("/black-box/registrations/quill?model=opus", headers=_h(CLIENT))
     assert r.status_code == 400
     assert r.json()["unknown"] == ["model"]
     assert r.json()["supported"] == []
 
 
 def test_the_list_route_returns_each_registered_crew_once(client):
-    _register(client, crew="cfo", model="sonnet", gateway="anthropic")
-    _register(client, crew="ea", model="opus", gateway="bedrock")
-    _register(client, crew="cfo", model="opus", gateway="bedrock")
+    _register(client, crew="quill", model="sonnet", gateway="anthropic")
+    _register(client, crew="osprey", model="opus", gateway="bedrock")
+    _register(client, crew="quill", model="opus", gateway="bedrock")
 
     got = client.get("/black-box/registrations", headers=_h(CLIENT))
     assert got.status_code == 200
     body = got.json()
     assert body["count"] == 2
     crews = [r["crew"] for r in body["registrations"]]
-    assert sorted(crews) == ["cfo", "ea"]
+    assert sorted(crews) == ["osprey", "quill"]
     assert len(crews) == len(set(crews))
 
-    cfo = next(r for r in body["registrations"] if r["crew"] == "cfo")
-    assert cfo["model"] == "opus"
+    quill = next(r for r in body["registrations"] if r["crew"] == "quill")
+    assert quill["model"] == "opus"
 
 
 def test_a_crew_named_with_a_slash_is_reachable_through_the_path_converter(client):
     # `_clean_black_box_ident` puts no character restriction on `crew`
     # (reviewer, PR #174 round 1) — without `{crew:path}` this would 404
     # before the handler ran, indistinguishable from "never registered".
-    r = _register(client, crew="finance/cfo", model="sonnet",
+    r = _register(client, crew="finance/quill", model="sonnet",
                   gateway="anthropic")
     assert r.status_code == 200
 
-    got = client.get("/black-box/registrations/finance/cfo",
+    got = client.get("/black-box/registrations/finance/quill",
                      headers=_h(CLIENT))
     assert got.status_code == 200
-    assert got.json()["crew"] == "finance/cfo"
+    assert got.json()["crew"] == "finance/quill"
 
 
 def test_an_over_long_crew_path_value_is_refused(client):

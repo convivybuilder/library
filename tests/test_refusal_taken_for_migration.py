@@ -48,7 +48,7 @@ def test_upgrade_backfills_from_the_lease_each_refusal_names(tmp_path):
     conn.executemany(
         "INSERT INTO lease_refusals (id, at, requested_item_id, product, "
         "requester, actor, blocking_lease_id, blocking_root_id, "
-        "blocking_holder, blocks_by) VALUES (?, '2026-01-01', 'leaf', 'vivy', "
+        "blocking_holder, blocks_by) VALUES (?, '2026-01-01', 'leaf', 'fennick', "
         "'crew-b', 't', ?, 'epic', 'crew-a', 'ancestor')",
         [("ref_kept", "lease_1"), ("ref_gone", "lease_purged")])
     conn.commit()

@@ -39,8 +39,13 @@ def test_the_migration_creates_both_tables_at_head(tmp_path):
             "PRAGMA table_info(profiles)")}
     finally:
         conn.close()
-    assert roster_columns == {"id", "name", "created_at", "created_by",
-                              "updated_at", "updated_by"}
+    # `source_doc`: added by `ebb81eb799bc`, later in the same chain — see
+    # `test_roster_agents_source_doc_migration.py` for that revision's own
+    # upgrade/downgrade coverage. Named here too because this assertion is
+    # "every column at head", and a column landing after this migration but
+    # before head is still one this test would otherwise miss.
+    assert roster_columns == {"id", "name", "source_doc", "created_at",
+                              "created_by", "updated_at", "updated_by"}
     assert profile_columns == {"id", "project", "variant", "include",
                                "claude_md_extras", "created_at",
                                "created_by", "updated_at", "updated_by"}
@@ -79,7 +84,7 @@ def test_the_profile_project_variant_pair_is_unique(tmp_path):
         "INSERT INTO profiles "
         "(project, variant, include, claude_md_extras, created_at, "
         " created_by, updated_at, updated_by) "
-        "VALUES ('hollis', 'daytime', '[]', '[]', '2026-01-01', 'x', "
+        "VALUES ('bramwell', 'daytime', '[]', '[]', '2026-01-01', 'x', "
         "        '2026-01-01', 'x')")
     conn.commit()
     raised = False
@@ -88,7 +93,7 @@ def test_the_profile_project_variant_pair_is_unique(tmp_path):
             "INSERT INTO profiles "
             "(project, variant, include, claude_md_extras, created_at, "
             " created_by, updated_at, updated_by) "
-            "VALUES ('hollis', 'daytime', '[]', '[]', '2026-01-01', 'y', "
+            "VALUES ('bramwell', 'daytime', '[]', '[]', '2026-01-01', 'y', "
             "        '2026-01-01', 'y')")
         conn.commit()
     except sqlite3.IntegrityError:
@@ -108,13 +113,13 @@ def test_a_different_variant_of_the_same_project_is_allowed(tmp_path):
         "INSERT INTO profiles "
         "(project, variant, include, claude_md_extras, created_at, "
         " created_by, updated_at, updated_by) "
-        "VALUES ('hollis', 'daytime', '[]', '[]', '2026-01-01', 'x', "
+        "VALUES ('bramwell', 'daytime', '[]', '[]', '2026-01-01', 'x', "
         "        '2026-01-01', 'x')")
     conn.execute(
         "INSERT INTO profiles "
         "(project, variant, include, claude_md_extras, created_at, "
         " created_by, updated_at, updated_by) "
-        "VALUES ('hollis', 'overnight', '[]', '[]', '2026-01-01', 'x', "
+        "VALUES ('bramwell', 'overnight', '[]', '[]', '2026-01-01', 'x', "
         "        '2026-01-01', 'x')")
     conn.commit()
     count = conn.execute("SELECT COUNT(*) FROM profiles").fetchone()[0]

@@ -24,7 +24,7 @@ import identity
 import protocol
 import store
 
-AGENT = "agent-token-vivy"
+AGENT = "agent-token-fennick"
 SYSTEM = "system-token"
 CLIENT = "orient-token"
 
@@ -47,26 +47,26 @@ def client(tmp_path, monkeypatch):
     conn.executemany(
         "INSERT INTO signals (id, product, kind, body, privacy_class, "
         "ingested_at) VALUES (?,?,?,?,?,?)",
-        [("sig_internal", "vivy", "note", "an internal note", "internal",
+        [("sig_internal", "fennick", "note", "an internal note", "internal",
           "2026-08-01 07:30:00.000000"),
-         ("sig_customer", "vivy", "note", "a customer wrote this", "customer",
+         ("sig_customer", "fennick", "note", "a customer wrote this", "customer",
           "2026-08-01 07:31:00.000000"),
          # A second product's own signal — model per `test_archives_isolation
          # .py`'s `two_products` fixture — for the credential below, scoped to
-         # "vivy" only, to be refused against.
-         ("sig_other_product", "constance", "note", "not vivy's", "internal",
+         # "fennick" only, to be refused against.
+         ("sig_other_product", "marlow", "note", "not fennick's", "internal",
           "2026-08-01 07:32:00.000000")])
     conn.commit()
     conn.close()
 
     tokens = tmp_path / "api-tokens.json"
     tokens.write_text(json.dumps({
-        AGENT: {"name": "vivy-agent", "products": ["vivy"]},
+        AGENT: {"name": "fennick-agent", "products": ["fennick"]},
         SYSTEM: {"name": "capture", "products": ["*"], "kind": "system"},
     }))
     client_tokens = tmp_path / "client-tokens.json"
     client_tokens.write_text(json.dumps({
-        CLIENT: {"name": "orient", "products": ["vivy"]},
+        CLIENT: {"name": "orient", "products": ["fennick"]},
     }))
 
     monkeypatch.setattr(store, "DB_PATH", db)
@@ -315,7 +315,7 @@ def test_get_acks_omits_an_out_of_scope_signal_even_when_acked(client):
     conn.execute(
         "INSERT INTO signals (id, product, kind, body, privacy_class, "
         "ingested_at) VALUES (?,?,?,?,?,?)",
-        ("sig_other", "constance", "note", "not vivy", "internal",
+        ("sig_other", "marlow", "note", "not fennick", "internal",
          "2026-08-01 07:32:00.000000"))
     conn.execute(
         "INSERT INTO signal_acks (id, signal_id, identity, acked_at) "

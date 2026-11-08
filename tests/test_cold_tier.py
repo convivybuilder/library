@@ -22,6 +22,7 @@ import pytest
 
 import cold_tier as ct
 import store
+import store_owner
 import vectors
 
 MAIN_SCHEMA = """
@@ -64,7 +65,7 @@ def _insert(path, sig_id, kind, *, ingested_at, embedded_at="2020-01-01 00:00:00
         "INSERT INTO signals (id, source, kind, actor, ingested_by, product, "
         "refs, body, meta, privacy_class, ingested_at, embedded_at, dedup_key) "
         "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (sig_id, "test", kind, "someone", "someone", "vivy", "{}", body,
+        (sig_id, "test", kind, "someone", "someone", "fennick", "{}", body,
          json.dumps(meta or {}), "internal", ingested_at, embedded_at,
          dedup_key))
     conn.commit()
@@ -407,7 +408,7 @@ def test_a_move_pass_and_a_concurrent_writer_neither_get_a_lock_error(db):
                         "privacy_class, ingested_at) VALUES "
                         "(?,?,?,?,?,?,?,?,?,?,?)",
                         (f"sig_live_{i:04d}", "test", "note", "someone",
-                         "someone", "vivy", "{}", "b", "{}", "internal",
+                         "someone", "fennick", "{}", "b", "{}", "internal",
                          RECENT))
                     conn.commit()
                 finally:
@@ -560,3 +561,68 @@ def test_cold_db_available_is_false_when_the_variable_is_unset(db, monkeypatch):
     ok, why = store.cold_db_available()
     assert ok is False
     assert why == "the cold tier could not be opened"
+
+
+# --- running as the store's owner (company/decisions/0025 point 5, library
+# issue CQ-225) -------------------------------------------------------------
+#
+# These exercise `ct.main`'s own wiring to `store_owner.reexec_as_db_owner`,
+# never `ct.run`/`ct.move` directly — every case above calls those, never
+# `main`, so adding the owner-switch check there leaves every one of them,
+# and the single-account path they cover, untouched. The switch command
+# itself — its exact argv, the capability probe, environment forwarding,
+# and the refusal that leaves nothing run — is `store_owner.py`'s own
+# `tests/test_store_owner.py` to prove with a real stubbed subprocess; a
+# real double re-exec of this whole process is not exercised here, since
+# the `db` fixture's monkeypatched `store.DB_PATH`/`WRITES_ENABLED` are
+# this process's own attributes, invisible to a freshly spawned one.
+
+
+def test_main_proceeds_in_process_when_no_switch_is_needed(db, monkeypatch):
+    """The single-account install's own path: when `store_owner.
+    reexec_as_db_owner` reports no switch was needed (`None`), `ct.main`
+    runs the real move itself, in-process — exactly as it always has."""
+    _insert(db, "sig_old", "note", ingested_at=OLD, dedup_key="dk1")
+    monkeypatch.setattr(ct.store_owner, "reexec_as_db_owner",
+                        lambda *a, **k: None)
+
+    assert ct.main([]) == 0
+
+    assert not _hot_exists(db, "sig_old")
+    assert _cold_exists("sig_old")
+
+
+def _run_must_not_be_called(**_k):
+    raise AssertionError("run() must not be called when main() already "
+                         "returned the real work's own exit code")
+
+
+def test_main_propagates_a_switched_runs_exit_code_without_redoing_the_work(
+        db, monkeypatch):
+    """When `reexec_as_db_owner` reports a switch happened (an int — the
+    exit code of the child that already did the real work), `ct.main`
+    returns it directly rather than running the move a second time."""
+    _insert(db, "sig_old", "note", ingested_at=OLD, dedup_key="dk1")
+    monkeypatch.setattr(ct.store_owner, "reexec_as_db_owner",
+                        lambda *a, **k: 0)
+    monkeypatch.setattr(ct, "run", _run_must_not_be_called)
+
+    assert ct.main([]) == 0
+    assert _hot_exists(db, "sig_old"), "nothing may have moved in THIS process"
+
+
+def test_main_reports_a_refused_switch_and_runs_nothing(db, monkeypatch, capsys):
+    """When `reexec_as_db_owner` raises `OwnerSwitchRefused`, `ct.main`
+    prints a message naming the owner and returns 1, never calling `run`."""
+    _insert(db, "sig_old", "note", ingested_at=OLD, dedup_key="dk1")
+
+    def _refuse(*_a, **_k):
+        raise store_owner.OwnerSwitchRefused(store.DB_PATH, "otheruser", "me")
+
+    monkeypatch.setattr(ct.store_owner, "reexec_as_db_owner", _refuse)
+    monkeypatch.setattr(ct, "run", _run_must_not_be_called)
+
+    assert ct.main([]) == 1
+    assert "otheruser" in capsys.readouterr().err
+    assert _hot_exists(db, "sig_old"), "nothing may have been moved"
+    assert not _cold_exists("sig_old")

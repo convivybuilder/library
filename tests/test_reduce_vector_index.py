@@ -52,7 +52,7 @@ def _signal(db_path, signal_id, kind):
     conn.execute(
         "INSERT INTO signals (id, product, kind, body, privacy_class, "
         "ingested_at, embedded_at) VALUES (?,?,?,?,'internal',?,?)",
-        (signal_id, "vivy", kind, f"{kind} body",
+        (signal_id, "fennick", kind, f"{kind} body",
          "2026-08-01 11:00:00.000000", "2026-08-01 11:00:01.000000"))
     conn.commit()
     conn.close()
@@ -92,7 +92,7 @@ def _cold_signal(signal_id, kind):
     conn.execute(
         "INSERT INTO signals (id, product, kind, body, privacy_class, "
         "ingested_at, embedded_at) VALUES (?,?,?,?,'internal',?,?)",
-        (signal_id, "vivy", kind, f"{kind} body",
+        (signal_id, "fennick", kind, f"{kind} body",
          "2026-08-01 11:00:00.000000", "2026-08-01 11:00:01.000000"))
     conn.commit()
     conn.close()
@@ -308,7 +308,7 @@ def test_a_concurrent_writer_to_signals_raises_no_lock_error(db):
     writer.execute("BEGIN IMMEDIATE")
     writer.execute(
         "INSERT INTO signals (id, product, kind, body, privacy_class, "
-        "ingested_at, embedded_at) VALUES ('sig_concurrent','vivy','finding',"
+        "ingested_at, embedded_at) VALUES ('sig_concurrent','fennick','finding',"
         "'x','internal','2026-08-01 12:00:00.000000',NULL)")
     try:
         conn = _connect_rw()

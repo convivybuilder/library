@@ -125,7 +125,7 @@ def test_guard_distinct_accepts_two_different_files(source_db, dest_db):
 def test_stranded_counts_by_id_and_by_content(source_db, dest_db):
     src, dst = _conn(source_db), _conn(dest_db)
     src.execute("INSERT INTO issue_items (id, product, title) VALUES "
-               "('a', 'vivy', 'only in source')")
+               "('a', 'fennick', 'only in source')")
     src.execute("INSERT INTO issue_comments (item_id, actor, kind, body, at) "
                "VALUES ('a', 'x', 'note', 'hi', '2026-01-01')")
     dst.execute("INSERT INTO issue_comments (item_id, actor, kind, body, at) "
@@ -148,7 +148,7 @@ def test_stranded_counts_by_id_and_by_content(source_db, dest_db):
 def test_replay_inserts_by_id_tables_preserving_the_id(source_db, dest_db):
     src = _conn(source_db)
     src.execute("INSERT INTO decision_items (id, product, body) VALUES "
-               "('dec_1', 'vivy', 'a ruling')")
+               "('dec_1', 'fennick', 'a ruling')")
     src.commit()
     src.close()
 
@@ -168,7 +168,7 @@ def test_replay_renulls_embedded_at_on_arrival(source_db, dest_db):
     copying it verbatim would make the row invisible to the embed sweep."""
     src = _conn(source_db)
     src.execute("INSERT INTO issue_items (id, product, title, embedded_at) "
-               "VALUES ('a', 'vivy', 't', '2026-01-01 00:00:00')")
+               "VALUES ('a', 'fennick', 't', '2026-01-01 00:00:00')")
     src.commit()
     src.close()
 
@@ -230,11 +230,11 @@ def test_replay_skips_a_unique_collision_rather_than_failing_the_whole_run(
     nor a crash is correct; a report is."""
     src, dst = _conn(source_db), _conn(dest_db)
     src.execute("INSERT INTO issue_items (id, product, title, once_key) "
-               "VALUES ('orient-side', 'vivy', 'destroyed files', 'k')")
+               "VALUES ('orient-side', 'fennick', 'destroyed files', 'k')")
     src.execute("INSERT INTO issue_items (id, product, title, once_key) "
-               "VALUES ('also-clean', 'vivy', 'unrelated new item', 'k2')")
+               "VALUES ('also-clean', 'fennick', 'unrelated new item', 'k2')")
     dst.execute("INSERT INTO issue_items (id, product, title, once_key) "
-               "VALUES ('library-side', 'vivy', 'appeared path', 'k')")
+               "VALUES ('library-side', 'fennick', 'appeared path', 'k')")
     src.commit()
     dst.commit()
     src.close()
@@ -298,7 +298,7 @@ def test_main_refuses_cleanly_when_writes_are_disabled(
     monkeypatch.setattr(store, "WRITES_ENABLED", False)
     src = _conn(source_db)
     src.execute("INSERT INTO decision_items (id, product, body) VALUES "
-               "('dec_1', 'vivy', 'a ruling')")
+               "('dec_1', 'fennick', 'a ruling')")
     src.commit()
     src.close()
 
@@ -325,7 +325,7 @@ def test_main_dry_run_reports_and_writes_nothing(
     monkeypatch.setattr(store, "resolve_db", lambda: (dest_db, "LIBRARY_DB"))
     src = _conn(source_db)
     src.execute("INSERT INTO decision_items (id, product, body) VALUES "
-               "('dec_1', 'vivy', 'a ruling')")
+               "('dec_1', 'fennick', 'a ruling')")
     src.commit()
     src.close()
 
@@ -363,7 +363,7 @@ def test_main_i_mean_it_writes_backs_up_and_embeds_nothing_when_none_exists(
 
     src = _conn(source_db)
     src.execute("INSERT INTO decision_items (id, product, body) VALUES "
-               "('dec_1', 'vivy', 'a ruling')")
+               "('dec_1', 'fennick', 'a ruling')")
     src.commit()
     src.close()
 
@@ -394,7 +394,7 @@ def test_main_reports_cleanly_when_the_embed_sweep_fails(
 
     src = _conn(source_db)
     src.execute("INSERT INTO decision_items (id, product, body) VALUES "
-               "('dec_1', 'vivy', 'a ruling')")
+               "('dec_1', 'fennick', 'a ruling')")
     src.commit()
     src.close()
 

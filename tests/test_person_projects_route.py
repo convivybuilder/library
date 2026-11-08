@@ -63,9 +63,9 @@ def client(tmp_path, monkeypatch):
     conn.executemany(
         "INSERT INTO person_products (person_id, product, granted_at, "
         "granted_by) VALUES (?, ?, '2026-01-01', 'x')",
-        [("person_multi", "vivy"),
-         ("person_multi", "constance"),
-         ("person_multi", "hollis")])
+        [("person_multi", "fennick"),
+         ("person_multi", "marlow"),
+         ("person_multi", "bramwell")])
     conn.commit()
     conn.close()
 
@@ -74,7 +74,7 @@ def client(tmp_path, monkeypatch):
         ORIENT: {"name": "orient", "products": ["*"]},
         DECK: {"name": "deck", "products": ["*"]},
         BOSUN: {"name": "bosun", "products": ["*"]},
-        SCOPED: {"name": "a-scoped-client", "products": ["vivy", "hollis"]},
+        SCOPED: {"name": "a-scoped-client", "products": ["fennick", "bramwell"]},
         NOSCOPE_CLIENT: {"name": "a-scopeless-client", "products": []},
     }))
     agent_tokens = tmp_path / "api-tokens.json"
@@ -90,7 +90,7 @@ def client(tmp_path, monkeypatch):
     # routes fail closed with 503 wherever no agent-platform checkout exists,
     # which is CI.
     registry = tmp_path / "projects.json"
-    registry.write_text(json.dumps({"vivy": {}, "constance": {}, "hollis": {}}))
+    registry.write_text(json.dumps({"fennick": {}, "marlow": {}, "bramwell": {}}))
     monkeypatch.setattr(projects, "REGISTRY_PATH", registry)
     projects.reload()
     yield TestClient(libapp.app)
@@ -108,10 +108,10 @@ def test_a_project_outside_the_callers_scope_is_absent(client):
     r = client.get("/people/person_multi/projects", headers=_h(SCOPED))
     assert r.status_code == 200
     body = r.json()
-    assert body["projects"] == ["hollis", "vivy"]
+    assert body["projects"] == ["bramwell", "fennick"]
     assert body["count"] == 2
-    assert "constance" not in body["projects"]
-    assert "constance" not in json.dumps(body), (
+    assert "marlow" not in body["projects"]
+    assert "marlow" not in json.dumps(body), (
         "a project outside scope must be absent, never present and marked "
         "withheld")
 
@@ -120,7 +120,7 @@ def test_a_wildcard_credential_sees_every_granted_project(client):
     r = client.get("/people/person_multi/projects", headers=_h(ORIENT))
     assert r.status_code == 200
     body = r.json()
-    assert body["projects"] == ["constance", "hollis", "vivy"]
+    assert body["projects"] == ["bramwell", "fennick", "marlow"]
     assert body["count"] == 3
 
 
@@ -224,5 +224,5 @@ def test_orient_deck_and_bosun_each_read_under_their_own_credential(client):
     for token in (ORIENT, DECK, BOSUN):
         r = client.get("/people/person_multi/projects", headers=_h(token))
         assert r.status_code == 200
-        assert r.json() == {"projects": ["constance", "hollis", "vivy"],
+        assert r.json() == {"projects": ["bramwell", "fennick", "marlow"],
                             "count": 3}

@@ -17,30 +17,35 @@ merge-admission call (`issue_01KZCGQ43C0W6TBYTPDMR0HNVG`) to design, on
 purpose — "one mechanism at two moments" answered separately is how it ends
 up with two shapes.
 
-**THIS ROUTE IS CALLED ON THE HUMAN PATH AND BYPASSED ON THE AGENT PATH.**
-That asymmetry is the whole state of this split, and it is more dangerous than
-an uncalled gate, because the route has real traffic and looks exercised to
-anyone who checks whether it is live.
+**THIS ROUTE IS CALLED ON BOTH THE HUMAN PATH AND THE AGENT PATH, AS OF
+agent-platform#966 (CQ·531).** Until that PR merged, it was called on the
+human path and bypassed on the agent path — an asymmetry more dangerous than
+an uncalled gate, because the route had real traffic and looked exercised to
+anyone who checked whether it was live. It no longer is one.
 
 `convivy-orient`'s in-window KB editor calls it on every save: `kb_write_api.py`
 builds a partial frontmatter, calls `library_client.check_reference_admission`,
 returns 422 on `may_land: false`, and otherwise commits through
 `kb_commit.commit_document`, which shells to `agentctl kb checkout` and
 `agentctl kb apply` and returns only once the write has landed on `origin/main`.
-That caller has been live since 2026-08-25. Writes DO go through this route.
+That caller has been live since 2026-08-25.
 
-Nothing in `agent-platform` calls it. `agentctl kb apply`, `scribe apply` and
-`triage.py` validate locally and push; none of them asks. So every
-agent-initiated write bypasses the check that every Orient-initiated one passes.
+`agentctl kb apply` now calls it too: `_kb_admission_check` asks
+`POST /reference/admission` as the last gate before the commit and honours
+the answer with no override flag, refusing hard on `may_land: false`, on the
+Library being unreachable, and on any other error in the call (CQ·96 comment
+1202, CQ·531). `scribe apply` and `triage.py` still validate locally and
+push without asking; they are a narrower remaining gap than "every
+agent-initiated write", not the whole of it.
 
-Both halves are claims about other repositories and either can stop being true
-without anything here changing. Run both rather than trusting this paragraph:
+The agent-path claim above is about another repository and can stop being
+true without anything here changing. Run this rather than trusting the
+paragraph above:
 
     grep -rnE "reference/admission|reference_admission" ~/Convivy/agent-platform/{bin,lib}
-    grep -rnE "reference/admission|reference_admission" ~/Convivy/convivy-orient
 
-On 2026-08-29 the first returned nothing; the second returned `library_client.py`
-and `kb_write_api.py`.
+On 2026-10-21 this returned `bin/agentctl` (the admission call itself) and
+`bin/mcp-kb-server` (a comment naming it).
 
 **AN EARLIER VERSION OF THIS DOCSTRING SAID NOTHING CALLED THIS ROUTE AND GAVE
 ONLY THE FIRST COMMAND AS ITS PROOF.** The claim was about every caller
@@ -51,39 +56,31 @@ three days, two crews, and a steward ruling that repeated it.
 
 **WHAT IS GATED TODAY, PRECISELY.** The checkout clause itself is no longer
 optional — every request evaluates it, and one that names no `owner` is
-refused rather than answered on frontmatter alone. What is still gated is
-*who calls this route at all*: `agentctl` doesn't yet, so an agent-initiated
-write is still not checked (the asymmetry two paragraphs up). `clauses_checked`
-on the response still says which clauses actually ran — read that rather than
-inferring enforcement from a green answer. Orient's editor sends no `owner` as
-of this writing, so this change refuses its saves until Orient starts sending
-one; that deploy-ordering question is Orient's crew's to sequence, not this
-route's.
+refused rather than answered on frontmatter alone. `clauses_checked` on the
+response still says which clauses actually ran — read that rather than
+inferring enforcement from a green answer.
 
-**THE CHECKOUT CLAUSE HAS LANDED, WHICH WAS THE PRECONDITION FOR WIRING
-`kb apply` TO CALL THIS.** The steward's revised ordering (`issue_01M0YAS4S64P5TXN7S2C17GHF6`, comment
-1204, superseding the ruling in comment 1197): `kb checkout` returns a
-content-sha without minting a competing lease, then this file gains the checkout
-clause, then `kb apply` calls admission and honours the answer. Wiring before the
-clause produces a gate that is present, correct, called, and blind to the case it
-was called for, which is worse than an uncalled one because it leaves nothing
-open to find. The failure contract for that call is comment 1202: hard refuse on
-refusal, on unreachability and on any other error, with no override flag.
+**THE CHECKOUT CLAUSE LANDING WAS THE PRECONDITION FOR WIRING `kb apply` TO
+CALL THIS, AND BOTH HAVE NOW HAPPENED.** The steward's revised ordering
+(`issue_01M0YAS4S64P5TXN7S2C17GHF6`, comment 1204, superseding the ruling in
+comment 1197): `kb checkout` returns a content-sha without minting a
+competing lease, then this file gains the checkout clause, then `kb apply`
+calls admission and honours the answer. Wiring before the clause would have
+produced a gate that is present, correct, called, and blind to the case it
+was called for, which is worse than an uncalled one because it leaves
+nothing open to find. The failure contract for that call is comment 1202,
+landed as agent-platform#966 (CQ·531): hard refuse on refusal, on
+unreachability and on any other error, with no override flag.
 
-That is a half-wired split rather than a design that changed its mind, and the
-distinction is invisible from inside this file: everything here works, the
-tests pass, and the absence lives entirely in another repo. Written down
-because inferring it from an absence of callers requires knowing to look, and
-because this exact shape — a control that is present, correct and unreached —
-has cost the fleet repeatedly: guards pointing at moved constants, a test
-mocking a server into accepting what it rejects, a filing path returning 400 to
-workers who believed they had filed.
-
-Wiring the Bosun's path is the Bosun's half, and
-`issue_01M08YECXZ68NG1WWHG0NRD086` carries the state.
-`issue_01KZQA8A1SEEWSNYV5H8N0EQW7`'s branch protection waits on it: direct
-pushes to `knowledge/main` cannot be blocked while a push path exists that
-never asks, and `agentctl kb apply` is that path.
+The half-wired state this paragraph used to describe — "everything here
+works, the tests pass, and the absence lives entirely in another repo" — is
+the shape to watch for again whenever a split like this one lands in two
+repositories on two schedules: a control that is present, correct and
+unreached costs the fleet exactly as much as one that is absent, and looks
+healthy where an absent one does not. `issue_01M08YECXZ68NG1WWHG0NRD086`
+carries this split's state; `issue_01KZQA8A1SEEWSNYV5H8N0EQW7`'s branch
+protection, which waited on `agentctl kb apply` asking before a push path
+that never asks could be blocked, can now proceed on that front.
 
 **`validate_frontmatter` and the constants it checks against are duplicated
 from `knowledge/scripts/validate.py`, deliberately**, for the reason
@@ -139,68 +136,6 @@ ALLOWED_KINDS = frozenset({
     "build-plan",
 })
 
-# Kept as one flat set rather than reproducing `validate.py`'s per-entry
-# history — that commentary belongs with the registry it explains, not
-# duplicated a second time here. `knowledge/scripts/validate.py`
-# (`ALLOWED_PROJECTS`) is the source of truth for what's actually current.
-#
-# **THIS IS THE BASELINE, NOT THE WHOLE SET** (agent-platform#685, ported here
-# by `issue_01M3NS89KVRXB368VA4TJ38MDG` so the two validators agree).
-# `project_catalogue()` below adds every valid `projects/<name>/` directory the
-# knowledge tree at `KNOWLEDGE_ROOT` actually holds, so an adopter's own
-# project — one Convivy has never heard of — validates without a row here.
-# The baseline stays so every project below keeps validating even when
-# `KNOWLEDGE_ROOT` is unset or its directory is absent from the tree.
-ALLOWED_PROJECTS = frozenset({
-    "constance", "vivy", "sous-chef", "agent-platform",
-    # constance-landing (knowledge 6f9ac60, 2026-08-25): the constance.team apex
-    # landing page's own project, separate from `constance` so a dispatch against
-    # convivy/constance-landing resolves its narrow profile by default. Added here
-    # a day late, and the lateness is the point — see the drift note below.
-    "constance-landing",
-    "hollis", "selector", "convivy-app-kit", "convivy-services",
-    "nyh-studio",
-    # placard (crew created 2026-09-05): registered on the knowledge side only,
-    # so this port refused every `placard` admission until now. A project needs
-    # adding to `ID_PATTERN` below as well as to this set — `validate.py`'s own
-    # comment says "list AND ID_PATTERN below", and adding it here alone leaves
-    # every `placard/...` document id still rejected.
-    "placard",
-    # signals (2026-09-16, the operator): Convivy's internal product for commercial
-    # signal, briefings and message boards. An open crew that authors under
-    # projects/signals/. Added to validate.py by knowledge#540. It needs this
-    # set AND ID_PATTERN below, the same as placard.
-    "signals",
-    # archy (2026-10-02, the operator): an agentic operations system for small
-    # businesses that a specialist installs; an open crew. Added to validate.py
-    # by knowledge#722, which turned this repo's drift check red until it
-    # landed here. ID_PATTERN is derived from this set, so one entry covers both.
-    "archy",
-    # shipwright (2026-09-06, the operator): the crew that works Convivy Builder, with a
-    # slug of its own for its runbooks and its dispatch profile.
-    #
-    # **A SLUG IS NOT A BEAD.** shipwright must not write the Builder's bead —
-    # that part is the operator's and stands — but a crew can carry documents under its
-    # own project while working another product's bead. An earlier comment here
-    # asserted shipwright was deliberately excluded from the slug on the
-    # strength of the bead rule; that inference was wrong, and nothing about
-    # its slug had in fact been decided at the time. The distinction is written
-    # down here because conflating the two is what produced that error.
-    "shipwright",
-    # www (2026-09-12): convivy/www, the public convivy.com site, given its own
-    # project so its dispatch profile can exclude `kind: reference` entirely.
-    # validate.py carries the reasoning.
-    "www",
-    # vivy-landing (2026-10-02): convivy/vivy-landing, the public vivy.rentals
-    # site, given its own project for the same reason as www, so its dispatch
-    # profile can exclude `kind: reference`. Added to validate.py by
-    # knowledge#730; ID_PATTERN is derived from this set.
-    "vivy-landing",
-    "substrate", "knowledge", "convivy-orient", "keel", "library", "svc",
-    "deck", "write-better",
-    "company", "platform", "commercial", "engineering-practice",
-})
-
 ALLOWED_STATUSES = frozenset({"draft", "current", "deprecated", "archived"})
 ALLOWED_VISIBILITY = frozenset({"public", "team", "internal"})
 
@@ -232,8 +167,44 @@ def id_pattern_for(allowed) -> re.Pattern:
         r"^(" + "|".join(sorted(allowed)) + r")/[a-z][a-z-]*/[a-z0-9][a-z0-9-]*\Z")
 
 
-# The baseline set's pattern, for a caller with no knowledge tree in hand.
-ID_PATTERN = id_pattern_for(ALLOWED_PROJECTS)
+def _registry_projects() -> frozenset[str] | None:
+    """platform/decisions/0097 point 1's set — the only list of legal
+    knowledge-base project names: `projects.kb_slugs()` union
+    `projects.scopes()` union `projects.kb_legacy()`. `None` when any of the
+    three could not be read, distinguishably from "the registry is readable
+    and admits nothing" for the same reason each of them returns `None`
+    rather than an empty set.
+
+    The three are read off one snapshot (`projects._snapshot`) taken once
+    here, so they come from one registry generation even when a rewrite
+    lands mid-call (security-reviewer, PR #307 round 1).
+
+    **Every name is held to `_PROJECT_SLUG` here, where registry data
+    enters**, and a name that fails it is dropped. `id_pattern_for` puts
+    these names into a regex unescaped and relies on that rule. The literal
+    list this replaces met it by construction; the registry is written by
+    another repository, whose schema test checks only that `kb_project` is
+    truthy, so a non-string value would otherwise fail `sorted()` at import
+    and stop the Library, and a string holding a regex metacharacter would
+    silently widen `ID_PATTERN` (both reviewers, PR #307 round 1)."""
+    snap = projects._snapshot()
+    kb, scope, legacy = snap.kb_slugs, snap.scopes, snap.kb_legacy
+    if kb is None or scope is None or legacy is None:
+        return None
+    return frozenset(n for n in kb | scope | legacy
+                     if isinstance(n, str) and _PROJECT_SLUG.fullmatch(n))
+
+
+# Computed once, at import, from whatever the registry says at that moment —
+# used ONLY by `validate_frontmatter`'s `catalogue=None` default, for a
+# direct caller with no knowledge tree in hand and no catalogue built for
+# it. `project_catalogue` never reads this pair: it reads the registry LIVE,
+# through `_registry_projects()`, on every call, so a registry edit reaches
+# it without a restart the way every other view in this module does. This
+# pair is fixed for a process's whole life, matching the literal
+# `ALLOWED_PROJECTS`/`ID_PATTERN` pair it replaces, which was equally fixed.
+_BASELINE = _registry_projects() or frozenset()
+ID_PATTERN = id_pattern_for(_BASELINE)
 ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 # Where the knowledge tree lives whose `projects/` directories widen the
@@ -246,17 +217,26 @@ KNOWLEDGE_ROOT = os.environ.get("LIBRARY_KNOWLEDGE_ROOT")
 
 
 class ProjectCatalogue(NamedTuple):
-    """The projects one knowledge tree admits. `allowed` is the baseline plus
-    the tree's valid `projects/` directories (and a `pending` name not yet on
-    disk); `id_pattern` is built from `allowed`; `refused` maps each directory
-    entry or `pending` name that was NOT admitted to why."""
+    """The projects one knowledge tree admits. `allowed` is the registry's
+    admitted set (platform/decisions/0097 point 1) plus the tree's
+    REGISTERED `projects/` directories (and a `pending` name not yet on disk,
+    admitted on the same registry-membership terms); `id_pattern` is built
+    from `allowed`; `refused` maps each directory entry or `pending` name
+    that was NOT admitted to why."""
     allowed: frozenset
     id_pattern: re.Pattern
     refused: dict
 
 
-def _name_refusal(name: str) -> str | None:
-    """Why `name` cannot be a project slug whatever is on disk, or None."""
+def _syntax_and_privacy_refusal(name: str) -> str | None:
+    """Why `name` cannot be a project slug on syntax and privacy grounds
+    alone, irrespective of whether it is a registered project: a retired
+    scope, a private crew, or a name that is not a plain lowercase
+    directory name. `None` when none of these refuses it.
+
+    Shared by `_name_refusal` (which additionally requires registry
+    membership, platform/decisions/0097 point 4) and `project_dir_refusal`
+    (which does not, when the registry cannot be read)."""
     if name in RETIRED_PROJECTS:
         return (f"'{name}' is a retired scope (ARCH-438); nothing may be filed "
                 f"under it")
@@ -267,14 +247,11 @@ def _name_refusal(name: str) -> str | None:
     # a private project's slug and its `repos`, so an alias, a `display`
     # name, a `crew` name or a `home_dir`/`dirs` basename would validate here
     # as an ordinary project while agent-platform's own validator still
-    # refuses it (reviewer finding, PR #160).
+    # refuses it (reviewer finding, PR #160). `None` — the registry could
+    # not be read — is not a private-crew match either way; the caller's own
+    # registry-membership check (or its absence) decides that case.
     private = projects.private_crew_names()
-    if private is None:
-        if name not in ALLOWED_PROJECTS:
-            return (f"'{name}' cannot be admitted: the project registry could "
-                    f"not be read, so private crews cannot be told apart "
-                    f"(platform/decisions/0043)")
-    elif name.casefold() in private:
+    if private is not None and name.casefold() in private:
         return (f"'{name}' is a private crew (platform/decisions/0043); none "
                 f"of its content may reach the Library")
     if not _PROJECT_SLUG.fullmatch(name):
@@ -283,11 +260,38 @@ def _name_refusal(name: str) -> str | None:
     return None
 
 
+def _name_refusal(name: str) -> str | None:
+    """Why `name` cannot be a project slug whatever is on disk, or None.
+
+    Refuses a name outside platform/decisions/0097 point 1's registry set
+    WHETHER OR NOT THE REGISTRY IS READABLE (point 4) — used for a `pending`
+    name, which has no on-disk directory for `project_dir_refusal` to trust
+    instead when the registry cannot be read."""
+    why = _syntax_and_privacy_refusal(name)
+    if why:
+        return why
+    admitted = _registry_projects()
+    if admitted is None:
+        return (f"'{name}' cannot be admitted: the project registry could "
+                f"not be read, so an unregistered name cannot be created "
+                f"(platform/decisions/0097)")
+    if name not in admitted:
+        return f"'{name}' is not a registered project (platform/decisions/0097)"
+    return None
+
+
 def project_dir_refusal(root, name: str) -> str | None:
     """Why `<root>/projects/<name>` is not a project directory, or None when
     it is. `root` is the knowledge tree being validated, never assumed to be
-    `KNOWLEDGE_ROOT`."""
-    why = _name_refusal(name)
+    `KNOWLEDGE_ROOT`.
+
+    When the registry can be read, `name` must also be in its admitted set
+    (platform/decisions/0097 point 4), the same requirement `_name_refusal`
+    applies to a `pending` name. When it cannot, an on-disk directory is
+    admitted anyway, trusting what the knowledge tree already holds rather
+    than refusing every document under it.
+    """
+    why = _syntax_and_privacy_refusal(name)
     if why:
         return why
     path = Path(root) / "projects" / name
@@ -297,6 +301,9 @@ def project_dir_refusal(root, name: str) -> str | None:
         path.resolve().relative_to(Path(root).resolve())
     except ValueError:
         return f"'{name}' is a symlink pointing outside the knowledge tree"
+    admitted = _registry_projects()
+    if admitted is not None and name not in admitted:
+        return f"'{name}' is not a registered project (platform/decisions/0097)"
     return None
 
 
@@ -306,12 +313,20 @@ def project_catalogue(root, pending: str | None = None) -> ProjectCatalogue:
     `root` of `None` — `KNOWLEDGE_ROOT` unset — admits the baseline alone,
     with `pending` ignored: that is today's behaviour, on purpose, so this
     code deploys safely before the tree is wired up. Given a real `root`, a
-    missing or unreadable `projects/` under it likewise admits the baseline
-    (never refuses everything). `pending` names a directory a write is about
-    to create; when it is not already on disk, it is admitted on its name
-    alone.
-    """
-    allowed = set(ALLOWED_PROJECTS)
+    missing `projects/` under it likewise admits the baseline alone. `pending`
+    names a directory a write is about to create; when it is not already on
+    disk, it is admitted only when the registry names it
+    (platform/decisions/0097 point 4) — never on its name alone.
+
+    When the registry cannot be read, the baseline is empty and every
+    on-disk directory is admitted regardless of registry membership
+    (`project_dir_refusal`'s fallback), while every `pending` name is
+    refused (`_name_refusal` has no on-disk directory to trust instead).
+
+    Reads the registry LIVE, through `_registry_projects()`, never the
+    import-time `_BASELINE` — this is the dynamic half of the pair
+    `_BASELINE`/`ID_PATTERN` describe; see their own comment."""
+    allowed = set(_registry_projects() or frozenset())
     refused: dict[str, str] = {}
     names: list[str] = []
     if root is not None:
@@ -355,7 +370,7 @@ def validate_frontmatter(fm, catalogue: ProjectCatalogue | None = None,
 
     `catalogue` is the project set of the knowledge tree the document lives in
     (`project_catalogue`/`catalogue_for_frontmatter`); without one, the
-    baseline `ALLOWED_PROJECTS`/`ID_PATTERN` apply.
+    import-time baseline `_BASELINE`/`ID_PATTERN` applies.
 
     `roster` is the names `GET /roster` currently serves. Without one —
     `None`, not an empty set — an `audience` or `binds_agents` value is left
@@ -437,7 +452,7 @@ def validate_frontmatter(fm, catalogue: ProjectCatalogue | None = None,
     # would otherwise raise `TypeError` uncaught rather than return a
     # validation error, a 500 on caller-controlled JSON reachable by
     # essentially every non-`approved_client` token in the fleet.
-    project_allowed = catalogue.allowed if catalogue else ALLOWED_PROJECTS
+    project_allowed = catalogue.allowed if catalogue else _BASELINE
     id_pattern = catalogue.id_pattern if catalogue else ID_PATTERN
     for field, allowed in (("kind", ALLOWED_KINDS), ("project", project_allowed),
                            ("status", ALLOWED_STATUSES),
@@ -509,7 +524,13 @@ def validate_frontmatter(fm, catalogue: ProjectCatalogue | None = None,
 # agents (`load_crew_registry.py` seeds it from the same superset
 # `validate.py`'s own `ALLOWED_AUDIENCE` is), so a plain membership test
 # would pass them into `binds_agents` unrefused.
-NON_AGENT_GROUPS = frozenset({"consultant", "team", "contractor"})
+#
+# `consultant` is NOT here, though the source listed it: it names
+# `agent-platform/agents/consultant`, a dispatchable agent, and every
+# document addressing `audience: [consultant]` addresses that agent. Listing
+# it made the agent unbindable by any instruction block
+# (`issue_01M350YE8J0KFQ9P73VZQ4CWBD`).
+NON_AGENT_GROUPS = frozenset({"team", "contractor"})
 
 # Shared by `validate_frontmatter`'s roster clause and
 # `frontmatter_needs_roster` below, so the two agree on what "checking a

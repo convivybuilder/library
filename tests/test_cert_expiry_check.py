@@ -24,6 +24,7 @@ import cert_expiry_check as cec
 import machine_identity
 import mtls
 import store
+import store_owner
 import tls_ca
 
 SCHEMA = """
@@ -329,4 +330,66 @@ def test_writes_disabled_is_reported_rather_than_raised(db, monkeypatch):
     monkeypatch.setattr(store, "WRITES_ENABLED", False)
     rc = cec.run(now=NOW)
     assert rc == 1
+    assert _signals(db) == []
+
+
+# --- running as the store's owner (company/decisions/0025 point 5, library
+# issue CQ-225) -------------------------------------------------------------
+#
+# These exercise `cec.main`'s own wiring to `store_owner.reexec_as_db_owner`,
+# never `cec.run` directly — every case above calls that, never `main`, so
+# adding the owner-switch check there leaves every one of them, and the
+# single-account path they cover, untouched. The switch command itself —
+# its exact argv, the capability probe, environment forwarding, and the
+# refusal that leaves nothing run — is `store_owner.py`'s own
+# `tests/test_store_owner.py` to prove with a real stubbed subprocess; a
+# real double re-exec of this whole process is not exercised here, since
+# the `db` fixture's monkeypatched `store.DB_PATH`/`WRITES_ENABLED` are
+# this process's own attributes, invisible to a freshly spawned one.
+
+
+def _run_must_not_be_called(**_k):
+    raise AssertionError("run() must not be called when main() already "
+                         "returned the real work's own exit code")
+
+
+def test_main_proceeds_in_process_when_no_switch_is_needed(db, monkeypatch):
+    """The single-account install's own path: when `store_owner.
+    reexec_as_db_owner` reports no switch was needed (`None`), `cec.main`
+    runs the real check itself, in-process — exactly as it always has."""
+    _register(db, "mini", FP_ACTIVE_INSIDE, "2026-10-15 00:00:00")
+    monkeypatch.setattr(cec.store_owner, "reexec_as_db_owner",
+                        lambda *a, **k: None)
+
+    assert cec.main([]) == 0
+    assert len(_signals(db)) == 1
+
+
+def test_main_propagates_a_switched_runs_exit_code_without_redoing_the_work(
+        db, monkeypatch):
+    """When `reexec_as_db_owner` reports a switch happened (an int — the
+    exit code of the child that already did the real work), `cec.main`
+    returns it directly rather than running the check a second time."""
+    _register(db, "mini", FP_ACTIVE_INSIDE, "2026-10-15 00:00:00")
+    monkeypatch.setattr(cec.store_owner, "reexec_as_db_owner",
+                        lambda *a, **k: 0)
+    monkeypatch.setattr(cec, "run", _run_must_not_be_called)
+
+    assert cec.main([]) == 0
+    assert _signals(db) == [], "nothing may have run in THIS process"
+
+
+def test_main_reports_a_refused_switch_and_runs_nothing(db, monkeypatch, capsys):
+    """When `reexec_as_db_owner` raises `OwnerSwitchRefused`, `cec.main`
+    prints a message naming the owner and returns 1, never calling `run`."""
+    _register(db, "mini", FP_ACTIVE_INSIDE, "2026-10-15 00:00:00")
+
+    def _refuse(*_a, **_k):
+        raise store_owner.OwnerSwitchRefused(store.DB_PATH, "otheruser", "me")
+
+    monkeypatch.setattr(cec.store_owner, "reexec_as_db_owner", _refuse)
+    monkeypatch.setattr(cec, "run", _run_must_not_be_called)
+
+    assert cec.main([]) == 1
+    assert "otheruser" in capsys.readouterr().err
     assert _signals(db) == []

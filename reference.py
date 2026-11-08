@@ -28,16 +28,29 @@ results, and is a different thing from a boundary it cannot cross.
 from __future__ import annotations
 
 import contextlib
+import datetime as _dt
 import json
 import os
 import re
 import sqlite3
+import subprocess
+import sys
 from pathlib import Path
 
 import store
 
 INDEX_DB = Path(os.environ.get(
     "LIBRARY_KB_INDEX", str(Path.home() / ".knowledge-index" / "index.db")))
+
+# The knowledge repository's own checkout, read the same way `INDEX_DB` is —
+# an environment override, falling back to the same path `com.convivy.
+# library.plist` already deploys as `LIBRARY_KNOWLEDGE_ROOT`
+# (`reference_admission.KNOWLEDGE_ROOT`, `profile_sync.KNOWLEDGE_ROOT`). A
+# separate setting rather than reading those: this module reads the index
+# everywhere else, and `GET /reference/history` is its one caller that needs
+# a checkout rather than a database.
+KB_REPO = Path(os.environ.get(
+    "LIBRARY_KB_REPO", str(Path.home() / "Convivy" / "knowledge")))
 
 # ---------------------------------------------------------------------------
 # THESE TWO CONSTANTS ARE DUPLICATED, and the duplication is the risk rather
@@ -212,6 +225,135 @@ def reading():
         raise ReferenceIndexUnavailable(f"{INDEX_DB} could not be read: {e}") from e
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# `GET /reference/history` reads commit history straight from `KB_REPO`
+# rather than the index: the index's `docs` table keeps only `updated_at`,
+# and no row in it remembers what changed, when, or in which commit
+# (issue_01M57NY6JE6371493282RGNS11, for Orient's per-project pages).
+# ---------------------------------------------------------------------------
+
+# Generous but bounded: a hung `git` process would otherwise hold this read
+# route's worker open indefinitely on a path that has no model and no
+# network of its own to time out first.
+GIT_LOG_TIMEOUT_SECONDS = 10
+
+# `%x1e`/`%x1f` are the ASCII record and unit separators, not a literal NUL
+# (`%x00`): a NUL cannot survive inside an argv string at all — it is the C
+# string terminator `execve` itself stops reading at — so it could never
+# delimit commits inside a `--format` argument the way these two bytes can.
+_GIT_LOG_FORMAT = "%x1e%H%x1f%ct%x1f%s"
+_GIT_STATUS_LINE = re.compile(r"^([AMD])\t(.+)$")
+
+# `--no-renames` on the `git log` call below turns every rename into a
+# delete-and-add pair against two different paths, which is why this
+# vocabulary never needs a fourth member for a rename.
+GIT_STATUS_NAMES = {"A": "added", "M": "modified", "D": "deleted"}
+
+
+class GitHistoryUnavailable(RuntimeError):
+    """`git log` against `KB_REPO` could not be run, timed out, or exited
+    non-zero.
+
+    **`.reason` IS FIXED, BOUNDED WORDING A CALLER MAY SEE**, mirroring
+    `store.ColdTierUnavailable`'s own split for the same reason
+    (security-reviewer, issue_01M35R5GA1SKRG2CMQRF189NDE round 2): the full
+    detail — `KB_REPO`'s own filesystem path, and `git`'s stderr — goes to
+    the service log only, through the `print()` at each raise site below,
+    and never to the caller.
+    """
+
+    def __init__(self, reason: str, detail: str):
+        super().__init__(detail)
+        self.reason = reason
+
+
+def _unsafe_project_for_pathspec(project: str) -> bool:
+    """Whether `project` is unsafe to interpolate into a git pathspec: a
+    `..` traversal segment, a leading `:` (git's own pathspec-magic marker),
+    or a `/` (a project is one path segment under `projects/`, never a path
+    of its own).
+
+    Checked here, at the point the pathspec is actually built, in addition
+    to `commit_history`'s caller validating `project` against the index's
+    own `docs.project` values before calling this at all — so a value that
+    somehow slipped past that first check still never reaches git.
+    """
+    return ".." in project or project.startswith(":") or "/" in project
+
+
+def _parse_git_log(output: str) -> list[dict]:
+    """`output` (`_GIT_LOG_FORMAT` plus `--name-status`) as one dict per
+    commit: `commit`, `committed_at` (ISO UTC), `subject`, and `files` — a
+    `(status, path)` pair per line `--name-status` printed, restricted to
+    `A`/`M`/`D` (see `GIT_STATUS_NAMES`).
+    """
+    commits = []
+    for chunk in output.split("\x1e"):
+        if not chunk:
+            continue
+        header, _, rest = chunk.partition("\n")
+        sha, epoch, subject = header.split("\x1f", 2)
+        files = [(m.group(1), m.group(2)) for line in rest.split("\n")
+                 if (m := _GIT_STATUS_LINE.match(line))]
+        committed_at = store._iso(_dt.datetime.fromtimestamp(
+            int(epoch), tz=_dt.timezone.utc))
+        commits.append({"commit": sha, "committed_at": committed_at,
+                        "subject": subject, "files": files})
+    return commits
+
+
+def commit_history(project: str, *, limit: int, offset: int) -> list[dict]:
+    """Recent commits touching `projects/<project>/` in the knowledge
+    repository at `KB_REPO`, newest first — one dict per commit, in
+    `_parse_git_log`'s shape.
+
+    **`limit` AND `offset` BOUND COMMITS, PASSED STRAIGHT TO GIT'S OWN `-n`
+    AND `--skip`** — not a count of the rows a commit's several changed
+    files can expand into, which is what makes `limit=N` match
+    `git log -N --name-status -- projects/<project>/` exactly, the
+    equivalence `issue_01M57NY6JE6371493282RGNS11`'s done-when tests against
+    the live Library.
+
+    **NO SHELL, AN ARGV LIST ONLY, BOUNDED BY `GIT_LOG_TIMEOUT_SECONDS`, AND
+    NO NETWORK CALL.** `origin/main` is named explicitly and read as the
+    checkout already has it — this never fetches, pulls, or checks anything
+    out, matching every other way this service touches the `knowledge`
+    repository.
+
+    Raises `GitHistoryUnavailable` on a timeout or a non-zero exit, never
+    returning a partial list. Raises `ValueError` if `project` is unsafe for
+    a git pathspec — the caller validates `project` against the index's
+    `docs.project` values first, so this is defence in depth rather than
+    the primary guard.
+    """
+    if _unsafe_project_for_pathspec(project):
+        raise ValueError(f"unsafe project for a git pathspec: {project!r}")
+    pathspec = f"projects/{project}/"
+    argv = ["git", "-C", str(KB_REPO), "--no-pager", "log", "--no-renames",
+            "--name-status", f"--format={_GIT_LOG_FORMAT}", f"-n{limit}",
+            f"--skip={offset}", "origin/main", "--", pathspec]
+    try:
+        result = subprocess.run(argv, capture_output=True, text=True,
+                                timeout=GIT_LOG_TIMEOUT_SECONDS, check=False)
+    except subprocess.TimeoutExpired:
+        print(f"library: git log timed out after {GIT_LOG_TIMEOUT_SECONDS}s "
+              f"against {KB_REPO}: {argv}", file=sys.stderr)
+        raise GitHistoryUnavailable(
+            "git log timed out",
+            f"git log timed out after {GIT_LOG_TIMEOUT_SECONDS}s") from None
+    except OSError as e:
+        print(f"library: git log could not be run against {KB_REPO}: {e}",
+              file=sys.stderr)
+        raise GitHistoryUnavailable("git could not be run", str(e)) from e
+    if result.returncode != 0:
+        print(f"library: git log exited {result.returncode} against "
+              f"{KB_REPO}: {result.stderr.strip()}", file=sys.stderr)
+        raise GitHistoryUnavailable(
+            f"git log exited with status {result.returncode}",
+            result.stderr.strip())
+    return _parse_git_log(result.stdout)
 
 
 def build_match(query: str) -> str | None:

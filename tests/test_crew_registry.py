@@ -37,6 +37,7 @@ def db(tmp_path, monkeypatch):
         CREATE TABLE roster_agents (
             id INTEGER PRIMARY KEY,
             name TEXT NOT NULL UNIQUE,
+            source_doc TEXT,
             created_at TEXT NOT NULL,
             created_by TEXT NOT NULL,
             updated_at TEXT NOT NULL,
@@ -109,15 +110,15 @@ def test_an_orchestrator_credential_lands(db):
 
 def test_a_worker_is_refused_profile_put(db):
     with pytest.raises(crew_registry.RosterWriteForbidden):
-        crew_registry.profile_put(WORKER, "hollis", "daytime", [], [])
+        crew_registry.profile_put(WORKER, "bramwell", "daytime", [], [])
     assert _profile_rows(db) == []
 
 
 def test_an_orchestrator_can_write_a_profile(db):
     row = crew_registry.profile_put(
-        ORCHESTRATOR, "hollis", "daytime",
-        [{"kind": "agent", "audience_contains": ["hollis-coder"]}], [])
-    assert row["project"] == "hollis" and row["variant"] == "daytime"
+        ORCHESTRATOR, "bramwell", "daytime",
+        [{"kind": "agent", "audience_contains": ["bramwell-coder"]}], [])
+    assert row["project"] == "bramwell" and row["variant"] == "daytime"
 
 
 def test_a_worker_is_refused_roster_remove(db):
@@ -128,9 +129,9 @@ def test_a_worker_is_refused_roster_remove(db):
 
 
 def test_a_worker_is_refused_profile_delete(db):
-    crew_registry.profile_put(ORCHESTRATOR, "hollis", "daytime", [], [])
+    crew_registry.profile_put(ORCHESTRATOR, "bramwell", "daytime", [], [])
     with pytest.raises(crew_registry.RosterWriteForbidden):
-        crew_registry.profile_delete(WORKER, "hollis", "daytime")
+        crew_registry.profile_delete(WORKER, "bramwell", "daytime")
     assert _profile_rows(db) != []
 
 
@@ -233,14 +234,14 @@ def test_roster_remove_refuses_an_oversized_actor(db):
 def test_profile_put_refuses_an_oversized_actor(db):
     with pytest.raises(crew_registry.InvalidRosterRow, match="actor"):
         crew_registry.profile_put(
-            _oversized_actor(), "hollis", "daytime", [], [])
+            _oversized_actor(), "bramwell", "daytime", [], [])
     assert _profile_rows(db) == []
 
 
 def test_profile_delete_refuses_an_oversized_actor(db):
-    crew_registry.profile_put(ORCHESTRATOR, "hollis", "daytime", [], [])
+    crew_registry.profile_put(ORCHESTRATOR, "bramwell", "daytime", [], [])
     with pytest.raises(crew_registry.InvalidRosterRow, match="actor"):
-        crew_registry.profile_delete(_oversized_actor(), "hollis", "daytime")
+        crew_registry.profile_delete(_oversized_actor(), "bramwell", "daytime")
     assert _profile_rows(db) != []
 
 
@@ -258,51 +259,51 @@ def test_the_actor_bound_is_checked_after_the_capability_check(db):
 
 
 def test_putting_the_same_profile_twice_does_not_duplicate_the_row(db):
-    crew_registry.profile_put(ORCHESTRATOR, "hollis", "daytime", [], [])
-    crew_registry.profile_put(ORCHESTRATOR, "hollis", "daytime", [], [])
+    crew_registry.profile_put(ORCHESTRATOR, "bramwell", "daytime", [], [])
+    crew_registry.profile_put(ORCHESTRATOR, "bramwell", "daytime", [], [])
     assert len(_profile_rows(db)) == 1
 
 
 def test_putting_again_replaces_the_selection_rules(db):
     crew_registry.profile_put(
-        ORCHESTRATOR, "hollis", "daytime",
-        [{"kind": "agent", "audience_contains": ["hollis-coder"]}], ["a"])
+        ORCHESTRATOR, "bramwell", "daytime",
+        [{"kind": "agent", "audience_contains": ["bramwell-coder"]}], ["a"])
     row = crew_registry.profile_put(
-        ORCHESTRATOR, "hollis", "daytime",
-        [{"kind": "agent", "audience_contains": ["hollis-reviewer"]}], ["b"])
+        ORCHESTRATOR, "bramwell", "daytime",
+        [{"kind": "agent", "audience_contains": ["bramwell-reviewer"]}], ["b"])
     assert row["include"] == [
-        {"kind": "agent", "audience_contains": ["hollis-reviewer"]}]
+        {"kind": "agent", "audience_contains": ["bramwell-reviewer"]}]
     assert row["claude_md_extras"] == ["b"]
 
 
 def test_different_variants_of_the_same_project_are_distinct_rows(db):
-    crew_registry.profile_put(ORCHESTRATOR, "hollis", "daytime", [], [])
-    crew_registry.profile_put(ORCHESTRATOR, "hollis", "overnight", [], [])
+    crew_registry.profile_put(ORCHESTRATOR, "bramwell", "daytime", [], [])
+    crew_registry.profile_put(ORCHESTRATOR, "bramwell", "overnight", [], [])
     assert len(_profile_rows(db)) == 2
 
 
 def test_include_and_claude_md_extras_round_trip_through_json(db):
-    include = [{"kind": "skill", "project": ["hollis", "platform"],
+    include = [{"kind": "skill", "project": ["bramwell", "platform"],
                "status": "current"}]
     extras = ["one block", "another block"]
     row = crew_registry.profile_put(
-        ORCHESTRATOR, "hollis", "daytime", include, extras)
+        ORCHESTRATOR, "bramwell", "daytime", include, extras)
     assert row["include"] == include
     assert row["claude_md_extras"] == extras
 
 
 def test_deleting_a_profile_that_does_not_exist_returns_none(db):
-    assert crew_registry.profile_delete(ORCHESTRATOR, "hollis", "daytime") \
+    assert crew_registry.profile_delete(ORCHESTRATOR, "bramwell", "daytime") \
         is None
 
 
 def test_deleting_removes_the_row_and_returns_it_decoded(db):
     crew_registry.profile_put(
-        ORCHESTRATOR, "hollis", "daytime",
-        [{"kind": "agent", "audience_contains": ["hollis-coder"]}], ["x"])
-    row = crew_registry.profile_delete(ORCHESTRATOR, "hollis", "daytime")
+        ORCHESTRATOR, "bramwell", "daytime",
+        [{"kind": "agent", "audience_contains": ["bramwell-coder"]}], ["x"])
+    row = crew_registry.profile_delete(ORCHESTRATOR, "bramwell", "daytime")
     assert row["include"] == [
-        {"kind": "agent", "audience_contains": ["hollis-coder"]}]
+        {"kind": "agent", "audience_contains": ["bramwell-coder"]}]
     assert row["claude_md_extras"] == ["x"]
     assert _profile_rows(db) == []
 
@@ -313,20 +314,20 @@ def test_deleting_removes_the_row_and_returns_it_decoded(db):
 def test_include_must_be_a_list(db):
     with pytest.raises(crew_registry.InvalidRosterRow, match="include"):
         crew_registry.profile_put(
-            ORCHESTRATOR, "hollis", "daytime", "not-a-list", [])
+            ORCHESTRATOR, "bramwell", "daytime", "not-a-list", [])
     assert _profile_rows(db) == []
 
 
 def test_an_include_block_must_be_an_object(db):
     with pytest.raises(crew_registry.InvalidRosterRow, match=r"include\[0\]"):
         crew_registry.profile_put(
-            ORCHESTRATOR, "hollis", "daytime", ["not-a-dict"], [])
+            ORCHESTRATOR, "bramwell", "daytime", ["not-a-dict"], [])
 
 
 def test_an_include_block_needs_a_kind(db):
     with pytest.raises(crew_registry.InvalidRosterRow, match="kind"):
         crew_registry.profile_put(
-            ORCHESTRATOR, "hollis", "daytime", [{"project": ["hollis"]}], [])
+            ORCHESTRATOR, "bramwell", "daytime", [{"project": ["bramwell"]}], [])
 
 
 @pytest.mark.parametrize("field", ["model", "tools", "allowed_tools",
@@ -337,7 +338,7 @@ def test_an_include_block_may_not_carry_a_definition_field(db, field):
     that keeps this write path from becoming a side door around it."""
     with pytest.raises(crew_registry.InvalidRosterRow, match="ARCH-134"):
         crew_registry.profile_put(
-            ORCHESTRATOR, "hollis", "daytime",
+            ORCHESTRATOR, "bramwell", "daytime",
             [{"kind": "agent", field: "whatever"}], [])
     assert _profile_rows(db) == []
 
@@ -346,7 +347,7 @@ def test_an_include_block_rejects_an_unrecognised_field(db):
     with pytest.raises(crew_registry.InvalidRosterRow,
                         match="unrecognised"):
         crew_registry.profile_put(
-            ORCHESTRATOR, "hollis", "daytime",
+            ORCHESTRATOR, "bramwell", "daytime",
             [{"kind": "agent", "made_up_field": "x"}], [])
 
 
@@ -354,20 +355,20 @@ def test_claude_md_extras_must_be_a_list(db):
     with pytest.raises(crew_registry.InvalidRosterRow,
                         match="claude_md_extras"):
         crew_registry.profile_put(
-            ORCHESTRATOR, "hollis", "daytime", [], "not-a-list")
+            ORCHESTRATOR, "bramwell", "daytime", [], "not-a-list")
 
 
 def test_a_claude_md_extras_block_must_be_a_non_empty_string(db):
     with pytest.raises(crew_registry.InvalidRosterRow,
                         match=r"claude_md_extras\[0\]"):
-        crew_registry.profile_put(ORCHESTRATOR, "hollis", "daytime", [], [""])
+        crew_registry.profile_put(ORCHESTRATOR, "bramwell", "daytime", [], [""])
 
 
 def test_an_oversized_claude_md_extras_block_is_refused(db):
     with pytest.raises(crew_registry.InvalidRosterRow,
                         match=r"claude_md_extras\[0\]"):
         crew_registry.profile_put(
-            ORCHESTRATOR, "hollis", "daytime", [],
+            ORCHESTRATOR, "bramwell", "daytime", [],
             ["x" * (crew_registry.MAX_EXTRA_BLOCK + 1)])
     assert _profile_rows(db) == []
 
@@ -378,18 +379,18 @@ def test_an_oversized_project_or_variant_is_refused(db):
             ORCHESTRATOR, "p" * (store.MAX_IDENT + 1), "daytime", [], [])
     with pytest.raises(crew_registry.InvalidRosterRow, match="variant"):
         crew_registry.profile_put(
-            ORCHESTRATOR, "hollis", "v" * (store.MAX_IDENT + 1), [], [])
+            ORCHESTRATOR, "bramwell", "v" * (store.MAX_IDENT + 1), [], [])
 
 
 def test_invalid_input_does_not_touch_an_existing_profile(db):
     crew_registry.profile_put(
-        ORCHESTRATOR, "hollis", "daytime",
-        [{"kind": "agent", "audience_contains": ["hollis-coder"]}], [])
+        ORCHESTRATOR, "bramwell", "daytime",
+        [{"kind": "agent", "audience_contains": ["bramwell-coder"]}], [])
     with pytest.raises(crew_registry.InvalidRosterRow):
         crew_registry.profile_put(
-            ORCHESTRATOR, "hollis", "daytime", "not-a-list", [])
+            ORCHESTRATOR, "bramwell", "daytime", "not-a-list", [])
     row = _profile_rows(db)[0]
-    assert "hollis-coder" in row["include"]
+    assert "bramwell-coder" in row["include"]
 
 
 # --- the shadow gate ---------------------------------------------------------
@@ -404,4 +405,4 @@ def test_roster_add_refuses_while_writes_are_disabled(db, monkeypatch):
 def test_profile_put_refuses_while_writes_are_disabled(db, monkeypatch):
     monkeypatch.setattr(store, "WRITES_ENABLED", False)
     with pytest.raises(store.WritesDisabled):
-        crew_registry.profile_put(ORCHESTRATOR, "hollis", "daytime", [], [])
+        crew_registry.profile_put(ORCHESTRATOR, "bramwell", "daytime", [], [])

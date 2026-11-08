@@ -42,7 +42,7 @@ import vectors
 
 REPO = Path(__file__).resolve().parent.parent
 
-AGENT = "agent-token-vivy"
+AGENT = "agent-token-fennick"
 WIDE = "agent-token-wide"
 NOREF = "agent-token-noref"
 REVIEWER = "agent-token-reviewer"
@@ -53,37 +53,37 @@ REPO_AND_CREW = "agent-token-repo-and-crew"
 PHRASE = "zylofoam gasket"
 
 DOCS = [
-    # kind=spec, current, vivy — the one every "found by the phrase" assertion
+    # kind=spec, current, fennick — the one every "found by the phrase" assertion
     # anchors on.
-    ("vivy/specs/gasket", "spec", "vivy", "current",
+    ("fennick/specs/gasket", "spec", "fennick", "current",
      f"the {PHRASE} spec describes the seal"),
     # Same phrase, another product — narrowed out by a `product` filter but
     # NOT by scope: the Reference Room is deliberately not product-scoped
-    # (reference.py's own module docstring), so a vivy-scoped caller still
+    # (reference.py's own module docstring), so a fennick-scoped caller still
     # sees this one and the product-scope test below asserts exactly that.
-    ("constance/specs/gasket", "spec", "constance", "current",
+    ("marlow/specs/gasket", "spec", "marlow", "current",
      f"a {PHRASE} appears here too"),
     # Archived — excluded by `reference.DEFAULT_STATUSES`, the same default
     # `/reference/search` applies. This is the "restricted document" case.
-    ("vivy/decisions/old-gasket", "decision", "vivy", "archived",
+    ("fennick/decisions/old-gasket", "decision", "fennick", "archived",
      f"an old {PHRASE} decision nobody should see by default"),
 ]
 
 ITEMS = [
     # The phrase is in the BODY ONLY — the title carries none of it, so this
     # is only findable through the text search this route adds.
-    ("item_vivy_gasket", "vivy", "bug", "An open item",
+    ("item_fennick_gasket", "fennick", "bug", "An open item",
      f"investigate the {PHRASE} failure"),
-    ("item_constance_gasket", "constance", "task", "Something else",
-     f"a {PHRASE} filed under constance"),
+    ("item_marlow_gasket", "marlow", "task", "Something else",
+     f"a {PHRASE} filed under marlow"),
 ]
 
 SIGNALS = [
-    ("sig_vivy_gasket", "vivy", "note", "internal", f"observed a {PHRASE}"),
-    ("sig_vivy_customer_gasket", "vivy", "note", "customer",
+    ("sig_fennick_gasket", "fennick", "note", "internal", f"observed a {PHRASE}"),
+    ("sig_fennick_customer_gasket", "fennick", "note", "customer",
      f"a customer mentioned a {PHRASE}"),
-    ("sig_constance_gasket", "constance", "note", "internal",
-     f"a {PHRASE} over in constance"),
+    ("sig_marlow_gasket", "marlow", "note", "internal",
+     f"a {PHRASE} over in marlow"),
 ]
 
 # Each of these is a review record's own linked signal — the only way Reviews
@@ -91,20 +91,20 @@ SIGNALS = [
 # matches the real shape `review_record_backfill.py` links, for realism only;
 # nothing here depends on `kind`.
 REVIEW_SIGNALS = [
-    ("sig_review_vivy_gasket", "vivy", "pr_comment", "internal",
+    ("sig_review_fennick_gasket", "fennick", "pr_comment", "internal",
      f"the {PHRASE} review looks solid"),
-    ("sig_review_constance_gasket", "constance", "pr_comment", "internal",
+    ("sig_review_marlow_gasket", "marlow", "pr_comment", "internal",
      f"the {PHRASE} review needs another pass"),
 ]
 
 # key, signal_id, product, repo_identity, pr, reviewed_ref, verdict, prose.
-# The `constance` row's `pr` is `None`, so its title names `reviewed_ref`
+# The `marlow` row's `pr` is `None`, so its title names `reviewed_ref`
 # instead — the branch the route's title-building takes when there is no PR.
 REVIEWS = [
-    ("vivy", "sig_review_vivy_gasket", "vivy", "github:vivy/widgets", 42,
+    ("fennick", "sig_review_fennick_gasket", "fennick", "github:fennick/widgets", 42,
      "a" * 40, "APPROVE", f"the {PHRASE} review looks solid"),
-    ("constance", "sig_review_constance_gasket", "constance",
-     "github:constance/widgets", None, "b" * 40, "REQUEST_CHANGES",
+    ("marlow", "sig_review_marlow_gasket", "marlow",
+     "github:marlow/widgets", None, "b" * 40, "REQUEST_CHANGES",
      f"the {PHRASE} review needs another pass"),
 ]
 
@@ -131,7 +131,7 @@ def _seed_review(*, signal_id, product, repo_identity, pr, reviewed_ref,
         "reviewed_ref": reviewed_ref, "role": "reviewer", "run_id": None,
         "verdict": verdict, "findings": [], "prose": prose,
         "paths": [], "doc_ids": [], "item_ids": [],
-        "auth": "unverified", "auth_reason": "no run",
+        "auth": "unverified", "auth_reason": "no run", "verdict_bound": False,
         "source_comment_id": None,
     }
     _, _, out = store.write_review_record(row)
@@ -154,7 +154,7 @@ def _seed_new_style_review(*, product, repo_identity, pr, reviewed_ref,
         "reviewed_ref": reviewed_ref, "role": "reviewer", "run_id": None,
         "verdict": verdict, "findings": [], "prose": prose,
         "paths": [], "doc_ids": [], "item_ids": [],
-        "auth": "unverified", "auth_reason": "no run",
+        "auth": "unverified", "auth_reason": "no run", "verdict_bound": False,
         "source_comment_id": None,
     }
     _, _, out = store.write_review_record(row)
@@ -217,7 +217,7 @@ def client(tmp_path, monkeypatch, vector_index):
 
     tokens = tmp_path / "api-tokens.json"
     tokens.write_text(json.dumps({
-        AGENT: {"name": "vivy-agent", "products": ["vivy"]},
+        AGENT: {"name": "fennick-agent", "products": ["fennick"]},
         # **`review_record.read` WITHHELD**, the same grants/withholds
         # mechanism `NOREF` below uses for `reference.read`: `agent` is
         # granted it by default (`identity.ROLE_CAPS`), and this file uses
@@ -289,9 +289,9 @@ def _keys(body):
 def test_a_document_an_item_and_a_signal_sharing_a_phrase_all_come_back(client):
     body = _search(client).json()
     keys = _keys(body)
-    assert ("reference", "vivy/specs/gasket") in keys
-    assert ("chart-house", "item_vivy_gasket") in keys
-    assert ("archives", "sig_vivy_gasket") in keys
+    assert ("reference", "fennick/specs/gasket") in keys
+    assert ("chart-house", "item_fennick_gasket") in keys
+    assert ("archives", "sig_fennick_gasket") in keys
     assert {"searched"} <= set(body)
     assert set(body["searched"]) == {"reference", "archives", "chart-house"}
     # `WIDE` withholds `review_record.read` (see the fixture) so the other
@@ -311,10 +311,10 @@ def test_a_document_a_work_item_and_a_review_record_sharing_a_phrase_all_come_ba
     rule below) and the review record itself takes its place."""
     body = _search(client, token=REVIEWER).json()
     keys = _keys(body)
-    assert ("reference", "vivy/specs/gasket") in keys
-    assert ("chart-house", "item_vivy_gasket") in keys
-    assert ("reviews", client.review_ids["vivy"]) in keys
-    assert ("archives", "sig_review_vivy_gasket") not in keys
+    assert ("reference", "fennick/specs/gasket") in keys
+    assert ("chart-house", "item_fennick_gasket") in keys
+    assert ("reviews", client.review_ids["fennick"]) in keys
+    assert ("archives", "sig_review_fennick_gasket") not in keys
 
 
 def test_every_result_carries_the_documented_fields(client):
@@ -327,9 +327,9 @@ def test_every_result_carries_the_documented_fields(client):
 def test_a_work_item_is_found_by_a_phrase_only_in_its_body(client):
     body = _search(client).json()
     hit = next(r for r in body["results"]
-              if r["vault"] == "chart-house" and r["id"] == "item_vivy_gasket")
+              if r["vault"] == "chart-house" and r["id"] == "item_fennick_gasket")
     assert PHRASE not in hit["title"].lower()
-    assert hit["read_route"] == "/items/item_vivy_gasket"
+    assert hit["read_route"] == "/items/item_fennick_gasket"
 
 
 def test_the_same_query_twice_returns_the_same_order(client):
@@ -346,27 +346,27 @@ def test_the_vault_filter_narrows_to_one_vault(client):
     body = _search(client, token=AGENT, vault="archives").json()
     assert body["searched"] == ["archives"]
     assert all(r["vault"] == "archives" for r in body["results"])
-    assert _keys(body) == {("archives", "sig_vivy_gasket")}
+    assert _keys(body) == {("archives", "sig_fennick_gasket")}
 
 
 def test_the_vault_filter_narrows_to_reviews_alone(client):
     body = _search(client, token=REVIEWER, vault="reviews").json()
     assert body["searched"] == ["reviews"]
     assert all(r["vault"] == "reviews" for r in body["results"])
-    assert _keys(body) == {("reviews", client.review_ids["vivy"]),
-                           ("reviews", client.review_ids["constance"])}
-    vivy = next(r for r in body["results"]
-               if r["id"] == client.review_ids["vivy"])
-    assert "github:vivy/widgets" in vivy["title"]
-    assert "42" in vivy["title"]
-    assert "APPROVE" in vivy["title"]
-    assert vivy["read_route"] == f"/review-records/{client.review_ids['vivy']}"
-    assert PHRASE in vivy["snippet"]
-    constance = next(r for r in body["results"]
-                     if r["id"] == client.review_ids["constance"])
+    assert _keys(body) == {("reviews", client.review_ids["fennick"]),
+                           ("reviews", client.review_ids["marlow"])}
+    fennick = next(r for r in body["results"]
+               if r["id"] == client.review_ids["fennick"])
+    assert "github:fennick/widgets" in fennick["title"]
+    assert "42" in fennick["title"]
+    assert "APPROVE" in fennick["title"]
+    assert fennick["read_route"] == f"/review-records/{client.review_ids['fennick']}"
+    assert PHRASE in fennick["snippet"]
+    marlow = next(r for r in body["results"]
+                     if r["id"] == client.review_ids["marlow"])
     # `pr` is `None` on this one, so the title names `reviewed_ref` instead.
-    assert ("b" * 40) in constance["title"]
-    assert "REQUEST_CHANGES" in constance["title"]
+    assert ("b" * 40) in marlow["title"]
+    assert "REQUEST_CHANGES" in marlow["title"]
 
 
 def test_a_review_records_kind_review_record_signal_is_found_by_its_prose(
@@ -379,7 +379,7 @@ def test_a_review_records_kind_review_record_signal_is_found_by_its_prose(
     never reaches the exact-membership assertions the other `vault=reviews`
     tests make against `REVIEWS` alone."""
     review_id = _seed_new_style_review(
-        product="vivy", repo_identity="github:vivy/widgets", pr=43,
+        product="fennick", repo_identity="github:fennick/widgets", pr=43,
         reviewed_ref="c" * 40, verdict="APPROVE",
         prose=f"the {NEW_STYLE_PHRASE} review looks solid")
     body = _search(client, token=REVIEWER, vault="reviews",
@@ -396,8 +396,8 @@ def test_vault_reviews_alone_needs_no_signal_read(client):
     for."""
     body = _search(client, token=NOSIGNAL, vault="reviews").json()
     assert body["searched"] == ["reviews"]
-    assert _keys(body) == {("reviews", client.review_ids["vivy"]),
-                           ("reviews", client.review_ids["constance"])}
+    assert _keys(body) == {("reviews", client.review_ids["fennick"]),
+                           ("reviews", client.review_ids["marlow"])}
     assert not any(r["vault"] == "archives" for r in body["results"])
 
 
@@ -422,14 +422,14 @@ def test_the_product_filter_narrows_every_vault_at_once(client):
     filter there, exactly as it is here, so this asserts the `product` filter
     narrows it exactly the way it narrows the other two: by request, not by
     identity."""
-    body = _search(client, product="vivy").json()
+    body = _search(client, product="fennick").json()
     keys = _keys(body)
-    assert ("reference", "vivy/specs/gasket") in keys
-    assert ("chart-house", "item_vivy_gasket") in keys
-    assert ("archives", "sig_vivy_gasket") in keys
-    assert ("reference", "constance/specs/gasket") not in keys
-    assert ("chart-house", "item_constance_gasket") not in keys
-    assert ("archives", "sig_constance_gasket") not in keys
+    assert ("reference", "fennick/specs/gasket") in keys
+    assert ("chart-house", "item_fennick_gasket") in keys
+    assert ("archives", "sig_fennick_gasket") in keys
+    assert ("reference", "marlow/specs/gasket") not in keys
+    assert ("chart-house", "item_marlow_gasket") not in keys
+    assert ("archives", "sig_marlow_gasket") not in keys
 
 
 def test_kind_is_refused_with_no_vault_filter(client):
@@ -466,8 +466,8 @@ def test_kind_is_accepted_and_narrows_against_reference(client):
     `LIMIT` — exact, not windowed — so it stays allowed here. `kind=spec`
     matches the document's `kind` column and narrows to the two specs."""
     body = _search(client, kind="spec", vault="reference").json()
-    assert _keys(body) == {("reference", "vivy/specs/gasket"),
-                           ("reference", "constance/specs/gasket")}
+    assert _keys(body) == {("reference", "fennick/specs/gasket"),
+                           ("reference", "marlow/specs/gasket")}
 
 
 # --- authorization: reused from each vault's own route, never re-implemented -
@@ -491,32 +491,32 @@ def test_without_review_record_read_reviews_is_silently_omitted(client):
 
 def test_a_product_scoped_caller_sees_nothing_from_another_product_in_the_scoped_vaults(
         client):
-    """`AGENT` is scoped to `vivy` alone. The Chart House and the Archives are
+    """`AGENT` is scoped to `fennick` alone. The Chart House and the Archives are
     product-scoped through `_scope_clause`, the exact function `GET /items`
-    and `GET /signals/search` already call, so a constance row from either is
+    and `GET /signals/search` already call, so a marlow row from either is
     absent — not merely unranked. The Reference Room is unaffected, matching
     its own route (see the product-filter test above for why)."""
     body = _search(client, token=AGENT).json()
     keys = _keys(body)
-    assert ("chart-house", "item_constance_gasket") not in keys
-    assert ("archives", "sig_constance_gasket") not in keys
-    assert ("chart-house", "item_vivy_gasket") in keys
-    assert ("archives", "sig_vivy_gasket") in keys
+    assert ("chart-house", "item_marlow_gasket") not in keys
+    assert ("archives", "sig_marlow_gasket") not in keys
+    assert ("chart-house", "item_fennick_gasket") in keys
+    assert ("archives", "sig_fennick_gasket") in keys
 
 
 def test_a_product_scoped_caller_sees_no_other_products_review_record(client):
-    """`AGENT` is scoped to `vivy` alone and holds `review_record.read` by
+    """`AGENT` is scoped to `fennick` alone and holds `review_record.read` by
     default (`identity.ROLE_CAPS["agent"]`) — Reviews is scoped by
     `_scope_clause` on `review_records.product`, the exact function every
-    other vector vault above already uses, so the `constance` review record
+    other vector vault above already uses, so the `marlow` review record
     is absent rather than merely unranked."""
     body = _search(client, token=AGENT, vault="reviews").json()
-    assert _keys(body) == {("reviews", client.review_ids["vivy"])}
+    assert _keys(body) == {("reviews", client.review_ids["fennick"])}
 
 
 def test_without_signal_customer_no_customer_class_signal_comes_back(client):
     body = _search(client, token=AGENT).json()
-    assert ("archives", "sig_vivy_customer_gasket") not in _keys(body)
+    assert ("archives", "sig_fennick_customer_gasket") not in _keys(body)
 
 
 def test_a_restricted_document_is_absent(client):
@@ -524,7 +524,7 @@ def test_a_restricted_document_is_absent(client):
     `/reference/search` excludes it by default — reused, not re-decided
     here."""
     body = _search(client).json()
-    assert ("reference", "vivy/decisions/old-gasket") not in _keys(body)
+    assert ("reference", "fennick/decisions/old-gasket") not in _keys(body)
 
 
 def _seed_mismatched_review(client):
@@ -583,17 +583,17 @@ def test_a_caller_scoped_to_both_products_gets_the_record_not_the_signal(
 
 def test_with_review_record_read_the_linked_signal_is_absent_and_the_record_present(
         client):
-    body = _search(client, token=REVIEWER, product="vivy").json()
+    body = _search(client, token=REVIEWER, product="fennick").json()
     keys = _keys(body)
-    assert ("archives", "sig_review_vivy_gasket") not in keys
-    assert ("reviews", client.review_ids["vivy"]) in keys
+    assert ("archives", "sig_review_fennick_gasket") not in keys
+    assert ("reviews", client.review_ids["fennick"]) in keys
 
 
 def test_without_review_record_read_the_signal_is_present_and_no_record_comes_back(
         client):
-    body = _search(client, token=WIDE, product="vivy").json()
+    body = _search(client, token=WIDE, product="fennick").json()
     keys = _keys(body)
-    assert ("archives", "sig_review_vivy_gasket") in keys
+    assert ("archives", "sig_review_fennick_gasket") in keys
     assert not any(r["vault"] == "reviews" for r in body["results"])
 
 
@@ -603,10 +603,10 @@ def test_the_swap_applies_to_vault_archives_alone_even_without_vault_reviews(
     `review_record.read` caller whether or not that caller also asked for
     `vault=reviews`."""
     body = _search(client, token=REVIEWER, vault="archives",
-                   product="vivy").json()
+                   product="fennick").json()
     assert body["searched"] == ["archives"]
-    assert ("archives", "sig_review_vivy_gasket") not in _keys(body)
-    assert ("archives", "sig_vivy_gasket") in _keys(body)
+    assert ("archives", "sig_review_fennick_gasket") not in _keys(body)
+    assert ("archives", "sig_fennick_gasket") in _keys(body)
 
 
 # --- the vector index being unavailable is reported, not silently dropped --
@@ -623,7 +623,7 @@ def test_an_unavailable_vector_index_is_reported_as_not_searched(
     assert "chart-house" not in body["searched"]
     # The Reference Room does not depend on the vector index at all.
     assert "reference" in body["searched"]
-    assert ("reference", "vivy/specs/gasket") in _keys(body)
+    assert ("reference", "fennick/specs/gasket") in _keys(body)
 
 
 def test_an_unavailable_vector_index_also_reports_reviews_as_not_searched(
@@ -676,9 +676,9 @@ def _ranked_archives_window(client, monkeypatch):
         "INSERT INTO signals (id, product, kind, body, privacy_class, "
         "ingested_at, source, actor, ingested_by, refs, meta) "
         "VALUES (?,?,?,?,?,?,'test','test','test','[]','{}')",
-        [("sig_near_vivy", "vivy", "note", "a near row", "internal",
+        [("sig_near_fennick", "fennick", "note", "a near row", "internal",
           _ts(days=1)),
-         ("sig_near_constance", "constance", "note", "a near row too",
+         ("sig_near_marlow", "marlow", "note", "a near row too",
           "internal", _ts(days=1)),
          ("sig_far_rare", "rare", "note", "a far row", "internal",
           _ts(days=1))])
@@ -701,7 +701,7 @@ def _ranked_archives_window(client, monkeypatch):
 
     # Ascending distance from an all-zero query vector: the two near rows
     # fall inside a size-2 window, the far one does not.
-    for sid, seed in (("sig_near_vivy", 0.0), ("sig_near_constance", 0.1),
+    for sid, seed in (("sig_near_fennick", 0.0), ("sig_near_marlow", 0.1),
                       ("sig_far_rare", 0.9)):
         vconn.execute(
             f"INSERT INTO {vectors.VEC_TABLE}(embedding, vault, item_id) "
@@ -717,7 +717,7 @@ def _ranked_archives_window(client, monkeypatch):
 def test_a_product_filter_matching_only_a_row_outside_the_window_reports_filtered_out(
         client, monkeypatch):
     """`?product=rare&limit=1` gives a window of 2, which holds
-    `sig_near_vivy` and `sig_near_constance` and never reaches
+    `sig_near_fennick` and `sig_near_marlow` and never reaches
     `sig_far_rare` at all. Neither window row is `rare`, so the page is
     empty — and `filtered_out` says that is the caller's own filter, not
     an empty corpus."""
@@ -737,7 +737,7 @@ def test_a_product_filter_matching_only_a_row_outside_the_window_reports_filtere
 
 def test_a_scoped_callers_filtered_out_excludes_rows_the_scope_wall_removed(
         client, monkeypatch):
-    """AGENT is scoped to `vivy` alone, so `sig_near_constance` never
+    """AGENT is scoped to `fennick` alone, so `sig_near_marlow` never
     reaches its scoped window at all — the scope clause removes it before
     `filtered_out` starts counting, leaving one row for the caller's own
     `product` filter to remove. WIDE sees both near rows, so its `product`
@@ -763,9 +763,9 @@ def _ranked_chart_house_window(client, monkeypatch):
         "severity, needs, created_by_kind, created_by, created_at, refs, "
         "topics) VALUES "
         "(?,?,?,?,?,'open','medium','agent','agent','agent',?,'[]','[]')",
-        [("item_near_vivy", "vivy", "bug", "a near item", "a near item",
+        [("item_near_fennick", "fennick", "bug", "a near item", "a near item",
           _ts(days=1)),
-         ("item_near_constance", "constance", "bug", "a near item too",
+         ("item_near_marlow", "marlow", "bug", "a near item too",
           "a near item too", _ts(days=1)),
          ("item_far_rare", "rare", "bug", "a far item", "a far item",
           _ts(days=1))])
@@ -785,7 +785,7 @@ def _ranked_chart_house_window(client, monkeypatch):
 
     # Ascending distance from an all-zero query vector: the two near rows
     # fall inside a size-2 window, the far one does not.
-    for iid, seed in (("item_near_vivy", 0.0), ("item_near_constance", 0.1),
+    for iid, seed in (("item_near_fennick", 0.0), ("item_near_marlow", 0.1),
                       ("item_far_rare", 0.9)):
         vconn.execute(
             f"INSERT INTO {vectors.VEC_TABLE}(embedding, vault, item_id) "
@@ -801,8 +801,8 @@ def _ranked_chart_house_window(client, monkeypatch):
 def test_a_product_filter_matching_only_a_chart_house_row_outside_the_window_reports_filtered_out(
         client, monkeypatch):
     """The Chart House twin of the archives test above: `?product=rare&
-    limit=1` gives a window of 2, holding `item_near_vivy` and
-    `item_near_constance` and never reaching `item_far_rare`. Neither window
+    limit=1` gives a window of 2, holding `item_near_fennick` and
+    `item_near_marlow` and never reaching `item_far_rare`. Neither window
     row is `rare`, so the page is empty and `filtered_out` says that is the
     caller's own filter, not an empty corpus."""
     _ranked_chart_house_window(client, monkeypatch)
@@ -821,7 +821,7 @@ def test_a_product_filter_matching_only_a_chart_house_row_outside_the_window_rep
 
 def test_a_scoped_callers_chart_house_filtered_out_excludes_rows_the_scope_wall_removed(
         client, monkeypatch):
-    """AGENT is scoped to `vivy` alone, so `item_near_constance` never
+    """AGENT is scoped to `fennick` alone, so `item_near_marlow` never
     reaches its scoped window at all — the scope clause removes it before
     `filtered_out` starts counting, leaving one row for the caller's own
     `product` filter to remove. WIDE sees both near rows, so its `product`
@@ -839,14 +839,14 @@ def test_a_scoped_callers_chart_house_filtered_out_excludes_rows_the_scope_wall_
 def _ranked_reviews_window(client, monkeypatch):
     """The Reviews twin of `_ranked_archives_window` above: reuses that
     exact Archives KNN window (three signals at controlled distances,
-    `sig_near_vivy`/`sig_near_constance` inside a size-2 window and
+    `sig_near_fennick`/`sig_near_marlow` inside a size-2 window and
     `sig_far_rare` outside it) and links one review record to each, so the
     same near/near/far shape governs which review records fall inside the
     window — Reviews has no vector of its own and takes its candidates from
     exactly this KNN."""
     _ranked_archives_window(client, monkeypatch)
-    for signal_id, product, ref in (("sig_near_vivy", "vivy", "d" * 40),
-                                    ("sig_near_constance", "constance",
+    for signal_id, product, ref in (("sig_near_fennick", "fennick", "d" * 40),
+                                    ("sig_near_marlow", "marlow",
                                      "e" * 40),
                                     ("sig_far_rare", "rare", "f" * 40)):
         _seed_review(signal_id=signal_id, product=product,
@@ -859,7 +859,7 @@ def test_a_product_filter_matching_only_a_review_outside_the_window_reports_filt
         client, monkeypatch):
     """The Reviews twin of the archives and chart-house tests above:
     `?product=rare&limit=1` gives a window of 2, holding the reviews linked
-    to `sig_near_vivy` and `sig_near_constance` and never reaching the one
+    to `sig_near_fennick` and `sig_near_marlow` and never reaching the one
     linked to `sig_far_rare`. Neither window row is `rare`, so the page is
     empty and `filtered_out` says that is the caller's own filter, not an
     empty corpus."""
@@ -874,8 +874,8 @@ def test_a_product_filter_matching_only_a_review_outside_the_window_reports_filt
 
 def test_a_scoped_callers_reviews_filtered_out_excludes_rows_the_scope_wall_removed(
         client, monkeypatch):
-    """AGENT is scoped to `vivy` alone, so the review linked to
-    `sig_near_constance` never reaches its scoped window at all — the scope
+    """AGENT is scoped to `fennick` alone, so the review linked to
+    `sig_near_marlow` never reaches its scoped window at all — the scope
     clause removes it before `filtered_out` starts counting, leaving one row
     for the caller's own `product` filter to remove. REVIEWER, scoped to
     `*`, sees both near reviews, so its `product` filter removes both."""

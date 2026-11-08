@@ -54,8 +54,8 @@ def client(tmp_path, monkeypatch):
 
     tokens = tmp_path / "api-tokens.json"
     tokens.write_text(json.dumps({
-        AGENT: {"name": "an-agent", "products": ["vivy"]},
-        READER: {"name": "commercial", "products": ["vivy"],
+        AGENT: {"name": "an-agent", "products": ["fennick"]},
+        READER: {"name": "commercial", "products": ["fennick"],
                  "kind": "customer_reader"},
         SYSTEM: {"name": "github-capture", "products": ["*"], "kind": "system"},
     }))
@@ -79,7 +79,7 @@ def _h(token):
 def _review_body(kind):
     """A payload shaped like the GitHub capture poller's (`github_capture.py`)."""
     return {"source": "github_review", "kind": kind, "actor": "octocat",
-            "product": "vivy", "body": "approved",
+            "product": "fennick", "body": "approved",
             "refs": {"pr": 1, "url": "https://github.com/convivy/x/pull/1"},
             "meta": {"state": "APPROVED"},
             "produced_at": "2026-08-01T00:00:00Z"}

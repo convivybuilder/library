@@ -54,13 +54,13 @@ def test_a_person_may_not_be_granted_the_same_product_twice(tmp_path):
     conn = sqlite3.connect(db)
     conn.execute(
         "INSERT INTO person_products (person_id, product, granted_at, "
-        "granted_by) VALUES ('person_a', 'vivy', '2026-01-01', 'x')")
+        "granted_by) VALUES ('person_a', 'fennick', '2026-01-01', 'x')")
     conn.commit()
     raised = False
     try:
         conn.execute(
             "INSERT INTO person_products (person_id, product, granted_at, "
-            "granted_by) VALUES ('person_a', 'vivy', '2026-01-01', 'y')")
+            "granted_by) VALUES ('person_a', 'fennick', '2026-01-01', 'y')")
         conn.commit()
     except sqlite3.IntegrityError:
         raised = True
@@ -77,10 +77,10 @@ def test_the_same_product_may_be_granted_to_a_different_person(tmp_path):
     conn = sqlite3.connect(db)
     conn.execute(
         "INSERT INTO person_products (person_id, product, granted_at, "
-        "granted_by) VALUES ('person_a', 'vivy', '2026-01-01', 'x')")
+        "granted_by) VALUES ('person_a', 'fennick', '2026-01-01', 'x')")
     conn.execute(
         "INSERT INTO person_products (person_id, product, granted_at, "
-        "granted_by) VALUES ('person_b', 'vivy', '2026-01-01', 'x')")
+        "granted_by) VALUES ('person_b', 'fennick', '2026-01-01', 'x')")
     conn.commit()
     count = conn.execute(
         "SELECT COUNT(*) FROM person_products").fetchone()[0]
@@ -127,7 +127,7 @@ def test_a_grant_survives_a_library_restart(tmp_path):
         "'x', '2026-01-01', 'x')")
     write_conn.execute(
         "INSERT INTO person_products (person_id, product, granted_at, "
-        "granted_by) VALUES ('person_a', 'vivy', '2026-01-01', 'x')")
+        "granted_by) VALUES ('person_a', 'fennick', '2026-01-01', 'x')")
     write_conn.commit()
     write_conn.close()
 
@@ -141,7 +141,7 @@ def test_a_grant_survives_a_library_restart(tmp_path):
     finally:
         reopened.close()
     assert row == ("Ada",)
-    assert grants == [("vivy",)]
+    assert grants == [("fennick",)]
 
 
 def test_a_grant_survives_a_subsequent_alembic_upgrade(tmp_path):
@@ -155,7 +155,7 @@ def test_a_grant_survives_a_subsequent_alembic_upgrade(tmp_path):
     conn = sqlite3.connect(db)
     conn.execute(
         "INSERT INTO person_products (person_id, product, granted_at, "
-        "granted_by) VALUES ('person_a', 'vivy', '2026-01-01', 'x')")
+        "granted_by) VALUES ('person_a', 'fennick', '2026-01-01', 'x')")
     conn.commit()
     conn.close()
 
@@ -169,4 +169,4 @@ def test_a_grant_survives_a_subsequent_alembic_upgrade(tmp_path):
             "WHERE person_id = 'person_a'").fetchall()
     finally:
         conn.close()
-    assert grants == [("vivy",)]
+    assert grants == [("fennick",)]

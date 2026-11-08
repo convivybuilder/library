@@ -35,8 +35,8 @@ import store
 
 REPO = Path(__file__).resolve().parent.parent
 WIDE = "wide-token"
-NARROW_VIVY = "narrow-vivy-token"
-NARROW_CONSTANCE = "narrow-constance-token"
+NARROW_FENNICK = "narrow-fennick-token"
+NARROW_MARLOW = "narrow-marlow-token"
 
 
 def _now() -> str:
@@ -55,8 +55,8 @@ def client(tmp_path, monkeypatch):
     tokens = tmp_path / "api-tokens.json"
     tokens.write_text(json.dumps({
         WIDE: {"name": "wide-agent", "products": ["*"]},
-        NARROW_VIVY: {"name": "vivy-agent", "products": ["vivy"]},
-        NARROW_CONSTANCE: {"name": "constance-agent", "products": ["constance"]},
+        NARROW_FENNICK: {"name": "fennick-agent", "products": ["fennick"]},
+        NARROW_MARLOW: {"name": "marlow-agent", "products": ["marlow"]},
     }))
     monkeypatch.setattr(store, "DB_PATH", db)
     monkeypatch.setattr(identity, "TOKENS", tokens)
@@ -72,7 +72,7 @@ def _h(token=WIDE):
 
 def seed(item_id, **cols):
     """One item, with only the columns a case cares about."""
-    cols.setdefault("product", "vivy")
+    cols.setdefault("product", "fennick")
     cols.setdefault("title", item_id)
     cols.setdefault("body", "synthetic body")
     cols.setdefault("refs", "{}")
@@ -129,8 +129,8 @@ def get(client, item_id, *, token=WIDE):
 def test_relating_across_products_succeeds(client):
     """The whole point: an item in one product names an epic in another,
     which `_validate_parent` would refuse as a `parent_id`."""
-    seed("epic_1", type=store.ITEM_TYPE_EPIC, product="vivy")
-    seed("item_1", type=None, product="constance")
+    seed("epic_1", type=store.ITEM_TYPE_EPIC, product="fennick")
+    seed("item_1", type=None, product="marlow")
 
     r = relate(client, "item_1", "epic_1")
     assert r.status_code == 201, r.text
@@ -142,8 +142,8 @@ def test_relating_across_products_succeeds(client):
 
 
 def test_relating_without_item_resolve_is_forbidden(client, monkeypatch):
-    seed("epic_1", type=store.ITEM_TYPE_EPIC, product="vivy")
-    seed("item_1", type=None, product="vivy")
+    seed("epic_1", type=store.ITEM_TYPE_EPIC, product="fennick")
+    seed("item_1", type=None, product="fennick")
     tokens = Path(identity.TOKENS)
     tokens.write_text(json.dumps({
         "no-resolve-token": {"name": "reader", "products": ["*"],
@@ -154,14 +154,14 @@ def test_relating_without_item_resolve_is_forbidden(client, monkeypatch):
 
 
 def test_target_must_be_an_epic(client):
-    seed("task_1", type=None, product="vivy")
-    seed("item_1", type=None, product="vivy")
+    seed("task_1", type=None, product="fennick")
+    seed("item_1", type=None, product="fennick")
     r = relate(client, "item_1", "task_1")
     assert r.status_code == 400 and "epic" in r.json()["error"]
 
 
 def test_an_epic_cannot_be_related_to_itself(client):
-    seed("epic_1", type=store.ITEM_TYPE_EPIC, product="vivy")
+    seed("epic_1", type=store.ITEM_TYPE_EPIC, product="fennick")
     r = relate(client, "epic_1", "epic_1")
     assert r.status_code == 400 and "itself" in r.json()["error"]
     assert _db().execute(
@@ -169,34 +169,34 @@ def test_an_epic_cannot_be_related_to_itself(client):
 
 
 def test_target_must_exist(client):
-    seed("item_1", type=None, product="vivy")
+    seed("item_1", type=None, product="fennick")
     r = relate(client, "item_1", "no-such-item")
     assert r.status_code == 400 and "epic" in r.json()["error"]
 
 
 def test_epic_id_is_required(client):
-    seed("item_1", type=None, product="vivy")
+    seed("item_1", type=None, product="fennick")
     r = client.post("/items/item_1/epic-relations", json={}, headers=_h())
     assert r.status_code == 400 and "epic_id" in r.json()["error"]
 
 
 def test_an_item_in_another_product_than_the_caller_is_not_found(client):
-    seed("epic_1", type=store.ITEM_TYPE_EPIC, product="vivy")
-    seed("item_1", type=None, product="constance")
-    r = relate(client, "item_1", "epic_1", token=NARROW_VIVY)
+    seed("epic_1", type=store.ITEM_TYPE_EPIC, product="fennick")
+    seed("item_1", type=None, product="marlow")
+    r = relate(client, "item_1", "epic_1", token=NARROW_FENNICK)
     assert r.status_code == 404
 
 
 def test_a_terminal_item_cannot_be_related(client):
-    seed("epic_1", type=store.ITEM_TYPE_EPIC, product="vivy")
-    seed("item_1", type=None, product="vivy", state="fixed")
+    seed("epic_1", type=store.ITEM_TYPE_EPIC, product="fennick")
+    seed("item_1", type=None, product="fennick", state="fixed")
     r = relate(client, "item_1", "epic_1")
     assert r.status_code == 409 and "terminal" in r.json()["error"]
 
 
 def test_writing_the_same_pair_twice_is_idempotent(client):
-    seed("epic_1", type=store.ITEM_TYPE_EPIC, product="vivy")
-    seed("item_1", type=None, product="constance")
+    seed("epic_1", type=store.ITEM_TYPE_EPIC, product="fennick")
+    seed("item_1", type=None, product="marlow")
 
     first = relate(client, "item_1", "epic_1")
     assert first.status_code == 201, first.text
@@ -213,8 +213,8 @@ def test_writing_the_same_pair_twice_is_idempotent(client):
 
 
 def test_an_item_held_by_another_session_refuses_the_write(client):
-    seed("epic_1", type=store.ITEM_TYPE_EPIC, product="vivy")
-    seed("item_1", type=None, product="vivy")
+    seed("epic_1", type=store.ITEM_TYPE_EPIC, product="fennick")
+    seed("item_1", type=None, product="fennick")
     _take_lease("item_1", holder="someone-else")
 
     r = relate(client, "item_1", "epic_1", owner="me")
@@ -225,26 +225,26 @@ def test_an_item_held_by_another_session_refuses_the_write(client):
 
 
 def test_the_epic_lists_related_items_beside_its_children(client):
-    seed("epic_1", type=store.ITEM_TYPE_EPIC, product="vivy")
-    seed("child_1", type=None, product="vivy", parent_id="epic_1")
-    seed("related_1", type=None, product="constance")
+    seed("epic_1", type=store.ITEM_TYPE_EPIC, product="fennick")
+    seed("child_1", type=None, product="fennick", parent_id="epic_1")
+    seed("related_1", type=None, product="marlow")
     relate(client, "related_1", "epic_1")
 
     body = get(client, "epic_1")
     assert body["progress"]["children"] == 1          # unaffected: parent_id only
     related_ids = [r["id"] for r in body["related_items"]]
     assert related_ids == ["related_1"]
-    assert body["related_items"][0]["product"] == "constance"
+    assert body["related_items"][0]["product"] == "marlow"
 
 
 def test_a_non_epic_carries_no_related_items_key(client):
-    seed("task_1", type=None, product="vivy")
+    seed("task_1", type=None, product="fennick")
     body = get(client, "task_1")
     assert "related_items" not in body
 
 
 def test_an_epic_with_no_relations_has_an_empty_list(client):
-    seed("epic_1", type=store.ITEM_TYPE_EPIC, product="vivy")
+    seed("epic_1", type=store.ITEM_TYPE_EPIC, product="fennick")
     assert get(client, "epic_1")["related_items"] == []
 
 
@@ -252,11 +252,11 @@ def test_a_narrowly_scoped_caller_does_not_learn_the_related_items_product(clien
     """The scope rule `_lease_root_visible` applies to a lease's blocking
     root applies here to a relation's target: a caller scoped to one
     product must not learn another product's item ids through this read."""
-    seed("epic_1", type=store.ITEM_TYPE_EPIC, product="vivy")
-    seed("related_1", type=None, product="constance")
+    seed("epic_1", type=store.ITEM_TYPE_EPIC, product="fennick")
+    seed("related_1", type=None, product="marlow")
     relate(client, "related_1", "epic_1")
 
-    body = get(client, "epic_1", token=NARROW_VIVY)
+    body = get(client, "epic_1", token=NARROW_FENNICK)
     assert body["related_items"] == []
 
     body = get(client, "epic_1", token=WIDE)
@@ -271,8 +271,8 @@ def test_the_relation_never_feeds_the_ancestor_or_subtree_walk(client):
     an epic only through `issue_epic_relations`, with no `parent_id` edge,
     is invisible to both walks that every lease disclosure and the
     epic-retype descendant count rest on."""
-    seed("epic_1", type=store.ITEM_TYPE_EPIC, product="vivy")
-    seed("related_1", type=None, product="constance")
+    seed("epic_1", type=store.ITEM_TYPE_EPIC, product="fennick")
+    seed("related_1", type=None, product="marlow")
     relate(client, "related_1", "epic_1")
 
     conn = _db()
@@ -286,8 +286,8 @@ def test_a_lease_on_the_epic_does_not_fence_the_related_item(client):
     this proves a lease taken on the epic leaves a cross-product related
     item free to check out and correct, with no 409 naming the epic's
     holder."""
-    seed("epic_1", type=store.ITEM_TYPE_EPIC, product="vivy")
-    seed("related_1", type=None, product="constance")
+    seed("epic_1", type=store.ITEM_TYPE_EPIC, product="fennick")
+    seed("related_1", type=None, product="marlow")
     relate(client, "related_1", "epic_1")
     _take_lease("epic_1", holder="someone-else")
 
@@ -302,8 +302,12 @@ def test_the_relation_does_not_count_toward_the_epic_retype_descendant_check(cli
     children, counted through `lease.subtree_ids`. A relation-only item must
     not be counted there, or an epic with none of its own children could
     never be retyped."""
-    seed("epic_1", type=store.ITEM_TYPE_EPIC, product="vivy")
-    seed("related_1", type=None, product="constance")
+    # `maturity="approved"`, so an ordinary AGENT credential may retype it out
+    # unassisted (library/decisions/0005) — unrelated to what this test is
+    # about, which is the descendant count alone.
+    seed("epic_1", type=store.ITEM_TYPE_EPIC, product="fennick",
+         maturity=store.ITEM_MATURITY_APPROVED)
+    seed("related_1", type=None, product="marlow")
     relate(client, "related_1", "epic_1")
 
     r = client.post("/items/epic_1/correct", json={"type": None}, headers=_h())

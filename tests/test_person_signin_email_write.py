@@ -87,7 +87,7 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(identity, "TOKENS", agent_tokens)
     monkeypatch.setattr(store, "WRITES_ENABLED", True)
     registry = tmp_path / "projects.json"
-    registry.write_text(json.dumps({"vivy": {}}))
+    registry.write_text(json.dumps({"fennick": {}}))
     monkeypatch.setattr(projects, "REGISTRY_PATH", registry)
     projects.reload()
     test_client = TestClient(libapp.app)

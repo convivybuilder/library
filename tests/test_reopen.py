@@ -36,7 +36,7 @@ import lease
 import protocol
 import store
 
-AGENT = "agent-token-vivy"
+AGENT = "agent-token-fennick"
 WIDE = "agent-token-wide"
 
 TERMINAL_STATES = sorted(store.ITEM_TERMINAL)
@@ -84,28 +84,28 @@ def client(tmp_path, monkeypatch):
         "INSERT INTO issue_items (id, product, title, type, state, claimed_by, "
         "claimed_at, parent_id, created_at, refs, resolution, resolved_by, "
         "resolved_at, outcome_note) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        [("epic_v", "vivy", "A vivy epic", "epic", "open", None, None, None,
+        [("epic_v", "fennick", "A fennick epic", "epic", "open", None, None, None,
           _ts(days=3), "{}", None, None, None, None),
          # Closed by a bad reconcile, with a PR still on the row — the exact
          # shape the bug report names: `pr`/`pr_url` must survive the reopen.
-         ("task_a", "vivy", "Wrongly closed", "task", "fixed", None, None,
+         ("task_a", "fennick", "Wrongly closed", "task", "fixed", None, None,
           "epic_v", _ts(days=2),
           json.dumps({"pr": 9, "url": "https://example/pull/9"}),
           "fixed", "some-agent", _ts(hours=1), "closed by mistake"),
-         ("open_v", "vivy", "Not yet claimed", "task", "open", None, None,
+         ("open_v", "fennick", "Not yet claimed", "task", "open", None, None,
           None, _ts(days=1), "{}", None, None, None, None),
-         ("claimed_v", "vivy", "Mid-work", "task", "claimed", "session-1",
+         ("claimed_v", "fennick", "Mid-work", "task", "claimed", "session-1",
           _ts(hours=1), None, _ts(days=1), "{}", None, None, None, None),
-         ("pr_open_v", "vivy", "In review", "task", "pr-open", "session-1",
+         ("pr_open_v", "fennick", "In review", "task", "pr-open", "session-1",
           _ts(hours=1), None, _ts(days=1), "{}", None, None, None, None),
-         ("task_c", "constance", "Another product", "task", "fixed",
+         ("task_c", "marlow", "Another product", "task", "fixed",
           None, None, None, _ts(days=1), "{}", "fixed", None, None, None)])
     conn.commit()
     conn.close()
 
     tokens = tmp_path / "api-tokens.json"
     tokens.write_text(json.dumps({
-        AGENT: {"name": "vivy-agent", "products": ["vivy"]},
+        AGENT: {"name": "fennick-agent", "products": ["fennick"]},
         WIDE: {"name": "wide-agent", "products": ["*"]},
     }))
     monkeypatch.setattr(store, "DB_PATH", db)
@@ -218,7 +218,7 @@ def test_reopening_writes_the_state_event_with_the_reason(client):
     events = _events("task_a")
     assert len(events) == 1
     actor, from_state, to_state, note = events[0]
-    assert (actor, from_state, to_state) == ("vivy-agent", "fixed", "open")
+    assert (actor, from_state, to_state) == ("fennick-agent", "fixed", "open")
     assert note == "the multi-repo close was wrong"
 
 

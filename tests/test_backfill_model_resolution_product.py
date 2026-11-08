@@ -2,7 +2,7 @@
 so it matches the crew registry (issue_01M2K33M9NG0S9HCJQJ2EPD7RP). Every
 assertion here runs against a temporary database, a temporary registry
 file, temporary token files, and a temporary run-directory tree — never the
-live `~/.library/library.db`, `agent-platform/config/projects.json`, or
+live `~/.library/library.db`, `<root>/install/projects.json`, or
 `~/Convivy/agent-runs`."""
 from __future__ import annotations
 
@@ -73,7 +73,7 @@ def db(tmp_path, monkeypatch):
         "_meta": {},
         "library": {"repos": ["library"]},
         "agent-platform": {"repos": ["agent-platform"]},
-        "vivy": {"repos": ["vivy"]},
+        "fennick": {"repos": ["fennick"]},
     }))
     monkeypatch.setattr(projects, "REGISTRY_PATH", registry)
     projects.reload()
@@ -179,9 +179,9 @@ def test_a_run_whose_meta_json_has_no_repo_is_untouched_and_reported(db, capsys)
 
 
 def test_a_row_already_matching_the_registry_is_untouched(db):
-    _write_run(db.runs, "2026-09-16", "run-cccccccc", repo="vivy")
+    _write_run(db.runs, "2026-09-16", "run-cccccccc", repo="fennick")
     conn = _conn(db.db)
-    _insert(conn, "sig_e", product="vivy", run="run-cccccccc")
+    _insert(conn, "sig_e", product="fennick", run="run-cccccccc")
     conn.commit()
     conn.close()
 
@@ -196,7 +196,7 @@ def test_a_row_already_matching_the_registry_is_untouched(db):
     conn = _conn(db.db)
     row = conn.execute("SELECT product FROM signals WHERE id = 'sig_e'").fetchone()
     conn.close()
-    assert row["product"] == "vivy"
+    assert row["product"] == "fennick"
 
 
 def test_dry_run_writes_nothing(db, capsys):
@@ -318,7 +318,7 @@ def test_a_narrow_reader_holding_a_moved_product_fails_the_precondition(db, tmp_
 
 
 def test_a_narrow_reader_on_an_untouched_product_meets_the_precondition(db, tmp_path, capsys):
-    _narrow_reader(tmp_path, ["vivy"])
+    _narrow_reader(tmp_path, ["fennick"])
     _write_run(db.runs, "2026-09-16", "run-44444444", repo="agent-platform")
     conn = _conn(db.db)
     _insert(conn, "sig_a", product="platform", run="run-44444444")

@@ -45,9 +45,9 @@ import store
 import tls_ca
 from mtls_server import RunningServer, tls_config
 
-AGENT = "agent-token-vivy"
-OTHER_SCOPE = "agent-token-constance-only"
-NOREF = "agent-token-vivy-noref"
+AGENT = "agent-token-fennick"
+OTHER_SCOPE = "agent-token-marlow-only"
+NOREF = "agent-token-fennick-noref"
 MACHINE = "macbook"
 OTHER_MACHINE = "keelboat"
 
@@ -119,11 +119,13 @@ def base_client(tmp_path, monkeypatch):
         CREATE TABLE call_slips (
             id TEXT PRIMARY KEY, item_id TEXT, product TEXT,
             claim_owner_label TEXT, issued_at TEXT, expires_at TEXT,
-            redeemed_at TEXT, grant_json TEXT);
+            redeemed_at TEXT, grant_json TEXT, crew TEXT);
         CREATE TABLE library_cards (
             id TEXT PRIMARY KEY, actor TEXT, product TEXT, item_id TEXT,
             slip_id TEXT UNIQUE, protocol_version INTEGER, state TEXT,
-            issued_at TEXT, revoked_at TEXT);
+            issued_at TEXT, revoked_at TEXT, secret_sha256 TEXT UNIQUE,
+            bound_machine TEXT, crew TEXT, profile TEXT,
+            revoked_cause TEXT, revoked_by TEXT, revocation_detail TEXT);
         CREATE TABLE machine_certificates (
             id INTEGER PRIMARY KEY,
             machine TEXT NOT NULL,
@@ -147,16 +149,16 @@ def base_client(tmp_path, monkeypatch):
     conn.execute(
         "INSERT INTO issue_items (id, product, title, type, state, needs, "
         "created_by_kind, parent_id, created_at, refs) VALUES "
-        "('task_a', 'vivy', 'Task A', 'task', 'claimed', 'agent', 'agent', "
+        "('task_a', 'fennick', 'Task A', 'task', 'claimed', 'agent', 'agent', "
         "NULL, ?, '{}')", (_ts(days=1),))
     conn.commit()
     conn.close()
 
     tokens = tmp_path / "api-tokens.json"
     tokens.write_text(json.dumps({
-        AGENT: {"name": "vivy-agent", "products": ["vivy"]},
-        OTHER_SCOPE: {"name": "constance-agent", "products": ["constance"]},
-        NOREF: {"name": "vivy-noref-agent", "products": ["vivy"],
+        AGENT: {"name": "fennick-agent", "products": ["fennick"]},
+        OTHER_SCOPE: {"name": "marlow-agent", "products": ["marlow"]},
+        NOREF: {"name": "fennick-noref-agent", "products": ["fennick"],
                 "withholds": ["reference.read"]},
     }))
     monkeypatch.setattr(store, "DB_PATH", db)
@@ -195,7 +197,7 @@ def _db():
     return conn
 
 
-def _mint_slip(*, now=None, item_id="task_a", product="vivy", grant=None):
+def _mint_slip(*, now=None, item_id="task_a", product="fennick", grant=None):
     conn = _db()
     slip_id = call_slips.mint(conn, item_id=item_id, product=product,
                               claim_owner_label="checkout-owner", now=now,
@@ -226,12 +228,42 @@ def test_redeeming_a_slip_issues_a_card_and_consumes_it(client):
     assert r.status_code == 200
     body = r.json()
     assert body["card_id"].startswith("card_")
-    assert body["actor"] == "vivy-agent"
-    assert body["product"] == "vivy"
+    assert body["actor"] == "fennick-agent"
+    assert body["product"] == "fennick"
     assert body["protocol_version"] == protocol.CURRENT
     assert body["state"] == "active"
     assert _slip_row(slip_id)["redeemed_at"] is not None
     assert len(_cards()) == 1
+
+
+# --- the credential: `card_secret` is returned once, the row holds only its
+# hash (library/specs/library-card-credential-and-revocation-plan §1, test 7,
+# issuance half) --------------------------------------------------------
+
+
+def test_redemption_returns_a_card_secret_whose_hash_is_what_the_row_stores(
+        client):
+    """Catches a mutation that stores the raw secret, or stores a hash of
+    something other than what was returned — either would leave the secret
+    recoverable from a database read or backup, which is the whole reason
+    `card_secret` exists as a value separate from `card_id`."""
+    slip_id = _mint_slip()
+    body = _redeem(client, slip_id).json()
+    secret = body["card_secret"]
+    assert secret.startswith("card.")
+    row = _cards()[0]
+    assert row["secret_sha256"] == credential_binding.sha256_token(secret)
+    assert secret not in json.dumps(dict(row)), (
+        "the raw secret must never be a stored column's value")
+
+
+def test_two_redemptions_get_two_different_secrets(client):
+    """Catches a mutation that derives the secret from something constant or
+    already-known (the card id, the actor), rather than generating a fresh
+    one per card."""
+    first = _redeem(client, _mint_slip()).json()["card_secret"]
+    second = _redeem(client, _mint_slip()).json()["card_secret"]
+    assert first != second
 
 
 # --- the grant, returned as issued (issue_01M3VN8WV1K891BT866K82ZBPX) -------
@@ -241,7 +273,7 @@ def test_redeeming_a_slip_issues_a_card_and_consumes_it(client):
 GRANT = {
     "persona_md": "# coder\n\nWrites the change.",
     "docs": [{"id": "platform/agents/coder", "body_sha256": "ab" * 32}],
-    "bundle": {"profile": "vivy/daytime", "available": True},
+    "bundle": {"profile": "fennick/daytime", "available": True},
     "model": "model-resolution-not-implemented",
     "budget": {"cap_usd": 2.5},
     "limits": {},
@@ -379,7 +411,7 @@ def test_a_credential_bound_to_another_machine_is_refused(base_client):
     assert r.status_code == 401
     text = r.text
     assert MACHINE not in text and OTHER_MACHINE not in text
-    assert "vivy-agent" not in text
+    assert "fennick-agent" not in text
     _assert_refused_and_nothing_written(slip_id)
 
 
@@ -535,7 +567,7 @@ def test_over_a_real_handshake_the_bound_machine_redeems_and_another_is_refused(
         status, body = _post_redeem(
             port, _client_ctx(base_client, good, good_key), slip_id)
         assert status == 200, body
-        assert json.loads(body)["actor"] == "vivy-agent"
+        assert json.loads(body)["actor"] == "fennick-agent"
     finally:
         server.stop()
     assert len(_cards()) == 1

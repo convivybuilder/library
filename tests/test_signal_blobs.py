@@ -25,8 +25,8 @@ import projects
 import protocol
 import store
 
-AGENT = "agent-token-vivy"
-OTHER = "agent-token-constance"
+AGENT = "agent-token-fennick"
+OTHER = "agent-token-marlow"
 SYSTEM = "system-token"
 
 
@@ -53,8 +53,8 @@ def client(tmp_path, monkeypatch, vector_index):
 
     tokens = tmp_path / "api-tokens.json"
     tokens.write_text(json.dumps({
-        AGENT: {"name": "vivy-agent", "products": ["vivy"]},
-        OTHER: {"name": "constance-agent", "products": ["constance"]},
+        AGENT: {"name": "fennick-agent", "products": ["fennick"]},
+        OTHER: {"name": "marlow-agent", "products": ["marlow"]},
         SYSTEM: {"name": "capture", "products": ["*"], "kind": "system"},
     }))
     vector_index(db)
@@ -78,7 +78,7 @@ def _h(token=AGENT):
 
 def _body(**over):
     out = {"source": "claude-code", "kind": "transcript-turn", "actor": "operator",
-           "product": "vivy", "body": "a preview of the turn"}
+           "product": "fennick", "body": "a preview of the turn"}
     out.update(over)
     return out
 
@@ -201,7 +201,7 @@ def test_the_blob_route_respects_product_scope(client):
     """The read authorizes on the ROW, so a caller out of the row's product
     scope is refused even though the blob file itself exists and is
     perfectly readable by ref."""
-    created = client.post("/signals", json=_body(content="vivy's own text"),
+    created = client.post("/signals", json=_body(content="fennick's own text"),
                           headers=_h(AGENT)).json()
     r = client.get(f"/signals/{created['id']}/blob", headers=_h(OTHER))
     assert r.status_code == 404

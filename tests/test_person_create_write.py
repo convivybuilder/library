@@ -90,7 +90,7 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(identity, "TOKENS", agent_tokens)
     monkeypatch.setattr(store, "WRITES_ENABLED", True)
     registry = tmp_path / "projects.json"
-    registry.write_text(json.dumps({"vivy": {}}))
+    registry.write_text(json.dumps({"fennick": {}}))
     monkeypatch.setattr(projects, "REGISTRY_PATH", registry)
     projects.reload()
     test_client = TestClient(libapp.app)
@@ -304,12 +304,12 @@ def test_the_new_person_is_found_by_email(client):
 def test_projects_may_be_granted_to_the_new_person(client):
     created = _post(client, ADMIN_TOKEN, {"display_name": "Tara Target"}).json()
     pid = created["person_id"]
-    r = client.post(f"/people/{pid}/projects", json={"grant": ["vivy"]},
+    r = client.post(f"/people/{pid}/projects", json={"grant": ["fennick"]},
                     headers=_h(ADMIN_TOKEN))
     assert r.status_code == 200
-    assert r.json()["granted"] == ["vivy"]
+    assert r.json()["granted"] == ["fennick"]
     r = client.get(f"/people/{pid}/projects", headers=_h(ADMIN_TOKEN))
-    assert r.json() == {"projects": ["vivy"], "count": 1}
+    assert r.json() == {"projects": ["fennick"], "count": 1}
 
 
 def test_the_email_may_be_set_on_the_new_person_afterwards(client):

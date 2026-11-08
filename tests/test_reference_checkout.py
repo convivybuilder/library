@@ -24,7 +24,7 @@ import protocol
 import reference
 import store
 
-AGENT = "agent-token-vivy"
+AGENT = "agent-token-fennick"
 SYSTEM = "system-token"
 
 DOC_ID = "platform/decisions/0022-library-repo"
@@ -81,7 +81,7 @@ def client(tmp_path, monkeypatch):
 
     tokens = tmp_path / "api-tokens.json"
     tokens.write_text(json.dumps({
-        AGENT: {"name": "vivy-agent", "products": ["vivy"]},
+        AGENT: {"name": "fennick-agent", "products": ["fennick"]},
         SYSTEM: {"name": "capture", "products": ["*"], "kind": "system"},
     }))
 
@@ -127,7 +127,7 @@ def test_a_document_can_be_checked_out(client):
     assert body["doc_id"] == DOC_ID
     # `holder` FALLS BACK TO THE TOKEN'S NAME, not the bearer string —
     # `_claim_owner`'s own contract, exercised here rather than assumed.
-    assert body["holder"] == "vivy-agent"
+    assert body["holder"] == "fennick-agent"
     assert body["released_at"] is None
     assert "policy" in r.json()
 
@@ -172,8 +172,8 @@ def test_a_dead_checkout_is_reclaimed_rather_than_blocking(client, monkeypatch):
     # STAMPED WITH THE VERIFIED ACTOR, NOT THE CALLER-DECLARED `holder`. The
     # reclaiming request's owner is "holder-b", a self-chosen label; the audit
     # column must say who actually broke the dead lock, which is the token
-    # identity behind it (`vivy-agent`), not that label.
-    assert rows[0]["released_by"] == "vivy-agent"
+    # identity behind it (`fennick-agent`), not that label.
+    assert rows[0]["released_by"] == "fennick-agent"
     assert rows[0]["released_by"] != "holder-b"
 
 
@@ -260,7 +260,7 @@ def test_checking_in_what_you_hold_releases_it(client):
     # STAMPED WITH THE VERIFIED ACTOR, NOT THE CALLER-DECLARED `holder` — the
     # same reasoning `take`'s reclaim uses, applied to the ordinary check-in
     # path too (security-reviewer, PR #45, round 2).
-    assert out["released_by"] == "vivy-agent"
+    assert out["released_by"] == "fennick-agent"
     assert out["released_by"] != "holder-a"
 
     again = _checkout(client, owner="holder-b")

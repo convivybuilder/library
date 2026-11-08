@@ -2,9 +2,9 @@
 
 Contract §8. **Every refusal names what failed**, and the ones a caller can act
 on also name what to do about it. That is not politeness: the platform's own
-lease refusal is the worked example — "epic E is held by co-vivy-0912 until
-05:30, covering these 4 items" lets an orchestrator route to other work, where a
-bare "no" leaves it with block or retry and both waste the run.
+lease refusal is the worked example — "epic E is held by co-northwind-0912
+until 05:30, covering these 4 items" lets an orchestrator route to other work,
+where a bare "no" leaves it with block or retry and both waste the run.
 
 The status codes are fixed by the contract so a client can branch on them without
 reading prose:

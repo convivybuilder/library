@@ -76,7 +76,7 @@ def client(tmp_path, monkeypatch, vector_index, ledger_tables):
             blocking_root_id TEXT, blocking_holder TEXT, blocks_by TEXT, blocking_taken_for TEXT);
         CREATE TABLE call_slips (
             id TEXT PRIMARY KEY, item_id TEXT, product TEXT, claim_owner_label TEXT,
-            issued_at TEXT, expires_at TEXT, grant_json TEXT);
+            issued_at TEXT, expires_at TEXT, grant_json TEXT, crew TEXT);
         CREATE TABLE issue_comments (
             id INTEGER PRIMARY KEY AUTOINCREMENT, item_id TEXT, actor TEXT,
             kind TEXT, body TEXT, run_id TEXT, at TEXT);
@@ -91,33 +91,33 @@ def client(tmp_path, monkeypatch, vector_index, ledger_tables):
     conn.executemany(
         "INSERT INTO issue_items (id, product, title, type, state, needs, "
         "created_by_kind, parent_id, created_at, refs) VALUES (?,?,?,?,?,?,?,?,?,?)",
-        [("epic1", "vivy", "An epic", "epic", "open", "agent", "agent",
+        [("epic1", "fennick", "An epic", "epic", "open", "agent", "agent",
           None, _ts(days=2), "{}"),
-         ("task1", "vivy", "First task", "task", "open", "agent", "agent",
+         ("task1", "fennick", "First task", "task", "open", "agent", "agent",
           "epic1", _ts(days=2), "{}"),
-         ("task2", "vivy", "Second task", "task", "open", "agent", "agent",
+         ("task2", "fennick", "Second task", "task", "open", "agent", "agent",
           "epic1", _ts(days=2), "{}"),
-         ("lone1", "vivy", "Parentless one", "task", "open", "agent", "agent",
+         ("lone1", "fennick", "Parentless one", "task", "open", "agent", "agent",
           None, _ts(days=1), "{}"),
-         ("lone2", "vivy", "Parentless two", "task", "open", "agent", "agent",
+         ("lone2", "fennick", "Parentless two", "task", "open", "agent", "agent",
           None, _ts(days=1), "{}"),
          # Nested epics lease themselves, so `sub` and `top` have different
          # roots: the shape the conflict scan, not the refresh branch, judges.
-         ("top", "vivy", "Top epic", "epic", "open", "agent", "agent",
+         ("top", "fennick", "Top epic", "epic", "open", "agent", "agent",
           None, _ts(days=2), "{}"),
-         ("sub", "vivy", "Sub epic", "epic", "open", "agent", "agent",
+         ("sub", "fennick", "Sub epic", "epic", "open", "agent", "agent",
           "top", _ts(days=2), "{}"),
-         ("leaf", "vivy", "Leaf", "task", "open", "agent", "agent",
+         ("leaf", "fennick", "Leaf", "task", "open", "agent", "agent",
           "sub", _ts(days=2), "{}")])
     conn.commit()
     conn.close()
 
     tokens = tmp_path / "api-tokens.json"
     tokens.write_text(json.dumps({
-        CREW_A1: {"name": "co-a1", "products": ["vivy"], "crew": "crew-alpha"},
-        CREW_A2: {"name": "co-a2", "products": ["vivy"], "crew": "crew-alpha"},
-        CREW_B: {"name": "co-b1", "products": ["vivy"], "crew": "crew-bravo"},
-        UNCREWED: {"name": "co-x", "products": ["vivy"]},
+        CREW_A1: {"name": "co-a1", "products": ["fennick"], "crew": "crew-alpha"},
+        CREW_A2: {"name": "co-a2", "products": ["fennick"], "crew": "crew-alpha"},
+        CREW_B: {"name": "co-b1", "products": ["fennick"], "crew": "crew-bravo"},
+        UNCREWED: {"name": "co-x", "products": ["fennick"]},
     }))
     vector_index(db)
     ledger_tables(db)

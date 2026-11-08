@@ -85,8 +85,8 @@ def _seed_mixed_kind_signals(conn, *, test_result_rows: int) -> None:
     production's own mix of kinds does not."""
     now = "2026-10-01 00:00:00.000000"
     rows = []
-    products = ("vivy", "selector", "library", "convivy-orient", "svc",
-                "constance")
+    products = ("fennick", "thistle", "library", "convivy-orient", "loom",
+                "marlow")
     for i in range(test_result_rows):
         sha = f"sha{i:07d}"
         refs = ('{"commit": "%s", "conclusion": "success", '
@@ -99,10 +99,10 @@ def _seed_mixed_kind_signals(conn, *, test_result_rows: int) -> None:
                      "a test-result row", "internal", now))
     for i in range(2000):
         rows.append((f"sig_pr_{i:08d}", "keel", "pr_state", "keel", "keel",
-                     "vivy", "{}", "{}", "a pr_state row", "internal", now))
+                     "fennick", "{}", "{}", "a pr_state row", "internal", now))
     for i, kind in enumerate(("alert", "handoff", "decision") * 170):
         rows.append((f"sig_misc_{i:08d}", "misc", kind, "misc", "misc",
-                     "vivy", "{}", "{}", "a misc row", "internal", now))
+                     "fennick", "{}", "{}", "a misc row", "internal", now))
     conn.executemany(TEST_RESULT_INSERT, rows)
     conn.commit()
 

@@ -27,8 +27,10 @@ import lease
 import protocol
 import store
 
-AGENT = "agent-token-vivy"
+AGENT = "agent-token-fennick"
 WIDE = "agent-token-wide"
+OPERATOR = "deck-token"
+HUMAN = "operator@example.com"
 
 
 def _ts(**delta):
@@ -89,8 +91,8 @@ def client(tmp_path, monkeypatch):
     conn.executemany(
         "INSERT INTO corrections_queues (id, product, created_at) "
         "VALUES (?,?,?)",
-        [("cq_vivy", "vivy", "2026-08-01 00:00:00.000000"),
-         ("cq_constance", "constance", "2026-08-01 00:00:00.000000")])
+        [("cq_fennick", "fennick", "2026-08-01 00:00:00.000000"),
+         ("cq_marlow", "marlow", "2026-08-01 00:00:00.000000")])
     # (id, product, title, type, state, severity, maturity, parent_id, refs,
     #  specification, definition_of_done)
     #
@@ -99,27 +101,29 @@ def client(tmp_path, monkeypatch):
     # (issue_01M0EEPS591VQHYEBJY7NGF4C3). `done`, below, is TERMINAL and keeps
     # the type it closed with, exactly as a real closed row does.
     rows = [
-        ("task", "vivy", "A task", None, "open", "medium", None, None, "{}",
+        ("task", "fennick", "A task", None, "open", "medium", None, None, "{}",
          None, None),
-        ("bug", "vivy", "A bug", None, "open", "low", None, None, "{}",
+        ("bug", "fennick", "A bug", None, "open", "low", None, None, "{}",
          None, None),
-        ("epic", "vivy", "An epic", "epic", "open", "medium", "proposed", None,
+        ("epic", "fennick", "An epic", "epic", "open", "medium", "proposed", None,
          "{}", "what it is", "when it is done"),
-        ("child", "vivy", "Under the epic", None, "open", "low", None, "epic",
+        ("child", "fennick", "Under the epic", None, "open", "low", None, "epic",
          "{}", None, None),
-        ("epic_bare", "vivy", "A childless epic", "epic", "open", "medium",
+        ("epic_bare", "fennick", "A childless epic", "epic", "open", "medium",
          "proposed", None, "{}", None, None),
-        ("epic_ok", "vivy", "An approved epic", "epic", "open", "medium",
+        ("epic_ok", "fennick", "An approved epic", "epic", "open", "medium",
          "approved", None, "{}", "the long form", "the finish line"),
-        ("epic_approved_bare", "vivy", "Approved with nothing said", "epic",
+        ("epic_approved_bare", "fennick", "Approved with nothing said", "epic",
          "open", "medium", "approved", None, "{}", None, None),
-        ("impr_ok", "vivy", "An approved non-epic", None, "open",
+        ("impr_ok", "fennick", "An approved non-epic", None, "open",
          "low", "approved", None, "{}", None, None),
-        ("done", "vivy", "Done", "bug", "fixed", "low", None, None, "{}",
+        ("epic_declined", "fennick", "A declined epic", "epic", "open", "medium",
+         "declined", None, "{}", "scope nobody will build", "a finish line"),
+        ("done", "fennick", "Done", "bug", "fixed", "low", None, None, "{}",
          None, None),
-        ("other", "constance", "Other product", None, "open", "low", None, None,
+        ("other", "marlow", "Other product", None, "open", "low", None, None,
          "{}", None, None),
-        ("other_epic", "constance", "Other epic", "epic", "open", "low", None,
+        ("other_epic", "marlow", "Other epic", "epic", "open", "low", None,
          None, "{}", None, None),
     ]
     conn.executemany(
@@ -133,7 +137,7 @@ def client(tmp_path, monkeypatch):
     # below read this row to see that it did.
     conn.execute(
         "INSERT INTO courses (id, product, title, entries, status, version, "
-        "created_by, created_at) VALUES ('course_vivy', 'vivy', 'The route', ?, "
+        "created_by, created_at) VALUES ('course_fennick', 'fennick', 'The route', ?, "
         "'live', 1, 'test', ?)",
         (json.dumps(["epic", "epic_ok", "other_epic_in_order"]), _ts(days=3)))
     conn.commit()
@@ -141,11 +145,16 @@ def client(tmp_path, monkeypatch):
 
     tokens = tmp_path / "api-tokens.json"
     tokens.write_text(json.dumps({
-        AGENT: {"name": "vivy-agent", "products": ["vivy"]},
+        AGENT: {"name": "fennick-agent", "products": ["fennick"]},
         WIDE: {"name": "wide-agent", "products": ["*"]},
+    }))
+    clients = tmp_path / "client-tokens.json"
+    clients.write_text(json.dumps({
+        OPERATOR: {"name": "deck", "products": ["*"]},
     }))
     monkeypatch.setattr(store, "DB_PATH", db)
     monkeypatch.setattr(identity, "TOKENS", tokens)
+    monkeypatch.setattr(identity, "CLIENT_TOKENS", clients)
     monkeypatch.setattr(store, "WRITES_ENABLED", True)
     monkeypatch.setattr(lease, "TUNABLES", tmp_path / "absent.json")
     return TestClient(libapp.app)
@@ -185,7 +194,7 @@ def _notes(item_id):
 
 def _course_entries():
     conn = _db()
-    row = conn.execute("SELECT entries FROM courses WHERE id = 'course_vivy'"
+    row = conn.execute("SELECT entries FROM courses WHERE id = 'course_fennick'"
                        ).fetchone()
     conn.close()
     return json.loads(row["entries"])
@@ -197,6 +206,14 @@ def _set_maturity(item_id, value):
     up. The approval ROUTE is exercised in `test_approve.py`."""
     conn = _db()
     conn.execute("UPDATE issue_items SET maturity = ? WHERE id = ?",
+                 (value, item_id))
+    conn.commit()
+    conn.close()
+
+
+def _set_needs(item_id, value):
+    conn = _db()
+    conn.execute("UPDATE issue_items SET needs = ? WHERE id = ?",
                  (value, item_id))
     conn.commit()
     conn.close()
@@ -233,6 +250,7 @@ def test_a_terminal_item_cannot_be_corrected(client):
 @pytest.mark.parametrize("body", [
     {"type": "nonsense"}, {"type": 7}, {"severity": "urgent"},
     {"severity": []}, {"specification": 7}, {"definition_of_done": ["a"]},
+    {"needs": "urgent"}, {"needs": 7}, {"needs": None}, {"needs": []},
 ])
 def test_a_value_outside_its_closed_set_is_refused(client, body):
     assert _correct(client, "bug", body).status_code == 400
@@ -319,7 +337,7 @@ def test_an_explicit_null_moves_a_work_item_to_its_corrections_queue(client):
     corrections queue, which an epic's `null` does not do (that case is
     covered separately). The move writes no note."""
     r = _correct(client, "child", {"parent_id": None})
-    assert r.status_code == 200 and r.json()["parent_id"] == "cq_vivy"
+    assert r.status_code == 200 and r.json()["parent_id"] == "cq_fennick"
     assert _notes("child") == []
 
 
@@ -362,7 +380,18 @@ def test_retyping_an_epic_with_children_is_refused(client):
 
 
 def test_a_childless_epic_may_be_retyped(client):
-    assert _correct(client, "epic_bare", {"type": None}).status_code == 200
+    """`epic_bare` is `proposed`, so this retype needs the same gate
+    `/decline` does (library/decisions/0005) — an ordinary `AGENT` credential
+    is refused (below); this one holds `epic.approve` and names a human."""
+    r = _correct(client, "epic_bare", {"type": None, "acting_human": HUMAN},
+                 token=OPERATOR)
+    assert r.status_code == 200, r.text
+
+
+def test_retyping_a_proposed_epic_out_needs_epic_approve(client):
+    r = _correct(client, "epic_bare", {"type": None})
+    assert r.status_code == 403
+    assert _row("epic_bare")["type"] == "epic"
 
 
 def test_a_parentless_epic_retyped_to_a_work_item_gets_the_queue(client):
@@ -371,12 +400,35 @@ def test_a_parentless_epic_retyped_to_a_work_item_gets_the_queue(client):
     other direction from `test_an_item_in_a_queue_cannot_be_retyped_to_epic_
     in_a_later_request`'s epic-from-queue case, and no `parent_id` is sent
     in the request either way."""
-    r = _correct(client, "epic_bare", {"type": None})
+    r = _correct(client, "epic_bare", {"type": None, "acting_human": HUMAN},
+                 token=OPERATOR)
     assert r.status_code == 200, r.text
-    assert _row("epic_bare")["parent_id"] == "cq_vivy"
+    assert _row("epic_bare")["parent_id"] == "cq_fennick"
 
 
 # --- ADR-0030's approval invariant ---------------------------------------------
+
+
+def test_a_declined_epics_specification_is_not_edited(client):
+    """library/decisions/0005."""
+    r = _correct(client, "epic_declined", {"specification": "a new scope"})
+    assert r.status_code == 409
+    assert "declined epic" in r.json()["error"]
+    assert "repropose" in r.json()["hint"]
+    assert _row("epic_declined")["specification"] == "scope nobody will build"
+
+
+def test_a_declined_epics_definition_of_done_is_not_edited(client):
+    r = _correct(client, "epic_declined", {"definition_of_done": "new"})
+    assert r.status_code == 409
+    assert _row("epic_declined")["definition_of_done"] == "a finish line"
+
+
+def test_a_declined_epics_severity_may_still_be_corrected(client):
+    """The refusal is on the two approval fields, not on the item."""
+    r = _correct(client, "epic_declined", {"severity": "high"})
+    assert r.status_code == 200
+    assert r.json()["severity"] == "high"
 
 
 def test_editing_an_approved_epics_text_returns_it_to_proposed(client):
@@ -396,7 +448,7 @@ def test_a_demotion_takes_the_epic_off_its_course_and_records_why(client):
     assert r.status_code == 200
     assert _course_entries() == ["epic", "other_epic_in_order"]
     note = _notes("epic_ok")[0]
-    assert "Left the Course" in note and "course_vivy" in note
+    assert "Left the Course" in note and "course_fennick" in note
     assert "position 2" in note
     conn = _db()
     course = conn.execute("SELECT version FROM courses").fetchone()
@@ -411,8 +463,12 @@ def test_a_demotion_takes_the_epic_off_its_course_and_records_why(client):
 
 def test_a_retype_takes_the_epic_off_its_course_with_the_retype_as_the_reason(
         client):
+    """`epic_ok` is already `approved`, so an ordinary `AGENT` credential may
+    retype it out unassisted, as it always could — only the write changes
+    (library/decisions/0005): the item left epic-hood, so it carries no
+    maturity at all rather than being demoted to `proposed`."""
     r = _correct(client, "epic_ok", {"type": None})
-    assert r.status_code == 200 and r.json()["maturity"] == "proposed"
+    assert r.status_code == 200 and r.json()["maturity"] is None
     assert "epic_ok" not in _course_entries()
     conn = _db()
     note = conn.execute("SELECT note FROM course_events").fetchone()["note"]
@@ -485,13 +541,13 @@ def test_an_approval_cannot_be_laundered_through_a_retype_round_trip(client):
     Stating the invariant on the resulting state of ONE call did not stop it,
     because an approval outlives the call."""
     assert _correct(client, "epic_ok", {"type": None}).status_code == 200
-    assert _row("epic_ok")["maturity"] == "proposed"          # closed at step one
+    assert _row("epic_ok")["maturity"] is None          # closed at step one
     # Retyping away from `epic` with no parent sent moved it into its
     # product's corrections queue (`library/specs/one-home-per-work-item`,
     # PR 2); clearing `parent_id` is what the retype back to epic needs in
     # the same request, the same door `test_an_item_in_a_queue_cannot_be_
     # retyped_to_epic_in_a_later_request` documents.
-    assert _row("epic_ok")["parent_id"] == "cq_vivy"
+    assert _row("epic_ok")["parent_id"] == "cq_fennick"
     assert _correct(client, "epic_ok",
                     {"specification": "text nobody approved"}).status_code == 200
     assert _correct(client, "epic_ok",
@@ -553,19 +609,20 @@ def test_doing_what_the_note_says_actually_works(client):
         "the note promised the approval would stand and it did not")
 
 
-def test_a_retype_demotion_is_told_no_assertion_would_have_helped(client):
-    """The other cause, and the one where the affordance must NOT be offered.
-    A caller told to send `end_state_unchanged` after a retype would send it and
-    get a 400, because the route refuses the pair. So this branch says the
-    retype revoked it and that no assertion would have kept it."""
+def test_a_retype_out_of_an_approved_epic_is_told_its_maturity_was_cleared(
+        client):
+    """The retype note is its own branch now (library/decisions/0005), and
+    reads differently from a plain demotion: the item left epic-hood, so it
+    carries no maturity at all rather than being returned to `proposed`.
+    `end_state_unchanged` still cannot rescue a retype — `_retype_conflict`
+    refuses that combination with its own 400, covered elsewhere — so this
+    note names no assertion a caller could have sent instead."""
     r = _correct(client, "epic_ok", {"type": None})
-    assert r.status_code == 200 and r.json()["maturity"] == "proposed"
+    assert r.status_code == 200 and r.json()["maturity"] is None
     note = _notes("epic_ok")[0]
-    assert "retype is what revoked it" in note
-    assert "REFUSED" in note and "400" in note, (
-        "the note does not say the assertion is refused alongside a retype")
-    assert "would have kept" in note, (
-        "the note does not tell the caller no assertion would have saved this")
+    assert "Maturity cleared" in note
+    assert "left epic-hood" in note
+    assert "no maturity value" in note
 
 
 def test_asserting_the_end_state_did_not_move_keeps_the_approval(client):
@@ -688,11 +745,11 @@ def test_the_assertion_does_not_reopen_the_retype_launder(client):
     assert _row("epic_ok")["maturity"] == "approved"
 
     assert _correct(client, "epic_ok", {"type": None}).status_code == 200
-    assert _row("epic_ok")["maturity"] == "proposed"
+    assert _row("epic_ok")["maturity"] is None
     # Moved into its product's corrections queue by the retype above
     # (`library/specs/one-home-per-work-item`, PR 2); cleared below in the
     # same request that retypes it back to epic.
-    assert _row("epic_ok")["parent_id"] == "cq_vivy"
+    assert _row("epic_ok")["parent_id"] == "cq_fennick"
     assert _correct(client, "epic_ok",
                     {"specification": "text nobody approved",
                      "end_state_unchanged": True}).status_code == 200
@@ -837,21 +894,21 @@ def test_re_parenting_under_a_live_lease_is_refused(client):
 
 
 def test_an_item_may_be_moved_into_its_products_corrections_queue(client):
-    r = _correct(client, "child", {"parent_id": "cq_vivy"})
+    r = _correct(client, "child", {"parent_id": "cq_fennick"})
     assert r.status_code == 200, r.text
-    assert r.json()["parent_id"] == "cq_vivy"
-    assert _row("child")["parent_id"] == "cq_vivy"
+    assert r.json()["parent_id"] == "cq_fennick"
+    assert _row("child")["parent_id"] == "cq_fennick"
 
 
 def test_another_products_queue_is_refused_as_a_parent(client):
-    r = _correct(client, "bug", {"parent_id": "cq_constance"}, token=WIDE)
+    r = _correct(client, "bug", {"parent_id": "cq_marlow"}, token=WIDE)
     assert r.status_code == 400
-    assert r.json() == {"error": "parent not found: cq_constance"}
+    assert r.json() == {"error": "parent not found: cq_marlow"}
     assert _row("bug")["parent_id"] is None
 
 
 def test_an_epic_cannot_be_moved_into_a_corrections_queue(client):
-    r = _correct(client, "epic_bare", {"parent_id": "cq_vivy"})
+    r = _correct(client, "epic_bare", {"parent_id": "cq_fennick"})
     assert r.status_code == 400
     assert "epic" in r.json()["error"]
 
@@ -860,12 +917,12 @@ def test_an_item_in_a_queue_cannot_be_retyped_to_epic_in_a_later_request(client)
     """Two requests, not one: move the item into its queue, then retype it
     with no `parent_id` in the payload. The stored queue parent must still
     be checked against the new type (reviewer, PR #237 round 1)."""
-    assert _correct(client, "task", {"parent_id": "cq_vivy"}).status_code == 200
+    assert _correct(client, "task", {"parent_id": "cq_fennick"}).status_code == 200
     r = _correct(client, "task", {"type": "epic"})
     assert r.status_code == 400, r.text
     assert "epic" in r.json()["error"]
     assert _row("task")["type"] != "epic"
-    assert _row("task")["parent_id"] == "cq_vivy"
+    assert _row("task")["parent_id"] == "cq_fennick"
     # Leaving the queue in the same request is the way through.
     r = _correct(client, "task", {"type": "epic", "parent_id": None})
     assert r.status_code == 200, r.text
@@ -877,7 +934,7 @@ def test_moving_into_a_queue_is_not_blocked_by_the_fence_check(client):
     for a queue id — it is not a row in `issue_items`, so `ancestor_ids`
     stops at once and no lease is ever rooted there either. No logic change
     was needed for this; this is the move the plan asks to be covered."""
-    r = _correct(client, "child", {"parent_id": "cq_vivy"})
+    r = _correct(client, "child", {"parent_id": "cq_fennick"})
     assert r.status_code == 200, r.text
 
 
@@ -885,7 +942,7 @@ def test_moving_out_of_a_live_lease_into_a_queue_is_refused(client):
     """The departure-side fence check applies to a queue destination exactly
     as it does to detaching to top level."""
     _take_lease("epic")
-    r = _correct(client, "child", {"parent_id": "cq_vivy"})
+    r = _correct(client, "child", {"parent_id": "cq_fennick"})
     assert r.status_code == 409 and r.json()["lease"]["holder"] == "someone-else"
     assert r.json()["reason"] == "held"
     assert _row("child")["parent_id"] == "epic"
@@ -895,7 +952,7 @@ def test_moving_out_of_a_live_lease_into_a_queue_is_refused(client):
 # PR 2, section 5 test 1) -----------------------------------------------------
 
 
-def _seed_a_filed_work_item(item_id, *, parent_id="cq_vivy", key="CQ·9"):
+def _seed_a_filed_work_item(item_id, *, parent_id="cq_fennick", key="CQ·9"):
     """A row shaped the way a real `POST /items` create with no parent would
     leave it, under PR 2: the queue from the start, never NULL."""
     conn = _db()
@@ -904,7 +961,7 @@ def _seed_a_filed_work_item(item_id, *, parent_id="cq_vivy", key="CQ·9"):
         "state, type, created_by, created_by_kind, needs, parent_id, "
         "topics, created_at, item_key) "
         "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (item_id, "vivy", "A filed work item", "body text", "{}", "low",
+        (item_id, "fennick", "A filed work item", "body text", "{}", "low",
          "open", None, "agent", "agent", "agent", parent_id, "[]",
          _ts(days=1), key))
     conn.commit()
@@ -949,14 +1006,14 @@ def test_a_move_changes_parent_id_alone(client):
     _assert_only_parent_moved("epic")
 
     assert _correct(client, "filed",
-                    {"parent_id": "cq_vivy"}).status_code == 200
-    _assert_only_parent_moved("cq_vivy")
+                    {"parent_id": "cq_fennick"}).status_code == 200
+    _assert_only_parent_moved("cq_fennick")
 
     assert _correct(client, "filed", {"parent_id": "epic"}).status_code == 200
     _assert_only_parent_moved("epic")
 
     assert _correct(client, "filed", {"parent_id": None}).status_code == 200
-    _assert_only_parent_moved("cq_vivy")
+    _assert_only_parent_moved("cq_fennick")
 
 
 def test_a_parent_move_with_another_field_notes_only_the_other_field(client):
@@ -1060,7 +1117,7 @@ def test_the_holder_may_move_an_item_out_of_its_own_epic(client):
     _take_lease("epic", holder="session-1")
     r = _correct(client, "child", {"parent_id": None, "owner": "session-1"})
     assert r.status_code == 200, r.json()
-    assert _row("child")["parent_id"] == "cq_vivy"
+    assert _row("child")["parent_id"] == "cq_fennick"
 
 
 def test_the_holder_may_move_an_item_into_an_epic_it_holds(client):
@@ -1169,7 +1226,7 @@ def test_every_change_is_named_in_the_thread(client):
     r = _correct(client, "bug", {"severity": "high", "type": "epic"})
     assert r.status_code == 200
     note = _notes("bug")[0]
-    assert "vivy-agent" in note
+    assert "fennick-agent" in note
     assert "**severity:**" in note and "'low' → 'high'" in note
     assert "**type:**" in note
 
@@ -1205,9 +1262,9 @@ def test_a_correction_cannot_write_refs(client):
 def test_a_correction_cannot_move_an_item_between_products(client):
     """`product` is immutable everywhere, and the descendant-count disclosure
     depends on that staying true."""
-    r = _correct(client, "bug", {"severity": "high", "product": "constance"})
+    r = _correct(client, "bug", {"severity": "high", "product": "marlow"})
     assert r.status_code == 200
-    assert _row("bug")["product"] == "vivy"
+    assert _row("bug")["product"] == "fennick"
 
 
 def test_an_explicit_null_clears_a_definition_of_done(client):
@@ -1231,15 +1288,15 @@ def test_a_lease_outside_the_callers_scope_blocks_without_disclosing_itself(clie
     upstream today, since no route can build a cross-product edge — which is the
     argument this check exists so as not to depend on."""
     conn = _db()
-    conn.execute("UPDATE issue_items SET product='constance' WHERE id='epic'")
+    conn.execute("UPDATE issue_items SET product='marlow' WHERE id='epic'")
     conn.commit()
     conn.close()
-    _take_lease("epic", holder="a-constance-agent")
+    _take_lease("epic", holder="a-marlow-agent")
     r = _correct(client, "child", {"parent_id": None})
     assert r.status_code == 409
     assert "outside this identity's scope" in r.json()["error"]
     assert "lease" not in r.json()
-    assert "a-constance-agent" not in json.dumps(r.json())
+    assert "a-marlow-agent" not in json.dumps(r.json())
 
 
 def test_an_unenumerable_subtree_refuses_the_retype(client, monkeypatch):
@@ -1434,3 +1491,61 @@ def test_topics_do_not_disturb_the_approval_invariant(client):
     r = _correct(client, "epic_ok", {"topics": ["DESIGN"]})
     assert r.status_code == 200, r.text
     assert _row("epic_ok")["maturity"] == "approved"
+
+
+# --- needs, added 2026-10-28 (CQ·251) --------------------------------------------
+# `needs` says who may execute an item (agent, operator, either) — a triage fact,
+# unlike `state`, which `/correct` still refuses. `/reconcile-pr`'s retired
+# `abandoned` outcome used to set it with no record at all; this route is the one
+# door back, and it records old and new like `severity` does.
+
+
+@pytest.mark.parametrize("value", sorted(store.ITEM_NEEDS))
+def test_needs_can_be_set_to_each_value(client, value):
+    start = next(v for v in sorted(store.ITEM_NEEDS) if v != value)
+    _set_needs("bug", start)
+    r = _correct(client, "bug", {"needs": value})
+    assert r.status_code == 200, r.text
+    assert r.json()["needs"] == value
+    assert _row("bug")["needs"] == value
+    note = _notes("bug")[0]
+    assert "**needs:**" in note
+    assert f"'{start}' → '{value}'" in note
+
+
+def test_a_needs_value_outside_the_set_changes_nothing(client):
+    r = _correct(client, "bug", {"needs": "urgent"})
+    assert r.status_code == 400
+    assert r.json()["supported"] == sorted(store.ITEM_NEEDS)
+    assert _row("bug")["needs"] == "agent"
+    assert _notes("bug") == []
+
+
+def test_a_null_needs_is_refused_rather_than_cleared(client):
+    """Unlike `severity`, `null` is not a quiet no-op here: it is a value
+    outside `store.ITEM_NEEDS`, so it is refused like any other bad value."""
+    r = _correct(client, "bug", {"needs": None})
+    assert r.status_code == 400
+    assert r.json()["supported"] == sorted(store.ITEM_NEEDS)
+    assert _row("bug")["needs"] == "agent"
+    assert _notes("bug") == []
+
+
+def test_setting_the_same_needs_again_is_a_no_op(client):
+    r = _correct(client, "bug", {"needs": "agent"})
+    assert r.status_code == 200
+    assert _notes("bug") == []
+
+
+def test_needs_alone_is_enough_of_a_field(client):
+    assert _correct(client, "bug", {"needs": "operator"}).status_code == 200
+
+
+def test_needs_correction_under_another_holders_lease_is_refused(client):
+    """The same hold discipline `severity` carries: no change to an item
+    someone else has checked out."""
+    _take_lease("epic")
+    r = _correct(client, "child", {"needs": "operator"})
+    assert r.status_code == 409
+    assert r.json()["reason"] == "held"
+    assert _row("child")["needs"] == "agent"

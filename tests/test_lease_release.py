@@ -34,7 +34,7 @@ import lease
 import protocol
 import store
 
-AGENT = "agent-token-vivy"
+AGENT = "agent-token-fennick"
 WIDE = "agent-token-wide"
 
 
@@ -75,7 +75,7 @@ def client(tmp_path, monkeypatch, ledger_tables):
             blocking_root_id TEXT, blocking_holder TEXT, blocks_by TEXT, blocking_taken_for TEXT);
         CREATE TABLE call_slips (
             id TEXT PRIMARY KEY, item_id TEXT, product TEXT, claim_owner_label TEXT,
-            issued_at TEXT, expires_at TEXT, grant_json TEXT);
+            issued_at TEXT, expires_at TEXT, grant_json TEXT, crew TEXT);
     """)
     # **`claimed_at` IS SET ON EVERY CLAIMED ROW, and its absence was hiding a
     # bug** (reviewer, PR #20). Both `claim_status` and `claim_statuses`
@@ -86,20 +86,20 @@ def client(tmp_path, monkeypatch, ledger_tables):
     conn.executemany(
         "INSERT INTO issue_items (id, product, title, type, state, claimed_by, "
         "claimed_at, parent_id, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
-        [("epic_v", "vivy", "A vivy epic", "epic", "open", None, None, None,
+        [("epic_v", "fennick", "A fennick epic", "epic", "open", None, None, None,
           _ts(days=3)),
          # Two siblings under one epic — the pair that makes `taken_for` mean
          # something. Without both, releasing one could never be distinguished
          # from releasing the fence.
-         ("task_a", "vivy", "First task", "task", "claimed", "session-1",
+         ("task_a", "fennick", "First task", "task", "claimed", "session-1",
           _ts(hours=2), "epic_v", _ts(days=2)),
-         ("task_b", "vivy", "Second task", "task", "claimed", "session-1",
+         ("task_b", "fennick", "Second task", "task", "claimed", "session-1",
           _ts(hours=2), "epic_v", _ts(days=2)),
-         ("lone_v", "vivy", "Parentless", "task", "claimed", "session-1",
+         ("lone_v", "fennick", "Parentless", "task", "claimed", "session-1",
           _ts(hours=3), None, _ts(days=1)),
-         ("open_v", "vivy", "Not claimed", "task", "open", None, None, None,
+         ("open_v", "fennick", "Not claimed", "task", "open", None, None, None,
           _ts(days=1)),
-         ("task_c", "constance", "Another product", "task", "claimed",
+         ("task_c", "marlow", "Another product", "task", "claimed",
           "session-1", _ts(days=2), None, _ts(days=1))])
     # ONE live lease, on the epic, taken FOR task_a.
     conn.executemany(
@@ -114,7 +114,7 @@ def client(tmp_path, monkeypatch, ledger_tables):
 
     tokens = tmp_path / "api-tokens.json"
     tokens.write_text(json.dumps({
-        AGENT: {"name": "vivy-agent", "products": ["vivy"]},
+        AGENT: {"name": "fennick-agent", "products": ["fennick"]},
         WIDE: {"name": "wide-agent", "products": ["*"]},
     }))
     ledger_tables(db)
@@ -526,6 +526,60 @@ def test_claim_statuses_agrees_with_claim_status_row_by_row(client):
         for row in rows:
             one = lease.claim_status(conn, row)
             assert batched.get(row["id"], (False, None)) == one, row["id"]
+    finally:
+        conn.close()
+
+
+def test_the_listing_and_claim_status_agree_after_a_re_parent(client):
+    """issue_01M06VDX8NRKG3WZ02DQT3VK2A: an item re-parented while a dead,
+    unreleased lease taken for it still sits on its OLD root. `claim_status`
+    reads the lease on the item's current root, finds none, and falls back to
+    the 24-hour TTL, so a claim two hours old is held. The listing's SQL must
+    say the same rather than judging the item on the stale lease's clock."""
+    conn = _conn()
+    try:
+        conn.execute(
+            "INSERT INTO issue_items (id, product, title, type, state, "
+            "created_at) VALUES ('epic_new', 'fennick', 'New home', 'epic', "
+            "'open', ?)", (_ts(days=1),))
+        conn.execute(
+            "INSERT INTO issue_items (id, product, title, type, state, "
+            "claimed_by, claimed_at, parent_id, created_at) VALUES "
+            "('moved', 'fennick', 'Moved', 'task', 'claimed', 'session-1', ?, "
+            "'epic_new', ?)", (_ts(hours=2), _ts(days=2)))
+        # Dead by the grace clock, never released, on the root it left.
+        conn.execute(
+            "INSERT INTO issue_leases (id, root_id, taken_for, holder, "
+            "taken_at, heartbeat_at) VALUES ('lease_stale', 'epic_v', 'moved', "
+            "'session-1', ?, ?)", (_ts(hours=6), _ts(hours=5)))
+        conn.commit()
+        row = conn.execute(f"SELECT {store.ITEM_COLUMNS} FROM issue_items "
+                           "WHERE id = 'moved'").fetchone()
+        expired, _ = lease.claim_status(conn, row)
+        sql, params = lease.claimable_clause()
+        listed = conn.execute(
+            f"SELECT 1 FROM issue_items WHERE id = 'moved' AND {sql}",
+            params).fetchone() is not None
+    finally:
+        conn.close()
+    assert expired is False
+    assert listed is expired
+
+
+def test_the_listing_still_reads_a_lease_on_the_current_root(client):
+    """The rooted match must not lose the ordinary case: task_a's own lease on
+    epic_v is live, so task_a is not listed, and a dead one on the same root
+    lists it."""
+    conn = _conn()
+    try:
+        sql, params = lease.claimable_clause()
+        listed = lambda: conn.execute(  # noqa: E731
+            f"SELECT 1 FROM issue_items WHERE id = 'task_a' AND {sql}",
+            params).fetchone() is not None
+        assert listed() is False
+        conn.execute("UPDATE issue_leases SET heartbeat_at = ?, taken_at = ? "
+                     "WHERE id = 'lease_1'", (_ts(hours=5), _ts(hours=6)))
+        assert listed() is True
     finally:
         conn.close()
 

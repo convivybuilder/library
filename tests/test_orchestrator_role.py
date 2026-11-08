@@ -16,17 +16,22 @@ import json
 import identity
 
 
-def test_the_role_adds_exactly_one_capability_over_agent():
+def test_the_role_adds_exactly_two_capabilities_over_agent():
     """A union over `agent` rather than a copy, so the two cannot drift. If
-    this ever reports more than one added capability, something widened the
-    role by accident."""
+    this ever reports more than these two added capabilities, something
+    widened the role by accident."""
     added = identity.ROLE_CAPS["orchestrator"] - identity.ROLE_CAPS["agent"]
-    assert added == {"roster.write"}
+    assert added == {"roster.write", "registry.write"}
 
 
 def test_an_ordinary_agent_lacks_roster_write():
     assert "roster.write" not in identity.ROLE_CAPS["agent"]
     assert "roster.write" not in identity.ROLE_CAPS["system"]
+
+
+def test_an_ordinary_agent_lacks_registry_write():
+    assert "registry.write" not in identity.ROLE_CAPS["agent"]
+    assert "registry.write" not in identity.ROLE_CAPS["system"]
 
 
 def test_the_orchestrator_keeps_the_ordinary_capabilities_agent_has():
@@ -60,6 +65,28 @@ def test_an_agent_credential_is_refused_roster_write(tmp_path, monkeypatch):
     ident = identity.resolve("Bearer tok")
     assert ident.kind == "agent"
     assert identity.authorized(ident, "roster.write") is False
+
+
+def test_orchestrator_is_nameable_and_holds_registry_write(tmp_path, monkeypatch):
+    """`registry.write` joins `roster.write` on the same role (CQ·242)."""
+    tokens = tmp_path / "t.json"
+    tokens.write_text(json.dumps({
+        "tok": {"name": "co-library", "products": ["*"],
+                "kind": "orchestrator"}}))
+    monkeypatch.setattr(identity, "TOKENS", tokens)
+    monkeypatch.setattr(identity, "CLIENT_TOKENS", tmp_path / "absent.json")
+    ident = identity.resolve("Bearer tok")
+    assert identity.authorized(ident, "registry.write") is True
+
+
+def test_an_agent_credential_is_refused_registry_write(tmp_path, monkeypatch):
+    tokens = tmp_path / "t.json"
+    tokens.write_text(json.dumps({
+        "tok": {"name": "a-worker", "products": ["*"]}}))
+    monkeypatch.setattr(identity, "TOKENS", tokens)
+    monkeypatch.setattr(identity, "CLIENT_TOKENS", tmp_path / "absent.json")
+    ident = identity.resolve("Bearer tok")
+    assert identity.authorized(ident, "registry.write") is False
 
 
 def test_the_nameable_set_still_excludes_the_client_role():

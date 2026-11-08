@@ -7,7 +7,7 @@ import Foundation
 /// is explicit that the root belongs there because of that fact, not on the
 /// mini that serves the Library.
 ///
-/// Three subcommands:
+/// Four subcommands:
 ///
 ///   root-ca generate-root --out root.crt
 ///       One-time. Generates the root's P-256 key inside the Secure Enclave,
@@ -33,6 +33,18 @@ import Foundation
 ///       Touch ID, and the certificate-fingerprint-and-expiry print after,
 ///       in the shape a registry enrolment command can take. Registry
 ///       enrolment itself is a separate tool this command does not call.
+///
+///   root-ca enroll <host> --root-cert <path> --library-host <ssh-host> [--days 90] [--register-command <cmd>]
+///       CQ·223: pulls the new host's certificate signing request over SSH
+///       as `agents@<host>`, prints its public-key fingerprint for the
+///       operator to compare against `individuator fingerprint` on the
+///       host's own screen, signs on confirmation, writes the certificate
+///       back over the same connection for the installer's `individuator
+///       adopt-cert`, and registers the machine on the Library's host with `--custody
+///       root-file` — unlike `sign`, this command runs that last step
+///       itself, over SSH, rather than printing it for the operator to run.
+///       A decline, or an SSH failure at any step, signs, pushes, and
+///       registers nothing past that point. Renewal takes the same path.
 ///
 /// **The fingerprint print and the Touch ID prompt are two different
 /// authorizations, not one.** The prompt proves a human touched the sensor;
@@ -63,7 +75,7 @@ func fail(_ message: String, exitCode: Int32 = 1) -> Never {
 func run() {
     var args = Array(CommandLine.arguments.dropFirst())
     guard !args.isEmpty else {
-        fail("usage: root-ca <generate-root|sign|sign-signer> [options]", exitCode: 2)
+        fail("usage: root-ca <generate-root|sign|sign-signer|enroll> [options]", exitCode: 2)
     }
     let command = args.removeFirst()
     do {
@@ -74,8 +86,10 @@ func run() {
             try runSign(args)
         case "sign-signer":
             try runSignSigner(args)
+        case "enroll":
+            try runEnroll(args)
         default:
-            fail("unknown command \(command.debugDescription); expected generate-root, sign, or sign-signer", exitCode: 2)
+            fail("unknown command \(command.debugDescription); expected generate-root, sign, sign-signer, or enroll", exitCode: 2)
         }
     } catch let e as CLIError {
         fail(e.message, exitCode: e.exitCode)
@@ -340,6 +354,86 @@ func runSignSigner(_ args: [String]) throws {
     print("  enroll_signing_cert.py issue \(email.lowercased()) \(machine) " +
         "\(result.certificateFingerprint) \(isoDate(issued.notAfter)) " +
         "--note \"signed by root-ca, \(isoDate(Date()))\"")
+}
+
+// MARK: - enroll
+
+/// `root-ca enroll <host>`'s host name is positional, unlike every other
+/// command's flags, because it is also the name a question has to be asked
+/// about ("does this match <host>'s own screen?") rather than just another
+/// value to look up — so it reads most naturally as `enroll macbook`, not
+/// `enroll --machine macbook`.
+func runEnroll(_ args: [String]) throws {
+    guard let host = args.first, !host.hasPrefix("--") else {
+        throw CLIError("enroll requires <host> as its first argument", exitCode: 2)
+    }
+    var p = ArgParser(Array(args.dropFirst()))
+    let days = try parseDays(p.value(for: "--days"), default: 90) // platform/decisions/0066 Handoff: 90-day machine certificates
+    guard let rootCertPath = p.value(for: "--root-cert") else {
+        throw CLIError("enroll requires --root-cert <path to the root certificate generate-root wrote>", exitCode: 2)
+    }
+    guard let libraryHost = p.value(for: "--library-host") else {
+        throw CLIError("enroll requires --library-host <the SSH host serving the Library>", exitCode: 2)
+    }
+    let registerCommand = p.value(for: "--register-command")
+        ?? EnrollmentCommands.defaultRegisterCommand
+    try p.requireEmpty()
+
+    let rootCertPEM = try readFile(rootCertPath, what: "root certificate")
+    let rootCertDER: Data
+    do {
+        rootCertDER = try PEM.decode(rootCertPEM, label: "CERTIFICATE")
+    } catch {
+        throw CLIError("could not read the root certificate at \(rootCertPath): \(error)")
+    }
+    guard let issuerCommonName = try? CertificateReader.subjectCommonName(certificateDER: rootCertDER)
+    else {
+        throw CLIError("the root certificate at \(rootCertPath) carries no readable commonName")
+    }
+
+    let signer: SecureEnclaveRootSigner
+    do {
+        signer = try SecureEnclaveRootSigner.load()
+    } catch let e as SecureEnclaveError {
+        throw CLIError(e.description)
+    }
+
+    let transport = SSHEnrollmentTransport(
+        libraryHost: libraryHost, registerCommand: registerCommand)
+
+    print("pulling \(host)'s certificate request over SSH as agents@\(host)...")
+
+    let result: Enrollment.Result
+    do {
+        result = try Enrollment.enroll(
+            host: host, issuerCommonName: issuerCommonName, days: days,
+            transport: transport, signer: signer,
+            printFingerprint: { fingerprint in
+                print("")
+                print("public key SHA-256 — compare this against what \(host)'s own screen shows")
+                print("for \"individuator fingerprint\" before confirming. This comparison is the")
+                print("authorization; Touch ID only confirms a human is present.")
+                print("")
+                print(fingerprint)
+                print("")
+            },
+            confirm: { _ in promptYesNo("does this match \(host)'s own screen? [y/N] ") })
+    } catch let e as EnrollmentError {
+        throw CLIError(e.description)
+    }
+
+    print("enrolled: \(host)")
+    print("  not_after:            \(isoDate(result.notAfter))")
+    print("  certificate SHA-256:  \(result.certificateFingerprint)")
+    print("  registered on \(libraryHost) with custody root-file")
+    print("  certificate on \(host): ~agents/.individuator-enroll/certificate.pem, for")
+    print("  \"individuator adopt-cert --cert <that path> --root <root certificate>\"")
+}
+
+func promptYesNo(_ prompt: String) -> Bool {
+    print(prompt, terminator: "")
+    guard let line = readLine() else { return false }
+    return line.trimmingCharacters(in: .whitespaces).lowercased() == "y"
 }
 
 // MARK: - helpers

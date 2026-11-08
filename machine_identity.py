@@ -142,6 +142,50 @@ def extended_key_usage_oids(der: bytes) -> set[bytes]:
         return set()
 
 
+_SUBJECT_ALT_NAME_OID = bytes((0x55, 0x1D, 0x11))
+_SAN_DNS_TAG = 0x82  # GeneralName dNSName [2] IMPLICIT IA5String
+_SAN_IP_TAG = 0x87   # GeneralName iPAddress [7] IMPLICIT OCTET STRING
+
+
+def dns_and_ip_names(der: bytes) -> set[str]:
+    """Every `dNSName` (lower-cased) and `iPAddress` (in `ipaddress`'s
+    compressed text form) in a certificate's `subjectAltName` extension, or
+    an empty set if it carries none.
+
+    The same minimal DER walk as `extended_key_usage_oids`, for the same
+    reason, and it fails closed the same way: a certificate this walk cannot
+    read names no host, so the caller refuses it rather than serving under
+    a name nobody checked.
+    """
+    import ipaddress
+    try:
+        _, cert_vs, _, _ = _der_tlv(der, 0)
+        _, tbs_vs, tbs_ve, _ = _der_tlv(der, cert_vs)
+        for tag, cvs, cve in _der_children(der, tbs_vs, tbs_ve):
+            if tag != _EXTENSIONS_TAG:
+                continue
+            _, seq_vs, seq_ve, _ = _der_tlv(der, cvs)
+            for _, ext_vs, ext_ve in _der_children(der, seq_vs, seq_ve):
+                fields = _der_children(der, ext_vs, ext_ve)
+                if not fields:
+                    continue
+                _, oid_vs, oid_ve = fields[0]
+                if der[oid_vs:oid_ve] != _SUBJECT_ALT_NAME_OID:
+                    continue
+                _, octet_vs, _ = fields[-1]
+                _, names_vs, names_ve, _ = _der_tlv(der, octet_vs)
+                names = set()
+                for n_tag, n_vs, n_ve in _der_children(der, names_vs, names_ve):
+                    if n_tag == _SAN_DNS_TAG:
+                        names.add(der[n_vs:n_ve].decode("ascii").lower())
+                    elif n_tag == _SAN_IP_TAG:
+                        names.add(str(ipaddress.ip_address(der[n_vs:n_ve])))
+                return names
+        return set()
+    except (IndexError, ValueError, UnicodeDecodeError):
+        return set()
+
+
 # UTCTime (`YYMMDDHHMMSSZ`) and GeneralizedTime (`YYYYMMDDHHMMSSZ`), the two
 # forms X.509's `Time` CHOICE allows (RFC 5280 §4.1.2.5).
 _UTCTIME_TAG = 0x17

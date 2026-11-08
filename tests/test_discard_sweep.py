@@ -77,7 +77,7 @@ def _insert_cold_signal(sig_id, kind, *, refs=None, meta=None,
         "INSERT INTO signals (id, source, kind, actor, ingested_by, product, "
         "refs, body, meta, privacy_class, ingested_at, embedded_at, dedup_key) "
         "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (sig_id, "test", kind, "someone", "someone", "vivy",
+        (sig_id, "test", kind, "someone", "someone", "fennick",
          json.dumps(refs or {}), "body", json.dumps(meta or {}), "internal",
          ingested_at, ingested_at, dedup_key))
     conn.commit()
@@ -91,7 +91,7 @@ def _insert_signal(path, sig_id, kind, *, refs=None, meta=None,
         "INSERT INTO signals (id, source, kind, actor, ingested_by, product, "
         "refs, body, meta, privacy_class, ingested_at) VALUES "
         "(?,?,?,?,?,?,?,?,?,?,?)",
-        (sig_id, "test", kind, "someone", "someone", "vivy",
+        (sig_id, "test", kind, "someone", "someone", "fennick",
          json.dumps(refs or {}), "body", json.dumps(meta or {}), "internal",
          ingested_at))
     conn.commit()
@@ -163,7 +163,7 @@ def _reinsert(dedup_key, kind="junk"):
     or, worse, returning a row that no longer exists."""
     row = {
         "id": f"sig_reinsert_{dedup_key}", "source": "test", "kind": kind,
-        "actor": "someone", "ingested_by": "someone", "product": "vivy",
+        "actor": "someone", "ingested_by": "someone", "product": "fennick",
         "stream": None, "body": "a fresh capture", "refs": "{}", "meta": "{}",
         "privacy_class": "internal", "dedup_key": dedup_key,
         "produced_at": None, "acting_human": None,
@@ -314,7 +314,7 @@ def test_a_sweep_pass_and_a_concurrent_writer_neither_get_a_lock_error(
                         "privacy_class, ingested_at) VALUES "
                         "(?,?,?,?,?,?,?,?,?,?,?)",
                         (f"sig_live_{i:04d}", "test", "note", "someone",
-                         "someone", "vivy", "{}", "b", "{}", "internal",
+                         "someone", "fennick", "{}", "b", "{}", "internal",
                          "2026-09-02 00:00:00.000000"))
                     conn.commit()
                 finally:

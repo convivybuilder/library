@@ -387,6 +387,78 @@ def test_extended_key_usage_oids_fails_closed_on_malformed_der(garbage):
     assert machine_identity.extended_key_usage_oids(garbage) == set()
 
 
+# --- subjectAltName DNS and IP names --------------------------------------
+
+def _san_der(tmp_path, **names):
+    ca_cert, ca_key = tls_ca.make_ca(tmp_path)
+    cert, _ = tls_ca.make_cert(tmp_path, "server", ca_cert, ca_key,
+                               ext_key_usage="serverAuth", **names)
+    return ssl.PEM_cert_to_DER_cert(cert.read_text())
+
+
+def test_dns_and_ip_names_reads_a_real_certificate(tmp_path):
+    """DNS names come back lower-cased and IPv6 in compressed form, the two
+    normalizations the remote listener's host match relies on."""
+    der = _san_der(tmp_path, dns_names=("LocalHost", "keel.host.example"),
+                   ip_names=("127.0.0.1", "2001:db8:0:0:0:0:0:1"),
+                   uri_names=("spiffe://convivy/machine/x",))
+    assert machine_identity.dns_and_ip_names(der) == {
+        "localhost", "keel.host.example", "127.0.0.1", "2001:db8::1"}
+
+
+def test_dns_and_ip_names_is_empty_for_a_certificate_with_no_extension(
+        tmp_path):
+    ca_cert, _ = tls_ca.make_ca(tmp_path)
+    der = ssl.PEM_cert_to_DER_cert(ca_cert.read_text())
+    assert machine_identity.dns_and_ip_names(der) == set()
+
+
+def test_dns_and_ip_names_fails_closed_on_a_truncated_certificate(tmp_path):
+    der = _san_der(tmp_path, ip_names=("192.0.2.10",))
+    assert machine_identity.dns_and_ip_names(der[: len(der) // 2]) == set()
+
+
+@pytest.mark.parametrize("garbage", [b"", b"\x00", b"not-a-certificate",
+                                     b"\x30\x80\xff\xff\xff\xff"])
+def test_dns_and_ip_names_fails_closed_on_malformed_der(garbage):
+    assert machine_identity.dns_and_ip_names(garbage) == set()
+
+
+def _patch_san_entry(der, name, tag=None, value=None):
+    """`der` with the dNSName entry for `name` given a new tag or new bytes
+    of the same length, so every enclosing DER length stays valid and only
+    the walk's handling of that one entry is under test."""
+    raw = name.encode("ascii")
+    entry = bytes([0x82, len(raw)]) + raw
+    assert der.count(entry) == 1
+    new = bytes([tag if tag is not None else 0x82, len(raw)]) + (value or raw)
+    assert len(new) == len(entry)
+    return der.replace(entry, new)
+
+
+def test_dns_and_ip_names_names_nothing_when_a_dns_name_is_not_ascii(
+        tmp_path):
+    """A non-ASCII dNSName empties the whole result rather than dropping
+    that one entry, so the valid names beside it cannot match a host
+    either (library#301 round 3)."""
+    der = _san_der(tmp_path, dns_names=("keel.example", "bad.example"),
+                   ip_names=("192.0.2.10",))
+    assert machine_identity.dns_and_ip_names(der) == {
+        "keel.example", "bad.example", "192.0.2.10"}
+    patched = _patch_san_entry(der, "bad.example",
+                               value="b\xe9d.example".encode("latin-1"))
+    assert machine_identity.dns_and_ip_names(patched) == set()
+
+
+def test_dns_and_ip_names_names_nothing_for_an_ip_of_odd_length(tmp_path):
+    """An iPAddress that is neither 4 nor 16 bytes empties the whole result
+    (library#301 round 3)."""
+    der = _san_der(tmp_path, dns_names=("keel.example", "odd.example"),
+                   ip_names=("192.0.2.10",))
+    patched = _patch_san_entry(der, "odd.example", tag=0x87)
+    assert machine_identity.dns_and_ip_names(patched) == set()
+
+
 # --- notAfter -----------------------------------------------------------
 
 def test_not_after_utc_matches_opensslS_own_reported_enddate(tmp_path):

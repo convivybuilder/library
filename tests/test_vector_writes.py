@@ -35,9 +35,9 @@ import protocol
 import store
 import vectors
 
-AGENT = "agent-token-vivy"
+AGENT = "agent-token-fennick"
 
-REGISTRY = {"_scopes": {"platform": {}}, "vivy": {"aliases": [], "repos": []}}
+REGISTRY = {"_scopes": {"platform": {}}, "fennick": {"aliases": [], "repos": []}}
 
 
 @pytest.fixture
@@ -79,14 +79,14 @@ def db(tmp_path, monkeypatch, vector_index):
     conn.executemany(
         "INSERT INTO issue_items (id, product, title, body, type, state, "
         "created_at) VALUES (?,?,?,?,'bug','open',?)",
-        [("item_old", "vivy", "The older item", "about leases",
+        [("item_old", "fennick", "The older item", "about leases",
           "2026-08-01 09:00:00.000000"),
-         ("item_new", "vivy", "The newer item", "about vectors",
+         ("item_new", "fennick", "The newer item", "about vectors",
           "2026-08-01 10:00:00.000000")])
     conn.executemany(
         "INSERT INTO signals (id, product, kind, body, privacy_class, "
         "ingested_at) VALUES (?,?,'note',?,'internal',?)",
-        [("sig_one", "vivy", "a captured thing", "2026-08-01 09:30:00.000000")])
+        [("sig_one", "fennick", "a captured thing", "2026-08-01 09:30:00.000000")])
     conn.commit()
     conn.close()
     vector_index(path)
@@ -99,7 +99,7 @@ def db(tmp_path, monkeypatch, vector_index):
 def client(db, tmp_path, monkeypatch):
     tokens = tmp_path / "api-tokens.json"
     tokens.write_text(json.dumps({
-        AGENT: {"name": "vivy-agent", "products": ["vivy"]}}))
+        AGENT: {"name": "fennick-agent", "products": ["fennick"]}}))
     registry = tmp_path / "projects.json"
     registry.write_text(json.dumps(REGISTRY))
     monkeypatch.setattr(identity, "TOKENS", tokens)
@@ -325,7 +325,7 @@ def _signal(db, signal_id, kind, body="some words about it"):
     conn.execute(
         "INSERT INTO signals (id, product, kind, body, privacy_class, "
         "ingested_at) VALUES (?,?,?,?,'internal',?)",
-        (signal_id, "vivy", kind, body, "2026-08-01 11:00:00.000000"))
+        (signal_id, "fennick", kind, body, "2026-08-01 11:00:00.000000"))
     conn.commit()
     conn.close()
 
@@ -442,7 +442,7 @@ def _fill(db, n, words):
     conn.executemany(
         "INSERT INTO issue_items (id, product, title, body, type, state, "
         "created_at) VALUES (?,?,?,?,'bug','open',?)",
-        [(f"bulk_{i:04d}", "vivy", f"bulk item {i}", body,
+        [(f"bulk_{i:04d}", "fennick", f"bulk item {i}", body,
           f"2026-08-02 09:{i // 60:02d}:{i % 60:02d}.000000") for i in range(n)])
     conn.commit()
     conn.close()
@@ -663,7 +663,7 @@ def test_a_created_signal_is_embedded_and_is_therefore_searchable(client, db):
     than an outright failure, because the search keeps answering."""
     r = client.post("/signals", json={
         "source": "github", "kind": "note", "actor": "someone",
-        "product": "vivy", "body": "a thing happened"}, headers=_h())
+        "product": "fennick", "body": "a thing happened"}, headers=_h())
     assert r.status_code == 201
     sid = r.json()["id"]
     assert len(conftest.vectors_for(db, sid)) == 1
@@ -674,7 +674,7 @@ def test_a_created_item_is_embedded(client, db):
     """Adjacency reads item vectors, so an item filed through the Library and not
     embedded is one the briefing can never find."""
     r = client.post("/items", json={
-        "product": "vivy", "title": "A newly filed item",
+        "product": "fennick", "title": "A newly filed item",
         "body": "with a body", "severity": "medium"}, headers=_h())
     assert r.status_code == 201, r.json()
     assert len(conftest.vectors_for(db, r.json()["id"])) == 1
@@ -683,12 +683,12 @@ def test_a_created_item_is_embedded(client, db):
 def test_an_idempotent_reply_does_not_re_embed_somebody_elses_row(client, db):
     """A 200 answers with a row this call did not create."""
     first = client.post("/items", json={
-        "product": "vivy", "title": "Filed once", "severity": "medium",
+        "product": "fennick", "title": "Filed once", "severity": "medium",
         "once_key": "k"}, headers=_h())
     assert first.status_code == 201
     stamp = _stamp(db, "issue_items", first.json()["id"])
     again = client.post("/items", json={
-        "product": "vivy", "title": "Filed once", "severity": "medium",
+        "product": "fennick", "title": "Filed once", "severity": "medium",
         "once_key": "k"}, headers=_h())
     assert again.status_code == 200
     assert len(conftest.vectors_for(db, first.json()["id"])) == 1
@@ -706,7 +706,7 @@ def test_an_embedding_failure_does_not_cost_the_capture(client, db,
     monkeypatch.setattr(vectors, "_embedder", broken)
     r = client.post("/signals", json={
         "source": "github", "kind": "note", "actor": "someone",
-        "product": "vivy", "body": "captured while the model was down"},
+        "product": "fennick", "body": "captured while the model was down"},
         headers=_h())
     assert r.status_code == 201
     sid = r.json()["id"]
@@ -742,7 +742,7 @@ def test_the_row_is_committed_before_the_embed_runs(client, db):
     try:
         r = client.post("/signals", json={
             "source": "github", "kind": "note", "actor": "someone",
-            "product": "vivy", "body": "a thing happened"}, headers=_h())
+            "product": "fennick", "body": "a thing happened"}, headers=_h())
     finally:
         libapp.vectors.set_embedder(None)
     assert r.status_code == 201

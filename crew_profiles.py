@@ -57,14 +57,28 @@ from __future__ import annotations
 import json
 import sqlite3
 
+import agent_sync
 import identity
 import reference
 
 
 def roster(conn: sqlite3.Connection) -> list[dict]:
-    """Every `roster_agents` row, ordered by name."""
-    return [dict(row) for row in
+    """Every `roster_agents` row, ordered by name.
+
+    **`source_doc_missing` is computed fresh on every call**, against the
+    served knowledge tree at `agent_sync.KNOWLEDGE_ROOT` — true only for a
+    row whose `source_doc` is set and whose file is no longer on that tree,
+    the read `issue_01M5H8RPFPM6VBVJCPBND1XVBT` names as "expose it on a
+    read the operator can see." A row with no `source_doc` — seeded, or
+    added by hand through `PUT /roster/{name}` — always reads `False`.
+    """
+    rows = [dict(row) for row in
             conn.execute("SELECT * FROM roster_agents ORDER BY name")]
+    for row in rows:
+        row["source_doc_missing"] = bool(row["source_doc"]) and (
+            agent_sync.source_missing(agent_sync.KNOWLEDGE_ROOT,
+                                      row["source_doc"]))
+    return rows
 
 
 def profiles(conn: sqlite3.Connection) -> list[dict]:

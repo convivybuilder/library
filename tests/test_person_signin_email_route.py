@@ -80,14 +80,14 @@ def client(tmp_path, monkeypatch):
     conn.executemany(
         "INSERT INTO person_products (person_id, product, granted_at, "
         "granted_by) VALUES (?, ?, '2026-01-01', 'x')",
-        [(MULTI, "vivy"), (MULTI, "constance"), (MULTI, "hollis")])
+        [(MULTI, "fennick"), (MULTI, "marlow"), (MULTI, "bramwell")])
     conn.commit()
     conn.close()
 
     tokens = tmp_path / "client-tokens.json"
     tokens.write_text(json.dumps({
         ORIENT: {"name": "orient", "products": ["*"]},
-        SCOPED: {"name": "a-scoped-client", "products": ["vivy", "hollis"]},
+        SCOPED: {"name": "a-scoped-client", "products": ["fennick", "bramwell"]},
         NOSCOPE_CLIENT: {"name": "a-scopeless-client", "products": []},
     }))
     agent_tokens = tmp_path / "api-tokens.json"
@@ -99,7 +99,7 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(identity, "CLIENT_TOKENS", tokens)
     monkeypatch.setattr(identity, "TOKENS", agent_tokens)
     registry = tmp_path / "projects.json"
-    registry.write_text(json.dumps({"vivy": {}, "constance": {}, "hollis": {}}))
+    registry.write_text(json.dumps({"fennick": {}, "marlow": {}, "bramwell": {}}))
     monkeypatch.setattr(projects, "REGISTRY_PATH", registry)
     projects.reload()
     yield TestClient(libapp.app)
@@ -122,15 +122,15 @@ def test_a_project_outside_the_callers_scope_is_absent(client):
     r = _post(client, SCOPED, "multi@example.com")
     assert r.status_code == 200
     body = r.json()
-    assert body["projects"] == ["hollis", "vivy"]
+    assert body["projects"] == ["bramwell", "fennick"]
     assert body["count"] == 2
-    assert "constance" not in json.dumps(body)
+    assert "marlow" not in json.dumps(body)
 
 
 def test_a_wildcard_credential_sees_every_granted_project(client):
     r = _post(client, ORIENT, "multi@example.com")
     assert r.status_code == 200
-    assert r.json() == {"projects": ["constance", "hollis", "vivy"], "count": 3}
+    assert r.json() == {"projects": ["bramwell", "fennick", "marlow"], "count": 3}
 
 
 def test_matches_the_id_route_field_for_field(client):
@@ -144,7 +144,7 @@ def test_the_email_is_normalised_the_same_way_a_write_would_normalise_it(
         client):
     r = _post(client, ORIENT, "  Multi@Example.COM  ")
     assert r.status_code == 200
-    assert r.json() == {"projects": ["constance", "hollis", "vivy"], "count": 3}
+    assert r.json() == {"projects": ["bramwell", "fennick", "marlow"], "count": 3}
 
 
 # --- unknown email reads exactly like an empty person -----------------------
@@ -178,14 +178,14 @@ def test_the_route_never_discloses_a_display_name(client):
 def test_an_administrator_sees_every_project_the_registry_knows(client):
     r = _post(client, ORIENT, "ada@example.com")
     assert r.status_code == 200
-    assert r.json() == {"projects": ["constance", "hollis", "vivy"], "count": 3}
+    assert r.json() == {"projects": ["bramwell", "fennick", "marlow"], "count": 3}
 
 
 def test_an_administrators_answer_is_still_bounded_by_the_callers_scope(client):
     r = _post(client, SCOPED, "ada@example.com")
     assert r.status_code == 200
-    assert r.json() == {"projects": ["hollis", "vivy"], "count": 2}
-    assert "constance" not in json.dumps(r.json())
+    assert r.json() == {"projects": ["bramwell", "fennick"], "count": 2}
+    assert "marlow" not in json.dumps(r.json())
 
 
 def test_a_scopeless_client_reading_an_administrator_sees_nothing(client):

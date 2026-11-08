@@ -83,6 +83,7 @@ def db(tmp_path, monkeypatch):
         CREATE TABLE roster_agents (
             id INTEGER PRIMARY KEY,
             name TEXT NOT NULL UNIQUE,
+            source_doc TEXT,
             created_at TEXT NOT NULL,
             created_by TEXT NOT NULL,
             updated_at TEXT NOT NULL,

@@ -19,8 +19,10 @@
 #      outside git's tracked blobs reaches the deploy area, which is what
 #      makes this safe where `cp -r`/`rsync` would not be.
 #   3. Builds a fresh venv inside that same deploy area from the exported
-#      requirements.txt, so the interpreter travels with the code rather
-#      than depending on the checkout's own .venv (rule 4).
+#      requirements.lock, so the interpreter travels with the code rather
+#      than depending on the checkout's own .venv (rule 4). pip installs it
+#      with --require-hashes and --only-binary :all:, so it installs only a
+#      wheel whose sha256 the lock lists (bin/lock-requirements).
 #   4. Runs the deployed serve.sh's own `--check` against the staged build,
 #      BEFORE the swap — the same interpreter-trust guard that has always
 #      gated a start now also gates an install, so a broken pip install or
@@ -113,6 +115,32 @@ set -eu
 # the Library has to run on Linux too (company/decisions/0010).
 PLIST_HOME_PLACEHOLDER='@@LIBRARY_HOME@@'
 
+# Where a Library service unit might be installed — none of these depend on
+# a parsed command-line option, only on $HOME and the test overrides named
+# in each comment, so they're resolved up here, ahead of the hidden
+# --internal-* entry points below, rather than after this script's own
+# argument parsing. INSTALL_LIBRARY_LAUNCH_AGENTS, INSTALL_LIBRARY_LAUNCHCTL
+# (below) and INSTALL_LIBRARY_LAUNCHD_DOMAIN (below, once $LABEL is known)
+# let a test harness redirect every launchd-facing operation this script
+# makes at a scratch directory, a stub binary and a throwaway domain instead
+# of the real ones, without this script needing to know it is under test.
+# Each defaults to the real value, so an operator run is unchanged.
+LAUNCH_AGENTS="${INSTALL_LIBRARY_LAUNCH_AGENTS:-$HOME/Library/LaunchAgents}"
+PLIST_NAME="com.convivy.library.plist"
+PLIST_LIVE="$LAUNCH_AGENTS/$PLIST_NAME"
+# INSTALL_LIBRARY_LAUNCH_DAEMONS and INSTALL_LIBRARY_SYSTEMD_UNIT, the same
+# shape as INSTALL_LIBRARY_LAUNCH_AGENTS above, let a test point the other
+# two places a Library service unit can be installed at a scratch file
+# instead of the real system location. $PLIST_DAEMON_LIVE is a macOS
+# LaunchDaemon's own copy of $PLIST_NAME (a two- or three-account install's
+# serving job, rendered as a system unit rather than a LaunchAgent —
+# company/decisions/0025 point 5); $SYSTEMD_UNIT_LIVE is that same job's
+# Linux systemd unit (company/decisions/0010). Neither is ever written by
+# this script — only read, by _live_library_db_path below — since rendering
+# and installing either one is Shipwright's CQ·87, not this file's.
+PLIST_DAEMON_LIVE="${INSTALL_LIBRARY_LAUNCH_DAEMONS:-/Library/LaunchDaemons}/$PLIST_NAME"
+SYSTEMD_UNIT_LIVE="${INSTALL_LIBRARY_SYSTEMD_UNIT:-/etc/systemd/system/com.convivy.library.service}"
+
 # Replaces every literal occurrence of $1 in the text on stdin with $2,
 # treating both as plain strings — no regex, and no special meaning for `&`
 # or `\` in either, which is what sed's own `s/.../.../` or awk's own
@@ -161,6 +189,72 @@ _plist_env_pairs() {
     }
   ' "$1"
 }
+
+# Parses a systemd unit file's own `Environment=KEY=VALUE` directives (one
+# assignment per directive — the shape this installer's own rendered unit
+# will always use, never systemd's space-separated or quoted forms) for
+# key $2's value in unit file $1. Returns 1, with nothing printed, when $1
+# doesn't exist or never sets $2.
+_systemd_env_value() {
+  [ -f "$1" ] || return 1
+  awk -v key="$2" '
+    /^Environment=/ {
+      line = $0
+      sub(/^Environment=/, "", line)
+      eq = index(line, "=")
+      if (eq == 0) { next }
+      k = substr(line, 1, eq - 1)
+      v = substr(line, eq + 1)
+      gsub(/^"/, "", v); gsub(/"$/, "", v)
+      if (k == key) { print v; found = 1 }
+    }
+    END { exit (found ? 0 : 1) }
+  ' "$1"
+}
+
+# Whether a Library service unit is installed anywhere this script knows to
+# look — the gate for the pre-migration check below: with nothing installed
+# yet, there is no running service that could self-restart out from under
+# an operator (see that check's own comment, further down, for the hazard).
+_any_live_unit_exists() {
+  [ -f "$PLIST_LIVE" ] || [ -f "$PLIST_DAEMON_LIVE" ] || [ -f "$SYSTEMD_UNIT_LIVE" ]
+}
+
+# LIBRARY_DB from whichever unit is actually installed — today's LaunchAgent
+# plist ($PLIST_LIVE), a LaunchDaemon plist ($PLIST_DAEMON_LIVE, a two- or
+# three-account install's own serving job rendered as a macOS system unit —
+# company/decisions/0025 point 5), or a systemd unit ($SYSTEMD_UNIT_LIVE,
+# that same job on Linux — company/decisions/0010). Read from the first that
+# both exists and sets it, root-owned units first: a LaunchDaemon plist or
+# systemd unit is what a service-account install runs, and the operator's
+# own LaunchAgent plist, which that operator can write, must not override
+# it. A single-account install has only the LaunchAgent plist. Prints
+# nothing, and returns 1, when none exists or none sets it.
+_live_library_db_path() {
+  if [ -f "$PLIST_DAEMON_LIVE" ]; then
+    v="$(_plist_env_pairs "$PLIST_DAEMON_LIVE" | awk -F= '$1=="LIBRARY_DB"{sub(/^[^=]*=/,""); print; exit}')"
+    if [ -n "$v" ]; then printf '%s\n' "$v"; return 0; fi
+  fi
+  if [ -f "$SYSTEMD_UNIT_LIVE" ]; then
+    v="$(_systemd_env_value "$SYSTEMD_UNIT_LIVE" LIBRARY_DB)" && [ -n "$v" ] && {
+      printf '%s\n' "$v"
+      return 0
+    }
+  fi
+  if [ -f "$PLIST_LIVE" ]; then
+    v="$(_plist_env_pairs "$PLIST_LIVE" | awk -F= '$1=="LIBRARY_DB"{sub(/^[^=]*=/,""); print; exit}')"
+    if [ -n "$v" ]; then printf '%s\n' "$v"; return 0; fi
+  fi
+  return 1
+}
+
+if [ "${1:-}" = "--internal-live-db-path" ]; then
+  # Not part of the public interface (usage() does not list it) — lets a
+  # test resolve LIBRARY_DB from whichever of the three unit files is
+  # staged, in isolation, without running a full install.
+  _live_library_db_path
+  exit $?
+fi
 
 # Reads `app.py`'s own `_DRAIN_DEADLINE_SECONDS` out of the deployed source
 # file at $1, truncated to whole seconds — `launchctl print`'s own `exit
@@ -356,22 +450,67 @@ for arg in "$@"; do
 done
 
 DEPLOY_DIR="$HOME/.local/deploy/library"
-# INSTALL_LIBRARY_LAUNCH_AGENTS, INSTALL_LIBRARY_LAUNCHCTL (below) and
-# INSTALL_LIBRARY_LAUNCHD_DOMAIN (below, once $LABEL is known) let a test
-# harness redirect every launchd-facing operation this script makes — the
-# LaunchAgents directory it writes a plist into, the launchctl binary it
-# invokes, and the domain it targets — at a scratch directory, a stub binary
-# and a throwaway domain instead of the real ones, without this script
-# needing to know it is under test. Each defaults to the real value, so an
-# operator run is unchanged.
-LAUNCH_AGENTS="${INSTALL_LIBRARY_LAUNCH_AGENTS:-$HOME/Library/LaunchAgents}"
-PLIST_NAME="com.convivy.library.plist"
-PLIST_LIVE="$LAUNCH_AGENTS/$PLIST_NAME"
 PLIST_RECORD="$HOME/.local/deploy/library-plist.sha256"
 LAUNCHCTL="${INSTALL_LIBRARY_LAUNCHCTL:-launchctl}"
 
+# The invoking user, read once — compared against the vault's own owner
+# (DB_OWNER, resolved once $MIG_DB_PATH is known) by every store-opening
+# step below.
+CURRENT_USER="$(id -un)"
+
+# Lets a test stand in a stub that logs the exact argv _run_as_db_owner
+# below hands it and then execs onward itself, instead of a real account
+# switch — the same shape INSTALL_LIBRARY_LAUNCHCTL already gives this
+# file's own launchd calls.
+SWITCH_USER_CMD="${INSTALL_LIBRARY_SWITCH_USER_CMD:-sudo}"
+
 say() { printf '\033[1;34m▸\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m!\033[0m %s\n' "$*" >&2; }
+
+# $1's owning username, read from the file itself — never assumed
+# (company/decisions/0025 point 5): BSD/macOS's `stat -f '%Su'` on Darwin,
+# GNU/Linux's `stat -c '%U'` on Linux, chosen by `uname -s` as serve.sh's
+# UNAME_S guard chooses (company/decisions/0010). Never try one form and fall
+# back to the other: on Linux `stat -f` is filesystem status and succeeds,
+# printing the block size and a literal "u" as the "owner", which made every
+# Linux install switch accounts. Prints nothing when $1 doesn't exist, the
+# platform is neither, or `stat` cannot read it.
+# INSTALL_LIBRARY_TEST_DB_OWNER overrides this, for a test to
+# simulate a store owned by an account that doesn't really exist on this
+# machine — never set in a real run.
+_file_owner() {
+  # Honoured only while a test has replaced the switch command with a stub
+  # that is not sudo; with the real sudo the owner always comes from the
+  # file, so a caller cannot choose which account to switch to.
+  if [ -n "${INSTALL_LIBRARY_TEST_DB_OWNER:-}" ] \
+     && [ -n "${INSTALL_LIBRARY_SWITCH_USER_CMD:-}" ] \
+     && [ "$(basename "$INSTALL_LIBRARY_SWITCH_USER_CMD")" != sudo ]; then
+    printf '%s\n' "$INSTALL_LIBRARY_TEST_DB_OWNER"
+    return 0
+  fi
+  case "$(uname -s 2>/dev/null)" in
+    Darwin) stat -f '%Su' "$1" 2>/dev/null || true ;;
+    Linux)  stat -c '%U' "$1" 2>/dev/null || true ;;
+  esac
+}
+
+# Runs "$@" as $DB_OWNER (set by the caller once $MIG_DB_PATH is known) —
+# directly, with no switch, when the invoking user already is that account
+# (the single-account install's own path, exactly as before this existed);
+# through $SWITCH_USER_CMD otherwise. `sudo -n` refuses before running
+# anything at all whenever becoming that account would need a password
+# (sudo(8): "-n ... if a password is required ... sudo will display an
+# error message and exit"), which is what makes a refused switch leave
+# nothing run — the caller decides whether a refusal here should stop the
+# install (see the owner_switch_refused handling around _compute_migration_
+# state below), this function only ever runs or refuses the one command.
+_run_as_db_owner() {
+  if [ -z "$DB_OWNER" ] || [ "$DB_OWNER" = "$CURRENT_USER" ]; then
+    "$@"
+    return $?
+  fi
+  "$SWITCH_USER_CMD" -n -u "$DB_OWNER" -- "$@"
+}
 
 # Find a real sha256 tool, never one a poisoned PATH could hand back — the
 # same principle, and the same shape, as the PYTHON_BIN search below: fixed
@@ -577,7 +716,7 @@ _db_alembic_revision() {
   db="$1"
   [ -f "$db" ] || { echo "__DB_MISSING__"; return 0; }
   [ -n "$DB_READ_PYTHON" ] || { echo "__UNREADABLE__"; return 0; }
-  "$DB_READ_PYTHON" -c "$_DB_READ_PY" "$db"
+  _run_as_db_owner "$DB_READ_PYTHON" -c "$_DB_READ_PY" "$db"
 }
 
 # The same read as _DB_READ_PY, minus the mode=ro&immutable=1 URI: a plain
@@ -620,7 +759,7 @@ _db_alembic_revision_live() {
   db="$1"
   [ -f "$db" ] || { echo "__DB_MISSING__"; return 0; }
   [ -n "$DB_READ_PYTHON" ] || { echo "__UNREADABLE__"; return 0; }
-  "$DB_READ_PYTHON" -c "$_DB_READ_LIVE_PY" "$db"
+  _run_as_db_owner "$DB_READ_PYTHON" -c "$_DB_READ_LIVE_PY" "$db"
 }
 
 # Finds the single alembic head among the version scripts at $1/alembic/
@@ -722,9 +861,18 @@ _read_migration_state_live() {
   _classify_db_revision "$(_db_alembic_revision_live "$1")"
 }
 
-# Fills MIG_STATE, MIG_DB_PATH, MIG_DB_REV and MIG_WAL_RETRIED from the live
-# plist's own LIBRARY_DB — read the same way this script already reads any
-# plist's EnvironmentVariables, via _plist_env_pairs.
+# Fills MIG_STATE, MIG_DB_PATH, MIG_DB_REV, MIG_WAL_RETRIED and DB_OWNER
+# from whichever unit is actually installed (_live_library_db_path, which
+# covers today's LaunchAgent plist, a LaunchDaemon plist, and a systemd
+# unit — company/decisions/0025 point 5, company/decisions/0010).
+#
+# DB_OWNER is resolved once $MIG_DB_PATH is known, and read from the vault
+# file itself, never assumed. When it differs from $CURRENT_USER, this
+# probes — with a complete no-op, `_run_as_db_owner true`, never any part
+# of the real read — whether the switch is even possible, and sets
+# MIG_STATE to the new "owner_switch_refused" state, read from nowhere
+# else, when it is not: a caller that refuses an install on that state
+# never attempted any store-opening step at all, probe included.
 #
 # A first "behind" read is retried in place, across
 # INSTALL_LIBRARY_SCHEMA_RETRY_TIMEOUT_SECONDS (default 2s, polled every
@@ -745,15 +893,19 @@ _compute_migration_state() {
   MIG_DB_REV=""
   MIG_STATE=""
   MIG_WAL_RETRIED=0
-  if [ -f "$PLIST_LIVE" ]; then
-    MIG_DB_PATH="$(_plist_env_pairs "$PLIST_LIVE" | awk -F= '$1=="LIBRARY_DB"{sub(/^[^=]*=/,""); print; exit}')"
-  fi
+  DB_OWNER=""
+  MIG_DB_PATH="$(_live_library_db_path)" || MIG_DB_PATH=""
   if [ -z "$MIG_DB_PATH" ]; then
     MIG_STATE="no_library_db"
     return 0
   fi
   if [ -z "$ALEMBIC_HEAD" ]; then
     MIG_STATE="unreadable"
+    return 0
+  fi
+  DB_OWNER="$(_file_owner "$MIG_DB_PATH")"
+  if [ -n "$DB_OWNER" ] && [ "$DB_OWNER" != "$CURRENT_USER" ] && ! _run_as_db_owner true; then
+    MIG_STATE="owner_switch_refused"
     return 0
   fi
   _read_migration_state "$MIG_DB_PATH"
@@ -925,10 +1077,12 @@ if [ "$STATUS_ONLY" -eq 1 ]; then
   _alembic_head_in_dir "$DEPLOY_DIR" || true
   _compute_migration_state
   case "$MIG_STATE" in
-    no_library_db)    echo "alembic db revision: unknown (LIBRARY_DB is not set in $PLIST_LIVE)" ;;
+    no_library_db)    echo "alembic db revision: unknown (LIBRARY_DB is not set in any installed unit)" ;;
     db_missing)       echo "alembic db revision: unknown (no database file at $MIG_DB_PATH)" ;;
     no_version_table) echo "alembic db revision: unknown ($MIG_DB_PATH has no alembic_version table)" ;;
     unreadable)       echo "alembic db revision: could not be read" ;;
+    owner_switch_refused)
+      echo "alembic db revision: unknown ($MIG_DB_PATH is owned by '$DB_OWNER'; '$CURRENT_USER' cannot switch to it without a password prompt)" ;;
     *)                echo "alembic db revision: $MIG_DB_REV" ;;
   esac
   if [ -n "$ALEMBIC_HEAD" ]; then
@@ -1213,11 +1367,13 @@ fi
 # "nothing was loaded, unloaded, kickstarted, or restarted" did not mean
 # nothing was about to happen).
 #
-# Skipped entirely when $PLIST_LIVE does not exist at all: with no job
-# loaded from a prior install, there is no running service that could
-# self-restart out from under an operator, so there is nothing here for this
-# gate to protect — the very first install onto a machine already requires
-# the vault to exist and be stamped by hand (store.py's baseline migration,
+# Skipped entirely when no unit is installed at all (_any_live_unit_exists:
+# today's LaunchAgent plist, a LaunchDaemon plist, or a systemd unit — see
+# _live_library_db_path): with no job loaded from a prior install, there is
+# no running service that could self-restart out from under an operator, so
+# there is nothing here for this gate to protect — the very first install
+# onto a machine already requires the vault to exist and be stamped by hand
+# (store.py's baseline migration,
 # `alembic/versions/0b1e7c4a9d52_baseline_the_migrated_vaults.py`), outside
 # this installer's own scope.
 #
@@ -1226,13 +1382,26 @@ fi
 # "Determine the tree's head from the alembic scripts in the commit being
 # installed") — the same principle as the code staged below, in a scratch
 # directory removed right after this check reads it.
-if [ -f "$PLIST_LIVE" ]; then
+if _any_live_unit_exists; then
   ALEMBIC_SCRATCH="${TMPDIR:-/tmp}/install-library-alembic-scratch.$$"
   rm -rf "$ALEMBIC_SCRATCH"
   mkdir -p "$ALEMBIC_SCRATCH"
   git -C "$REPO" archive "$SHA" -- alembic/versions 2>/dev/null | tar -x -C "$ALEMBIC_SCRATCH" 2>/dev/null || true
   _alembic_head_in_dir "$ALEMBIC_SCRATCH" || true
   _compute_migration_state
+
+  # Refused unconditionally, never bypassable with --allow-schema-behind
+  # (that flag is about a confirmed schema state, not about whether this
+  # process can even open the vault to find one) — company/decisions/0025
+  # point 5: when the vault belongs to a service account the invoking user
+  # cannot become, nothing below this point has run anything that opens it,
+  # the probe inside _compute_migration_state included.
+  if [ "$MIG_STATE" = "owner_switch_refused" ]; then
+    echo "install-library: REFUSING to install $SHA — $MIG_DB_PATH is owned by '$DB_OWNER', and '$CURRENT_USER' cannot switch to it without a password prompt." >&2
+    echo "  run this install as '$DB_OWNER', or grant '$CURRENT_USER' passwordless access to it (sudo -n -u $DB_OWNER true succeeding), then retry." >&2
+    rm -rf "$ALEMBIC_SCRATCH"
+    exit 1
+  fi
 
   # --- auto-migrate: only for "behind", never for a state where the vault's
   # own revision is unknown or unreadable (an unknown revision usually means
@@ -1277,16 +1446,22 @@ PENDING_FILES_EOF
     say "The vault is behind ($MIG_DB_REV, tree head ${ALEMBIC_HEAD:-unknown}) — backing it up to $BACKUP_DEST"
     # sqlite3's own `.backup` dot-command, never `cp`: the vault runs in WAL
     # mode, and a copy of the main file alone silently loses uncheckpointed
-    # writes `.backup` would not.
-    if ! "$SQLITE_BIN" "$MIG_DB_PATH" ".backup '$BACKUP_DEST'"; then
+    # writes `.backup` would not. Run as $DB_OWNER (_run_as_db_owner): the
+    # vault, and the directory this backup lands in, both belong to that
+    # account on a two- or three-account install, and _compute_migration_
+    # state above has already confirmed the switch works before this ever
+    # ran — this call never re-probes.
+    if ! _run_as_db_owner "$SQLITE_BIN" "$MIG_DB_PATH" ".backup '$BACKUP_DEST'"; then
       echo "install-library: REFUSING to install $SHA — could not back up $MIG_DB_PATH to $BACKUP_DEST" >&2
       rm -rf "$ALEMBIC_SCRATCH"
       exit 1
     fi
     # `sqlite3 -readonly` cannot open a WAL backup without a live writer; the
     # same `mode=ro&immutable=1` URI this script already uses to read the
-    # vault's own revision opens it correctly in every WAL state.
-    BACKUP_CHECK="$("$SQLITE_BIN" "file:$BACKUP_DEST?immutable=1" 'pragma quick_check' 2>&1)" || true
+    # vault's own revision opens it correctly in every WAL state. Run as
+    # $DB_OWNER too: the backup file the line above just wrote is owned by
+    # whichever account ran that command, same as $MIG_DB_PATH itself.
+    BACKUP_CHECK="$(_run_as_db_owner "$SQLITE_BIN" "file:$BACKUP_DEST?immutable=1" 'pragma quick_check' 2>&1)" || true
     if [ "$BACKUP_CHECK" != "ok" ]; then
       echo "install-library: REFUSING to install $SHA — the backup at $BACKUP_DEST failed its own integrity check: $BACKUP_CHECK" >&2
       rm -rf "$ALEMBIC_SCRATCH"
@@ -1298,8 +1473,16 @@ PENDING_FILES_EOF
     # install below extracts the new tree, so `upgrade head` run there
     # would resolve against the old graph. python -m alembic, never the
     # `alembic` console script, so this runs under the same interpreter
-    # $REPO's own venv was built with.
-    if ! ( cd "$REPO" && LIBRARY_DB="$MIG_DB_PATH" "$REPO/.venv/bin/python" -m alembic upgrade head ); then
+    # $REPO's own venv was built with. Run as $DB_OWNER, through a `sh -c`
+    # that takes $REPO, $MIG_DB_PATH and the interpreter as its own
+    # positional parameters rather than interpolated into the script text —
+    # the same reason _DB_READ_PY above takes the db path as argv rather
+    # than string-formatting it in: this process's own LIBRARY_DB is set
+    # inside that inner shell, never on _run_as_db_owner's own environment,
+    # because sudo resets the environment for the account it switches to
+    # regardless of what this process's own environment holds.
+    if ! _run_as_db_owner sh -c 'cd "$1" && LIBRARY_DB="$2" "$3" -m alembic upgrade head' sh \
+        "$REPO" "$MIG_DB_PATH" "$REPO/.venv/bin/python"; then
       echo "install-library: REFUSING to install $SHA — alembic upgrade head failed. The vault's pre-migration backup is kept at:" >&2
       echo "    $BACKUP_DEST" >&2
       rm -rf "$ALEMBIC_SCRATCH"
@@ -1320,7 +1503,7 @@ PENDING_FILES_EOF
     echo "install-library: REFUSING to install $SHA — the vault's schema state is not confirmed safe." >&2
     case "$MIG_STATE" in
       no_library_db)
-        echo "  LIBRARY_DB is not set in the live plist ($PLIST_LIVE) — there is no database to check." >&2 ;;
+        echo "  LIBRARY_DB is not set in any installed unit ($PLIST_LIVE, $PLIST_DAEMON_LIVE, or $SYSTEMD_UNIT_LIVE) — there is no database to check." >&2 ;;
       db_missing)
         echo "  no database file at $MIG_DB_PATH." >&2 ;;
       no_version_table)
@@ -1804,18 +1987,15 @@ mkdir -p "$STAGE"
 git -C "$REPO" archive "$SHA" | tar -x -C "$STAGE"
 chmod +x "$STAGE/serve.sh"
 
-# --- keep pip's own cache, and any source build's toolchain cache, out of
-# $HOME --------------------------------------------------------------------
+# --- keep pip's own cache out of $HOME --------------------------------------
 # pip writes its wheel/HTTP cache to $HOME/.cache by default on every
 # invocation, whether or not anything ends up installed — including the
 # internal pip run `python -m venv` shells out to via ensurepip to seed the
-# new venv, before requirements.txt is ever read. A source build for a
-# Rust-backed dependency (pydantic-core, tokenizers, py-rust-stemmers — none
-# guaranteed a prebuilt wheel for every platform/interpreter combination)
-# additionally invokes cargo, which creates $HOME/.cargo and $HOME/.rustup on
-# first use unless CARGO_HOME/RUSTUP_HOME are already set. All three read
-# $HOME from the environment, so all three would otherwise land inside
-# whatever $HOME this script is running under — never acceptable (rule 3's
+# new venv, before requirements.lock is ever read. The install below takes
+# wheels only, so no source build runs and no cargo toolchain cache is
+# created. pip reads $HOME from the environment, so its cache would
+# otherwise land inside whatever $HOME this script is running under — never
+# acceptable (rule 3's
 # principle, that nothing outside the deploy area and LaunchAgents gets
 # written under $HOME, extends to this). Everything from here through the
 # pip install below is confined to a scratch directory inside the staging
@@ -1825,17 +2005,21 @@ chmod +x "$STAGE/serve.sh"
 # in that falls back to it.
 BUILD_CACHE="$STAGE/.build-cache"
 mkdir -p "$BUILD_CACHE"
-export CARGO_HOME="$BUILD_CACHE/cargo"
-export RUSTUP_HOME="$BUILD_CACHE/rustup"
 export PIP_CACHE_DIR="$BUILD_CACHE/pip"
 export XDG_CACHE_HOME="$BUILD_CACHE/xdg"
 
 say "Building pinned interpreter ($PYTHON_BIN -m venv)"
 "$PYTHON_BIN" -m venv "$STAGE/.venv"
+# --only-binary :all: as well as --require-hashes: when the wheel's hash is
+# not in the lock, pip falls back to the sdist whose hash is, and builds it
+# with setuptools fetched from the index with no hash checked at all. Seen
+# on 2026-10-23 with alembic's wheel hash altered: the install succeeded
+# from the sdist.
 "$STAGE/.venv/bin/pip" install --quiet --disable-pip-version-check \
-    -r "$STAGE/requirements.txt"
+    --require-hashes --only-binary :all: \
+    -r "$STAGE/requirements.lock"
 rm -rf "$BUILD_CACHE"
-unset CARGO_HOME RUSTUP_HOME PIP_CACHE_DIR XDG_CACHE_HOME
+unset PIP_CACHE_DIR XDG_CACHE_HOME
 
 # --- rewrite the staged console scripts' shebangs for where they end up ----
 # pip writes each console script (pip itself, and one per entry point any

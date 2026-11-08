@@ -1,6 +1,6 @@
-"""Run the Library's two listeners — plain HTTP and mutual TLS — as two
-`uvicorn.Server` instances sharing one process, one event loop, and one
-SQLite writer.
+"""Run the Library's listeners — plain HTTP, and mutual TLS on loopback
+plus, when configured, a second remote address — as `uvicorn.Server`
+instances sharing one process, one event loop, and one SQLite writer.
 
 platform/decisions/0066, stage B. `serve.sh` used to `exec python -m uvicorn
 app:app --host 127.0.0.1 --port 8100` directly; it now execs this module
@@ -10,19 +10,37 @@ single SQLite writer — the ADR's own guess was that this is workable, with a
 second launchd job over the same database as the named fallback if it is
 not. It is: the risk this module actually has to manage is not the shared
 event loop, it is that `uvicorn.Server.serve()` installs a process-wide
-SIGTERM/SIGINT handler on entry, and two of those running concurrently would
-have the second one silently replace the first's — see `main()`.
+SIGTERM/SIGINT handler on entry, and more than one of those running
+concurrently would have the last one silently replace the rest — see
+`main()`.
 
 **The plain listener's own behaviour is exactly what it was before this file
-existed**: same host, same port, same log level, the one FastAPI lifespan
-that already ran under the old `python -m uvicorn` invocation. Everything
-below that concerns the TLS listener is additive, and if its material is not
-staged, the plain listener still starts — see `_build_tls_config`.
+existed**: same host unless `LIBRARY_PLAIN_HOST` says otherwise (and then
+only to another loopback address — `mtls.require_loopback_plain_host`
+refuses to start rather than honour anything else), same port, same log
+level, the one FastAPI lifespan that already ran under the old `python -m
+uvicorn` invocation. Everything below that concerns the TLS listeners is
+additive, and if the TLS material is not staged, the plain listener still
+starts — see `_build_tls_config`.
+
+**The multi-machine epic's Library clause**
+(issue_01M5FMP5GSE61PVQ4H96RK23FN) is `mtls.TLS_HOST`
+(`LIBRARY_TLS_HOST`): unset, only the loopback mutual-TLS listener binds, as
+it always has; set, a second mutual-TLS server also binds that address,
+alongside the loopback one rather than in place of it, sharing the loopback
+server's own `ssl.SSLContext`, `mtls.MTLSH11Protocol` and app — see
+`_build_tls_remote_config`. Every request on either binding still passes
+`machine_identity.MachineIdentityGate` — that gate is keyed on
+`mtls.EXTENSION_KEY`, which `mtls.MTLSH11Protocol` sets regardless of which
+address the listener using it is bound to, so no route is exempt on the
+remote binding that is not already exempt on the loopback one.
 """
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import signal
+import ssl
 import sys
 import traceback
 
@@ -49,25 +67,65 @@ LOG_LEVEL = "warning"
 # the margin that sets that constant's value are in app.py's comment above
 # it). So this names that constant rather than copying its value: two
 # literals drift, and a graceful shutdown that outlived the drain it mirrors
-# would re-open the lockout this whole mechanism exists to close. **Both
-# listeners carry it**:
-# the signal is process-wide, a wedged request may sit on either port, and
-# each server's `shutdown()` waits on its own connection set, so a bound on
-# only one leaves the other hanging the process anyway.
+# would re-open the lockout this whole mechanism exists to close. **Every
+# listener carries it**:
+# the signal is process-wide, a wedged request may sit on any of their
+# ports, and each server's `shutdown()` waits on its own connection set, so
+# a bound missing from any one of them leaves it hanging the process anyway.
 _GRACEFUL_SHUTDOWN_SECONDS = libapp._DRAIN_DEADLINE_SECONDS
+
+# How long a mutual-TLS connection may sit idle between requests before the
+# Library closes it. uvicorn's default is 5 s. Deck's machine key on the
+# operator's laptop is presence-gated (platform/decisions/0065): a TLS
+# handshake more than 300 s after the last approval shows the operator a
+# Touch ID or password prompt. Deck's key test on that laptop (2026-11-03)
+# showed that prompt once the window had lapsed. With a 5 s idle close,
+# every Deck call after a pause reconnects, and once the window has lapsed
+# that reconnect prompts, even for a background refresh the operator did
+# not start. Deck sends a heartbeat every 60 s, and asked for 120 s, twice
+# that interval: a late heartbeat keeps the connection open, while a fully
+# missed one leaves a 120 s gap that races this timer and may close it. A
+# prompt then comes only on a reconnect: a relaunch, a sleep, a drop, or
+# that race. 0065 allows the Library to keep an idle connection open longer
+# for exactly this reason.
+#
+# **Both mutual-TLS listeners, every client on them; the plain listener
+# keeps uvicorn's default.** uvicorn sets this per listener, and the
+# connection's certificate is what tells one client from another, so a
+# Deck-only value would mean new per-connection code in
+# `mtls.MTLSH11Protocol`. Nothing needs that: a client whose key has no
+# presence gate pays no prompt for a reconnect, so a longer idle hold only
+# keeps its socket open a little longer, and only a certified machine can
+# open one here. Revocation is unaffected, because the certificate registry
+# is read again on every request over an open connection
+# (`machine_identity.MachineIdentityGate`, through `resolve_machine`;
+# `mtls.MTLSH11Protocol` only stamps the certificate onto the connection).
+# The plain listener has no handshake to save, and
+# serves bearer-token clients on loopback, so it stays as it was.
+_TLS_IDLE_TIMEOUT_SECONDS = 120
 
 
 def _build_plain_config() -> uvicorn.Config:
-    config = uvicorn.Config(libapp.app, host=mtls.HOST, port=mtls.PLAIN_PORT,
-                             log_level=LOG_LEVEL,
+    """The plain listener's own `uvicorn.Config` — loopback only.
+
+    `require_loopback_plain_host` runs first and raises
+    `mtls.NonLoopbackPlainHost` for anything `LIBRARY_PLAIN_HOST` names that
+    is not loopback, so this never returns a config for an off-host bind:
+    the plain listener carries no TLS of its own, and nothing downstream
+    of this function is in a position to catch that mistake.
+    """
+    mtls.require_loopback_plain_host(mtls.PLAIN_HOST)
+    config = uvicorn.Config(libapp.app, host=mtls.PLAIN_HOST,
+                             port=mtls.PLAIN_PORT, log_level=LOG_LEVEL,
                              timeout_graceful_shutdown=_GRACEFUL_SHUTDOWN_SECONDS)
     config.load()
     return config
 
 
 def _build_tls_config() -> uvicorn.Config | None:
-    """A fully-armed mutual-TLS `uvicorn.Config`, or `None` if the TLS
-    material at `mtls.TLS_CERT` / `TLS_KEY` / `TLS_CA` is missing or invalid.
+    """A fully-armed mutual-TLS `uvicorn.Config` bound to loopback
+    (`mtls.HOST`), or `None` if the TLS material at `mtls.TLS_CERT` /
+    `TLS_KEY` / `TLS_CA` is missing or invalid.
 
     **`None` does not stop the process.** Stage B is explicitly "mutual TLS
     on 127.0.0.1:8443, and nobody is required to use it" — the listener is
@@ -92,6 +150,7 @@ def _build_tls_config() -> uvicorn.Config | None:
         # `_restart_watcher` task racing the first over the same module-level
         # globals. One `Config` runs it; the other explicitly does not.
         lifespan="off",
+        timeout_keep_alive=_TLS_IDLE_TIMEOUT_SECONDS,
         timeout_graceful_shutdown=_GRACEFUL_SHUTDOWN_SECONDS)
     # **NO `ssl_certfile` PASSED ABOVE, ON PURPOSE.** `Config.load()` builds
     # its own `SSLContext` from `ssl_certfile`/`ssl_keyfile`/etc whenever
@@ -104,6 +163,62 @@ def _build_tls_config() -> uvicorn.Config | None:
     # validated context directly, once, the only place a certificate is read.
     config.load()
     config.ssl = ctx
+    config.ssl_certfile = str(mtls.TLS_CERT)  # cosmetic: is_ssl for the log line
+    return config
+
+
+def _certificate_names(host: str) -> bool:
+    """Whether `mtls.TLS_CERT`'s subjectAltName carries `host`, as a DNS
+    name or an IP address. An unreadable certificate names nothing."""
+    try:
+        der = ssl.PEM_cert_to_DER_cert(mtls.TLS_CERT.read_text())
+    except (OSError, ValueError):
+        return False
+    try:
+        wanted = str(ipaddress.ip_address(host))
+    except ValueError:
+        wanted = host.lower()
+    return wanted in machine_identity.dns_and_ip_names(der)
+
+
+def _build_tls_remote_config(ssl_context: ssl.SSLContext) -> uvicorn.Config | None:
+    """A second mutual-TLS `uvicorn.Config`, bound to `mtls.TLS_HOST` at
+    `mtls.TLS_REMOTE_PORT`, reusing `ssl_context` — the certificate, trust
+    anchor and policy `_build_tls_config` already validated once for the
+    loopback listener, not re-validated for a second server. `None` when
+    `LIBRARY_TLS_HOST` is unset; the loopback listener binds unconditionally
+    either way and is unaffected by this function returning `None`.
+
+    `mtls.require_remote_tls_host` runs first and raises
+    `mtls.NonRemoteTlsHost` for a `LIBRARY_TLS_HOST` that is empty or itself
+    loopback, since the loopback listener built above already binds that
+    address.
+    """
+    if mtls.TLS_HOST is None:
+        return None
+    mtls.require_remote_tls_host(mtls.TLS_HOST)
+    if mtls.TLS_REMOTE_PORT is None:
+        print("library: remote mutual-TLS listener not started — "
+              "LIBRARY_TLS_REMOTE_PORT is not an integer", file=sys.stderr)
+        raise mtls.NonRemoteTlsHost("LIBRARY_TLS_REMOTE_PORT is not an integer")
+    # The server certificate must name the remote address. Its loopback
+    # names serve a client that dials its own loopback through a tunnel
+    # (platform/decisions/0066); a client dialing this address directly
+    # would otherwise fail hostname verification, or turn it off to connect.
+    if not _certificate_names(mtls.TLS_HOST):
+        print(f"library: remote mutual-TLS listener not started — the server "
+              f"certificate {mtls.TLS_CERT} does not name "
+              f"LIBRARY_TLS_HOST={mtls.TLS_HOST!r}; reissue it with that name",
+              file=sys.stderr)
+        raise mtls.NonRemoteTlsHost(
+            f"server certificate does not name {mtls.TLS_HOST!r}")
+    config = uvicorn.Config(
+        libapp.app, host=mtls.TLS_HOST, port=mtls.TLS_REMOTE_PORT,
+        log_level=LOG_LEVEL, http=mtls.MTLSH11Protocol, lifespan="off",
+        timeout_keep_alive=_TLS_IDLE_TIMEOUT_SECONDS,
+        timeout_graceful_shutdown=_GRACEFUL_SHUTDOWN_SECONDS)
+    config.load()
+    config.ssl = ssl_context
     config.ssl_certfile = str(mtls.TLS_CERT)  # cosmetic: is_ssl for the log line
     return config
 
@@ -122,20 +237,22 @@ async def _run(server: uvicorn.Server) -> None:
         await server.shutdown()
 
 
-async def _run_tls_survivably(server: uvicorn.Server) -> None:
-    """`_run(server)` for the TLS listener specifically, with anything that
-    escapes it caught rather than left to propagate.
+async def _run_tls_survivably(server: uvicorn.Server, label: str) -> None:
+    """`_run(server)` for a TLS listener specifically, with anything that
+    escapes it caught rather than left to propagate. `label` names the
+    listener's own `host:port` for the crash message, since there can now
+    be two of these (loopback and remote) crashing independently.
 
     **`asyncio.gather` cancels every other task the moment any one of them
     raises**, with the default `return_exceptions=False` `main()` uses below.
     An ordinary request-handler error never reaches here — Starlette already
     catches those — but something in the accept/handshake path itself could,
-    and "one process, two listeners, and the plain one is unaffected" (this
-    module's own docstring) is not true if that crash takes the plain
+    and "one process, several listeners, and the rest are unaffected" (this
+    module's own docstring) is not true if that crash takes a sibling
     listener's task down with it, since the plain listener is the one
     carrying every request until the fleet finishes migrating (security
     review, 2026-09-01). Catching here, once, for the one task that must not
-    be allowed to cancel its sibling, keeps `_run` itself free of a
+    be allowed to cancel its siblings, keeps `_run` itself free of a
     try/except that would blur why the plain listener's own call site has
     none.
 
@@ -157,10 +274,9 @@ async def _run_tls_survivably(server: uvicorn.Server) -> None:
     """
     try:
         await _run(server)
-    except (Exception, SystemExit):  # noqa: BLE001 — anything here must not cancel the plain listener
-        print("library: mutual-TLS listener crashed — "
-              f"serving {mtls.HOST}:{mtls.PLAIN_PORT} only from here on",
-              file=sys.stderr)
+    except (Exception, SystemExit):  # noqa: BLE001 — anything here must not cancel a sibling listener
+        print(f"library: mutual-TLS listener on {label} crashed — "
+              "continuing without it", file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
 
 
@@ -172,27 +288,46 @@ async def main() -> None:
     # there is nothing else left running to protect it from — so it keeps
     # `asyncio.gather`'s default propagate-and-cancel behaviour.
     tasks = [_run(plain)]
+    print(f"library: plain listener on {mtls.PLAIN_HOST}:{mtls.PLAIN_PORT}",
+          file=sys.stderr)
 
     tls_config = _build_tls_config()
     if tls_config is not None:
         tls_server = uvicorn.Server(tls_config)
         servers.append(tls_server)
-        tasks.append(_run_tls_survivably(tls_server))
+        tasks.append(_run_tls_survivably(tls_server, f"{mtls.HOST}:{mtls.TLS_PORT}"))
         print(f"library: mutual-TLS listener on "
               f"{mtls.HOST}:{mtls.TLS_PORT}, registry "
               f"{machine_identity.__name__} enforced", file=sys.stderr)
+
+        # A misconfigured remote address stops only the remote listener,
+        # the same way missing TLS material stops only the TLS one: the
+        # plain and loopback listeners are already built and carry every
+        # local client. `require_remote_tls_host` has logged why.
+        try:
+            remote_config = _build_tls_remote_config(tls_config.ssl)
+        except mtls.NonRemoteTlsHost:
+            remote_config = None
+        if remote_config is not None:
+            remote_server = uvicorn.Server(remote_config)
+            servers.append(remote_server)
+            tasks.append(_run_tls_survivably(
+                remote_server, f"{mtls.TLS_HOST}:{mtls.TLS_REMOTE_PORT}"))
+            print(f"library: mutual-TLS listener on "
+                  f"{mtls.TLS_HOST}:{mtls.TLS_REMOTE_PORT}, registry "
+                  f"{machine_identity.__name__} enforced", file=sys.stderr)
     else:
         print(f"library: mutual-TLS listener not started (see the line "
-              f"above) — serving {mtls.HOST}:{mtls.PLAIN_PORT} only",
+              f"above) — serving {mtls.PLAIN_HOST}:{mtls.PLAIN_PORT} only",
               file=sys.stderr)
 
-    # **ONE SIGNAL HANDLER FOR BOTH SERVERS, INSTALLED ONCE, HERE — NOT
+    # **ONE SIGNAL HANDLER FOR EVERY SERVER, INSTALLED ONCE, HERE — NOT
     # EACH `Server.serve()`'s OWN.** `Server.serve()` wraps itself in
     # `capture_signals()`, which calls `signal.signal(sig, self.handle_exit)`
-    # — a process-wide registration, last-writer-wins. Two servers both
-    # calling `.serve()` concurrently in this loop would have the second
-    # one's handler silently replace the first's, so a SIGTERM would reach
-    # only whichever server registered last; the other's `main_loop` would
+    # — a process-wide registration, last-writer-wins. More than one server
+    # calling `.serve()` concurrently in this loop would have the last
+    # one's handler silently replace the rest, so a SIGTERM would reach
+    # only whichever server registered last; the others' `main_loop`s would
     # never see `should_exit` flip and `asyncio.gather` below would hang on
     # shutdown forever. Driving each server through the public `startup` /
     # `main_loop` / `shutdown` methods instead of `.serve()` sidesteps that

@@ -25,6 +25,7 @@ from fastapi.testclient import TestClient
 
 import app as libapp
 import identity
+import projects
 import store
 
 REPO = Path(__file__).resolve().parent.parent
@@ -32,6 +33,25 @@ AGENT = "agent-token-wide"
 H = {"Library-Protocol": "1"}
 
 LINKED_URL = "https://github.com/convivy/library/pull/9"
+
+
+@pytest.fixture(autouse=True)
+def _library_registry(tmp_path, monkeypatch):
+    """A synthetic registry naming the `library` project's GitHub owner as
+    `convivy` — what `store._pr_repo` now reads instead of a hardcoded
+    literal. Never this machine's real registry, which CI has none of.
+
+    A test that needs a different owner, or none, overrides
+    `projects.REGISTRY_PATH` again and calls `projects.reload()` itself; this
+    fixture's own teardown reload still runs last, so no test here leaks its
+    registry into one that runs after it."""
+    registry = tmp_path / "projects.json"
+    registry.write_text(json.dumps({
+        "library": {"owner": "convivy", "repos": ["library", "knowledge"]}}))
+    monkeypatch.setattr(projects, "REGISTRY_PATH", registry)
+    projects.reload()
+    yield
+    projects.reload()
 
 
 def _h(token=AGENT):
@@ -123,7 +143,7 @@ def test_client_fixture_never_points_at_the_operators_real_credential_store(
 
 
 def test_detail_serves_pr_fields_for_a_linked_item(client, db_path):
-    _insert_item(db_path, id="linked", product="vivy", title="linked", type="task",
+    _insert_item(db_path, id="linked", product="fennick", title="linked", type="task",
                 refs=json.dumps({"pr": 9, "url": LINKED_URL}))
     r = client.get("/items/linked", headers=_h())
     assert r.status_code == 200, r.text
@@ -133,21 +153,35 @@ def test_detail_serves_pr_fields_for_a_linked_item(client, db_path):
     assert body["pr_repo"] == "convivy/library"
 
 
+def test_detail_serves_source_url_beside_pr_url(client, db_path):
+    """`source_url` (CQ·248) is additive and independent of `pr`/`pr_url`:
+    a row can carry both, from a create-time url and a later `/link-pr`."""
+    _insert_item(db_path, id="both", product="fennick", title="both", type="task",
+                refs=json.dumps({"pr": 9, "url": LINKED_URL,
+                                  "source_url": "https://example.com/src"}))
+    r = client.get("/items/both", headers=_h())
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["pr_url"] == LINKED_URL
+    assert body["source_url"] == "https://example.com/src"
+
+
 def test_detail_pr_fields_are_null_with_no_pr(client, db_path):
-    _insert_item(db_path, id="bare", product="vivy", title="bare", type="task")
+    _insert_item(db_path, id="bare", product="fennick", title="bare", type="task")
     r = client.get("/items/bare", headers=_h())
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["pr"] is None
     assert body["pr_url"] is None
     assert body["pr_repo"] is None
+    assert body["source_url"] is None
 
 
 def test_detail_pr_fields_are_null_when_refs_is_not_an_object(client, db_path):
     """`refs` is valid JSON of any shape, not necessarily an object —
     `test_search.py`'s Chart House fixture seeds it as `'[]'`. A non-dict
     `refs` carries no `pr`/`url` rather than raising."""
-    _insert_item(db_path, id="odd_refs", product="vivy", title="odd", type="task",
+    _insert_item(db_path, id="odd_refs", product="fennick", title="odd", type="task",
                 refs="[]")
     r = client.get("/items/odd_refs", headers=_h())
     assert r.status_code == 200, r.text
@@ -161,7 +195,7 @@ def test_detail_pr_repo_is_null_for_a_url_naming_another_org(client, db_path):
     """`pr_repo` is org-pinned: a `pr_url` is trusted to name a repo only when
     it points at this org's own GitHub, never derived from whatever host or
     org a caller's `url` names."""
-    _insert_item(db_path, id="offsite", product="vivy", title="offsite",
+    _insert_item(db_path, id="offsite", product="fennick", title="offsite",
                 type="task",
                 refs=json.dumps({"pr": 9, "url": "https://example/pull/9"}))
     r = client.get("/items/offsite", headers=_h())
@@ -198,22 +232,71 @@ def test_pr_repo_accepts_a_trailing_slash():
         "convivy/library"
 
 
+# --- the owner, read from the registry rather than a hardcoded literal ----------
+
+
+def test_pr_repo_derives_the_repo_for_a_url_on_the_registrys_own_owner(
+        tmp_path, monkeypatch):
+    """Proof this reads the registry rather than keeping `convivy` as a
+    literal: an owner the module fixture never names still derives a
+    `pr_repo` once the registry names it."""
+    registry = tmp_path / "projects.json"
+    registry.write_text(json.dumps({
+        "library": {"owner": "example-org", "repos": ["library"]}}))
+    monkeypatch.setattr(projects, "REGISTRY_PATH", registry)
+    projects.reload()
+    assert store._pr_repo("https://github.com/example-org/library/pull/9") == \
+        "example-org/library"
+
+
+def test_pr_repo_is_null_for_a_different_owner_than_the_registry_names():
+    assert store._pr_repo("https://github.com/someone-else/library/pull/9") is None
+
+
+def test_pr_repo_is_null_for_a_different_host():
+    assert store._pr_repo("https://example.com/convivy/library/pull/9") is None
+
+
+def test_pr_repo_is_null_for_an_owner_that_is_a_prefix_of_the_registrys():
+    assert store._pr_repo("https://github.com/conv/library/pull/9") is None
+
+
+def test_pr_repo_is_null_for_an_owner_that_is_a_suffix_of_the_registrys():
+    assert store._pr_repo("https://github.com/nvivy/library/pull/9") is None
+
+
+def test_pr_repo_is_null_when_the_registry_names_no_owner(tmp_path, monkeypatch):
+    """No owner on the `library` entry — never fall back to a literal, for
+    any url, `convivy`'s own included."""
+    registry = tmp_path / "projects.json"
+    registry.write_text(json.dumps({"library": {"repos": ["library"]}}))
+    monkeypatch.setattr(projects, "REGISTRY_PATH", registry)
+    projects.reload()
+    assert store._pr_repo("https://github.com/convivy/library/pull/9") is None
+
+
+def test_pr_repo_is_null_when_the_registry_cannot_be_read(tmp_path, monkeypatch):
+    monkeypatch.setattr(projects, "REGISTRY_PATH", tmp_path / "does-not-exist.json")
+    projects.reload()
+    assert store._pr_repo("https://github.com/convivy/library/pull/9") is None
+
+
 # --- GET /items?product=&state=, Deck's corrections queue -----------------------
 
 
 def test_list_by_product_and_state_matches_the_detail_route(client, db_path):
-    _insert_item(db_path, id="linked", product="vivy", title="linked", type="task",
+    _insert_item(db_path, id="linked", product="fennick", title="linked", type="task",
                 state="pr-open", refs=json.dumps({"pr": 9, "url": LINKED_URL}))
-    _insert_item(db_path, id="bare", product="vivy", title="bare", type="task",
+    _insert_item(db_path, id="bare", product="fennick", title="bare", type="task",
                 state="pr-open")
 
     detail_linked = client.get("/items/linked", headers=_h()).json()
     detail_bare = client.get("/items/bare", headers=_h()).json()
 
-    r = client.get("/items?product=vivy&state=pr-open", headers=_h())
+    r = client.get("/items?product=fennick&state=pr-open", headers=_h())
     assert r.status_code == 200, r.text
     body = r.json()
-    for field in ("pr", "pr_url", "pr_repo"):
+    for field in ("pr", "pr_url", "pr_repo", "source_url"):
         assert _item(body, "linked")[field] == detail_linked[field]
         assert _item(body, "bare")[field] == detail_bare[field]
     assert _item(body, "bare")["pr"] is None
@@ -225,10 +308,10 @@ def test_list_by_product_and_state_matches_the_detail_route(client, db_path):
 
 
 def test_list_by_parent_id_matches_the_detail_route(client, db_path):
-    _insert_item(db_path, id="epic1", product="vivy", title="epic", type="epic")
-    _insert_item(db_path, id="linked", product="vivy", title="linked", type="task",
+    _insert_item(db_path, id="epic1", product="fennick", title="epic", type="epic")
+    _insert_item(db_path, id="linked", product="fennick", title="linked", type="task",
                 parent_id="epic1", refs=json.dumps({"pr": 9, "url": LINKED_URL}))
-    _insert_item(db_path, id="bare", product="vivy", title="bare", type="task",
+    _insert_item(db_path, id="bare", product="fennick", title="bare", type="task",
                 parent_id="epic1")
 
     detail_linked = client.get("/items/linked", headers=_h()).json()
@@ -237,7 +320,7 @@ def test_list_by_parent_id_matches_the_detail_route(client, db_path):
     r = client.get("/items?parent_id=epic1", headers=_h())
     assert r.status_code == 200, r.text
     body = r.json()
-    for field in ("pr", "pr_url", "pr_repo"):
+    for field in ("pr", "pr_url", "pr_repo", "source_url"):
         assert _item(body, "linked")[field] == detail_linked[field]
         assert _item(body, "bare")[field] == detail_bare[field]
 
@@ -246,10 +329,10 @@ def test_list_by_parent_id_matches_the_detail_route(client, db_path):
 
 
 def test_course_resolved_children_match_the_detail_route(client, db_path):
-    _insert_item(db_path, id="linked", product="vivy", title="linked", type="epic",
+    _insert_item(db_path, id="linked", product="fennick", title="linked", type="epic",
                 refs=json.dumps({"pr": 9, "url": LINKED_URL}))
-    _insert_item(db_path, id="bare", product="vivy", title="bare", type="epic")
-    _insert_course(db_path, id="course1", product="vivy",
+    _insert_item(db_path, id="bare", product="fennick", title="bare", type="epic")
+    _insert_course(db_path, id="course1", product="fennick",
                    entries=["linked", "bare"])
 
     detail_linked = client.get("/items/linked", headers=_h()).json()
@@ -258,6 +341,6 @@ def test_course_resolved_children_match_the_detail_route(client, db_path):
     r = client.get("/courses/course1", headers=_h())
     assert r.status_code == 200, r.text
     items = {i["id"]: i for i in r.json()["items"]}
-    for field in ("pr", "pr_url", "pr_repo"):
+    for field in ("pr", "pr_url", "pr_repo", "source_url"):
         assert items["linked"][field] == detail_linked[field]
         assert items["bare"][field] == detail_bare[field]

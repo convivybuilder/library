@@ -18,7 +18,7 @@ import identity
 import protocol
 import store
 
-TOKEN = "agent-token-vivy"
+TOKEN = "agent-token-fennick"
 
 
 @pytest.fixture
@@ -31,7 +31,7 @@ def client(tmp_path, monkeypatch):
     that gets far enough to read."""
     tokens = tmp_path / "api-tokens.json"
     tokens.write_text(json.dumps(
-        {TOKEN: {"name": "vivy-agent", "products": ["vivy"]}}))
+        {TOKEN: {"name": "fennick-agent", "products": ["fennick"]}}))
     monkeypatch.setattr(identity, "TOKENS", tokens)
     monkeypatch.setattr(store, "DB_PATH", tmp_path / "control.db")
     return TestClient(libapp.app)
@@ -97,7 +97,7 @@ def test_the_envelope_holds_the_largest_body_a_route_will_accept(
     `content` is at exactly `MAX_BLOB_BYTES`, the largest the blob route takes."""
     content = char * (store.MAX_BLOB_BYTES // len(char.encode()))
     assert len(content.encode()) <= store.MAX_BLOB_BYTES
-    envelope = json.dumps({"source": "s", "kind": "k", "product": "vivy",
+    envelope = json.dumps({"source": "s", "kind": "k", "product": "fennick",
                            "body": "b", "content": content},
                           ensure_ascii=ensure_ascii).encode()
     assert len(envelope) <= store.MAX_REQUEST_BYTES, (
@@ -115,7 +115,7 @@ def test_the_worst_case_body_is_actually_ACCEPTED_over_the_wire(client):
 
     Cyrillic at exactly `MAX_BLOB_BYTES`: 20 MB of UTF-8, 60 MB on the wire."""
     content = "\u0430" * (store.MAX_BLOB_BYTES // 2)
-    body = json.dumps({"source": "probe", "kind": "note", "product": "vivy",
+    body = json.dumps({"source": "probe", "kind": "note", "product": "fennick",
                        "content": content}, ensure_ascii=True).encode()
     assert len(body) > store.MAX_BLOB_BYTES * 2, "not exercising the 3x path"
     r = client.post("/signals", headers=_h(), content=body)

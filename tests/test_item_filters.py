@@ -301,8 +301,8 @@ def test_a_narrow_credential_sees_only_its_own_claimable_items(scoped):
     same query, so a leak would be visible in the count even on a page that did
     not show the row."""
     seed("mine_1", product="keel")
-    seed("theirs_1", product="vivy")
-    seed("theirs_2", product="constance")
+    seed("theirs_1", product="fennick")
+    seed("theirs_2", product="marlow")
     for query in ("state=claimable", "state=claimable&needs=agent",
                   "state=open", "needs=agent"):
         body = scoped.get(f"/items?{query}", headers=_as("t-narrow")).json()
@@ -357,7 +357,7 @@ def test_a_topic_matches_exactly_not_as_a_substring(client):
 
 def test_topics_composes_with_the_other_filters(client):
     seed("keep", product="keel", state="open", topics=json.dumps(["DESIGN"]))
-    seed("wrong_product", product="vivy", state="open",
+    seed("wrong_product", product="fennick", state="open",
          topics=json.dumps(["DESIGN"]))
     seed("wrong_state", product="keel", state="fixed",
          topics=json.dumps(["DESIGN"]))
@@ -402,7 +402,7 @@ def test_an_unmatched_found_during_returns_nothing_rather_than_everything(client
 
 def test_found_during_composes_with_the_other_filters(client):
     seed("keep", product="keel", state="open", found_during="epic_a")
-    seed("wrong_product", product="vivy", state="open", found_during="epic_a")
+    seed("wrong_product", product="fennick", state="open", found_during="epic_a")
     seed("wrong_epic", product="keel", state="open", found_during="epic_b")
     assert listed(client, "found_during=epic_a&product=keel&state=open") == {"keep"}
 

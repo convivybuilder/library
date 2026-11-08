@@ -5,7 +5,7 @@ A person's set defaults to the projects the REGISTRY names them as having
 created (`projects.slugs_created_by`), never a table this repository keeps
 itself. Every registry entry here is synthetic — a temporary file under
 `tmp_path`, pointed to by `projects.REGISTRY_PATH` — so this never reads or
-writes the real `agent-platform/config/projects.json`, and no real person's
+writes the real `<root>/install/projects.json`, and no real person's
 name appears in it.
 
 **The schema is the real one**, built by `alembic upgrade head`, the way

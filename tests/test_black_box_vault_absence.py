@@ -11,12 +11,12 @@ route itself discloses no content. This file is the wider claim: given a
 registered black box, nothing it might have contributed ever reaches a
 read surface, while its declared bindings do.
 
-**`ask` is the crew (`platform/decisions/0043-black-box-crews`).** CFO has
+**`ask` is the crew (`platform/decisions/0043-black-box-crews`).** QUILL has
 a registry entry (`private: true`); Ask is "deliberately UNREGISTERED...
 protected only by the instruction in `~/Convivy/ask/CLAUDE.md`" — no
 registry entry and no repository list records it, exactly what the clause
 asks for. The fixture's own project registry below lists only the ordinary
-crews, `vivy` and `constance`, so `projects.resolve("ask")` returns `None`
+crews, `fennick` and `marlow`, so `projects.resolve("ask")` returns `None`
 for the same reason ADR-0043 calls that refusal "accidental": a readable
 registry that simply never heard of the name.
 
@@ -30,7 +30,7 @@ text those attempts carried. `test_write_surface.py` already pins the
 that same guard as the precondition for a clause-8 read-side claim, not as
 a second proof of clause 7 itself.
 
-**The positive control is `vivy`.** The same four surfaces are searched for
+**The positive control is `fennick`.** The same four surfaces are searched for
 an ordinary crew's own marker text, seeded through the same real write
 routes, and found — proving a search returning nothing is this corpus
 saying so, not a broken query or an empty index.
@@ -87,16 +87,16 @@ BLACKBOX_AGENT_NAME = "ask-scribe"
 BLACKBOX_PERSONA = "velderquist tanglewood"
 BLACKBOX_TRANSCRIPT = "quonsetbray emberfall"
 
-ORDINARY_CREW = "vivy"
-ORDINARY_AGENT_NAME = "vivy-scribe"
+ORDINARY_CREW = "fennick"
+ORDINARY_AGENT_NAME = "fennick-scribe"
 ORDINARY_PERSONA = "wrenfield glimmerstone"
 ORDINARY_TRANSCRIPT = "palmcross driftwood"
 
-# Only the ordinary crews are registered — never `ask` or `cfo` — matching
+# Only the ordinary crews are registered — never `ask` or `quill` — matching
 # ADR-0043's own description of Ask as unregistered. `_meta` mirrors the
 # real registry's own top-level key, excluded from iteration the same way
 # `projects.py`'s snapshot already skips any key starting with `_`.
-REGISTRY = {"_meta": {}, "vivy": {"repos": []}, "constance": {"repos": []}}
+REGISTRY = {"_meta": {}, "fennick": {"repos": []}, "marlow": {"repos": []}}
 
 
 @pytest.fixture
@@ -130,7 +130,7 @@ def client(tmp_path, monkeypatch, vector_index):
         "INSERT INTO docs (id, source_ref, kind, project, title, status, "
         "topics, audience, body, body_hash, last_reviewed, updated_at) "
         "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-        ("vivy/specs/scribe", "vivy/specs/scribe.md", "spec", "vivy",
+        ("fennick/specs/scribe", "fennick/specs/scribe.md", "spec", "fennick",
          "the scribe's persona", "current", "[]", "[]",
          f"this document carries the {ORDINARY_PERSONA}", "deadbeef",
          "2026-08-01", "2026-08-02"))
@@ -428,26 +428,26 @@ def test_spend_for_a_project_the_registry_marks_private_is_refused(
     the registry DOES list, as `private: true`, is the other way a black box
     is declared, and the refusal has to hold for it too."""
     _use_registry(tmp_path, monkeypatch,
-                  {**REGISTRY, "cfo": {"repos": [], "private": True}})
-    r = _report_ledger_spend(client, product="cfo", agent="cfo-scribe",
+                  {**REGISTRY, "quill": {"repos": [], "private": True}})
+    r = _report_ledger_spend(client, product="quill", agent="quill-scribe",
                              model="sonnet")
     assert r.status_code == 404
-    assert "cfo" not in _ledger_scopes(client)
+    assert "quill" not in _ledger_scopes(client)
 
 
 def test_spend_for_a_registered_project_that_declared_itself_a_black_box_is_refused(
         client):
     """A self-registration makes a crew a black box whatever the registry's
-    `private` flag says, so `constance`, listed as ordinary here, is refused
-    once it registers, while `vivy` beside it still books spend."""
+    `private` flag says, so `marlow`, listed as ordinary here, is refused
+    once it registers, while `fennick` beside it still books spend."""
     r = client.post(
         "/black-box/registrations",
-        json={"acting_human": "operator", "crew": "constance",
+        json={"acting_human": "operator", "crew": "marlow",
               "model": "sonnet", "gateway": "anthropic", "permissions": []},
         headers=_h(CLIENT))
     assert r.status_code == 200
-    refused = _report_ledger_spend(client, product="constance",
-                                   agent="constance-scribe", model="sonnet")
+    refused = _report_ledger_spend(client, product="marlow",
+                                   agent="marlow-scribe", model="sonnet")
     assert refused.status_code == 404
     booked = _report_ledger_spend(client, product=ORDINARY_CREW,
                                   agent=ORDINARY_AGENT_NAME, model="sonnet")
@@ -519,15 +519,15 @@ def test_a_name_a_black_box_crew_declared_is_withheld_whatever_its_prefix(client
 def test_a_private_crews_prefixed_name_is_withheld_and_an_ordinary_one_lands(
         client, tmp_path, monkeypatch):
     """A crew the registry marks private need not register, so it has
-    declared no agents; its name prefix is what withholds `cfo-scribe`.
-    `vivy-scribe` beside it lands, which shows the refusal is not blanket."""
+    declared no agents; its name prefix is what withholds `quill-scribe`.
+    `fennick-scribe` beside it lands, which shows the refusal is not blanket."""
     _use_registry(tmp_path, monkeypatch,
-                  {**REGISTRY, "cfo": {"repos": [], "private": True}})
-    assert client.put("/roster/cfo-scribe", headers=_h(ORCH)).status_code == 404
+                  {**REGISTRY, "quill": {"repos": [], "private": True}})
+    assert client.put("/roster/quill-scribe", headers=_h(ORCH)).status_code == 404
     landed = client.put(f"/roster/{ORDINARY_AGENT_NAME}", headers=_h(ORCH))
     assert landed.status_code == 200
     names = _roster_names(client)
-    assert "cfo-scribe" not in names
+    assert "quill-scribe" not in names
     assert ORDINARY_AGENT_NAME in names
 
 

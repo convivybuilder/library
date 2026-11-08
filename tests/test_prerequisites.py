@@ -23,10 +23,11 @@ from fastapi.testclient import TestClient
 import app as libapp
 import identity
 import lease
+import projects
 import protocol
 import store
 
-AGENT = "agent-token-vivy"
+AGENT = "agent-token-fennick"
 WIDE = "agent-token-wide"
 SYSTEM = "system-token"
 APPROVED = "approved-client-token"
@@ -70,7 +71,7 @@ def client(tmp_path, monkeypatch, vector_index, ledger_tables):
             blocking_root_id TEXT, blocking_holder TEXT, blocks_by TEXT, blocking_taken_for TEXT);
         CREATE TABLE call_slips (
             id TEXT PRIMARY KEY, item_id TEXT, product TEXT, claim_owner_label TEXT,
-            issued_at TEXT, expires_at TEXT, grant_json TEXT);
+            issued_at TEXT, expires_at TEXT, grant_json TEXT, crew TEXT);
         CREATE TABLE courses (
             id TEXT PRIMARY KEY, product TEXT, title TEXT, entries TEXT,
             waypoints TEXT DEFAULT '[]',
@@ -94,14 +95,14 @@ def client(tmp_path, monkeypatch, vector_index, ledger_tables):
 
     tokens = tmp_path / "api-tokens.json"
     tokens.write_text(json.dumps({
-        AGENT: {"name": "vivy-agent", "products": ["vivy"]},
+        AGENT: {"name": "fennick-agent", "products": ["fennick"]},
         WIDE: {"name": "wide-agent", "products": ["*"]},
         SYSTEM: {"name": "capture", "products": ["*"], "kind": "system"},
     }))
     client_tokens = tmp_path / "client-tokens.json"
     client_tokens.write_text(json.dumps({
         APPROVED: {"name": "orient", "products": ["*"]},
-        NARROW_APPROVED: {"name": "orient-narrow", "products": ["vivy"]},
+        NARROW_APPROVED: {"name": "orient-narrow", "products": ["fennick"]},
     }))
     vector_index(db)
     ledger_tables(db)
@@ -110,7 +111,12 @@ def client(tmp_path, monkeypatch, vector_index, ledger_tables):
     monkeypatch.setattr(identity, "CLIENT_TOKENS", client_tokens)
     monkeypatch.setattr(store, "WRITES_ENABLED", True)
     monkeypatch.setattr(lease, "TUNABLES", tmp_path / "absent.json")
-    return TestClient(libapp.app)
+    registry = tmp_path / "projects.json"
+    registry.write_text(json.dumps({"_meta": {}}))
+    monkeypatch.setattr(projects, "REGISTRY_PATH", registry)
+    projects.reload()
+    yield TestClient(libapp.app)
+    projects.reload()
 
 
 def _h(token=AGENT):
@@ -120,7 +126,7 @@ def _h(token=AGENT):
 
 def seed(item_id, **cols):
     """One item, with only the columns a case cares about."""
-    cols.setdefault("product", "vivy")
+    cols.setdefault("product", "fennick")
     cols.setdefault("title", item_id)
     cols.setdefault("type", None)
     cols.setdefault("state", "open")
@@ -215,7 +221,7 @@ def test_prerequisites_and_blocked_round_trip_on_get_course(client):
     seed("prereq_a")
     seed("epic_a", type="epic",
         prerequisites=json.dumps([{"item": "prereq_a"}]))
-    seed_course("course_v", "vivy", ["epic_a"])
+    seed_course("course_v", "fennick", ["epic_a"])
     r = client.get("/courses/course_v", headers=_h(WIDE))
     assert r.status_code == 200
     items = {i["id"]: i for i in r.json()["items"]}
@@ -279,7 +285,7 @@ def test_blocked_from_an_unmet_text_clears_by_verdict(client):
 
 
 def test_an_out_of_scope_prerequisite_renders_missing_and_still_blocks(client):
-    seed("other_prereq", product="constance")
+    seed("other_prereq", product="marlow")
     seed("scoped_blocker", prerequisites=json.dumps([{"item": "other_prereq"}]))
 
     narrow = get_item(client, "scoped_blocker", AGENT).json()
@@ -467,7 +473,7 @@ def test_an_out_of_scope_blocking_prerequisite_is_counted_and_never_named(client
     lease-only checkout carries the item, whose `prerequisites` must be exactly
     what `GET /items/{id}` renders for the same caller (the id, marked
     `missing`) and nothing of the prerequisite itself."""
-    seed("other_prereq", product="constance", severity="high")
+    seed("other_prereq", product="marlow", severity="high")
     seed("scoped_blocker", prerequisites=json.dumps([{"item": "other_prereq"}]))
     refused = claim(client, "scoped_blocker", owner="session-2")
     assert refused.status_code == 409, refused.text
@@ -480,7 +486,7 @@ def test_an_out_of_scope_blocking_prerequisite_is_counted_and_never_named(client
     rendered = get_item(client, "scoped_blocker").json()["prerequisites"]
     assert held.json()["item"]["prerequisites"] == rendered == [
         {"item": "other_prereq", "missing": True}]
-    assert "constance" not in json.dumps(held.json())
+    assert "marlow" not in json.dumps(held.json())
 
 
 # --- /correct: writing prerequisites and its validation -------------------------
@@ -516,7 +522,7 @@ def test_correct_clearing_prerequisites_writes_a_field_correction_note(client):
     notes = [c["body"] for c in body["comments"]]
     note = next((n for n in notes if "prerequisites" in n), None)
     assert note is not None, notes
-    assert "vivy-agent" in note
+    assert "fennick-agent" in note
     assert "prereq_a" in note
 
 
@@ -608,7 +614,7 @@ def test_correct_rejects_an_out_of_scope_item_id_the_same_as_unknown(client):
     """One wording for both, matching contract §6.1's rule for Course
     entries — so the refusal cannot be used to learn which ids exist in a
     product this identity cannot read."""
-    seed("other_prereq", product="constance")
+    seed("other_prereq", product="marlow")
     seed("plain")
     unknown = correct(client, "plain",
                       {"prerequisites": [{"item": "issue_does_not_exist"}]})
@@ -649,7 +655,7 @@ def test_correcting_prerequisites_on_an_approved_epic_leaves_maturity_approved(c
 def test_create_item_accepts_prerequisites(client):
     seed("prereq_a")
     r = client.post("/items", json={
-        "product": "vivy", "title": "a new item", "severity": "low",
+        "product": "fennick", "title": "a new item", "severity": "low",
         "prerequisites": [{"item": "prereq_a"}]}, headers=_h(WIDE))
     assert r.status_code == 201, r.text
     assert r.json()["prerequisites"] == [
@@ -697,7 +703,7 @@ def test_verdict_route_404s_when_no_entry_has_that_text(client):
 
 
 def test_verdict_route_404s_on_an_out_of_scope_item(client):
-    seed("other", product="constance", prerequisites=json.dumps(
+    seed("other", product="marlow", prerequisites=json.dumps(
         [{"text": "a condition", "met": False, "judged_by": None,
           "judged_at": None}]))
     r = verdict(client, "other", "a condition", True, token=NARROW_APPROVED)
@@ -717,7 +723,7 @@ def test_verdict_route_404_wording_matches_every_other_item_route(client):
     assert r.status_code == 404, r.text
     assert r.json()["error"] == "no such item, or none this identity may see"
 
-    seed("other", product="constance", prerequisites=json.dumps(
+    seed("other", product="marlow", prerequisites=json.dumps(
         [{"text": "a condition", "met": False, "judged_by": None,
           "judged_at": None}]))
     r = verdict(client, "other", "a condition", True, token=NARROW_APPROVED)

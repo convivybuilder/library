@@ -23,7 +23,7 @@ import projects
 import protocol
 import store
 
-AGENT = "agent-token-vivy"
+AGENT = "agent-token-fennick"
 
 
 @pytest.fixture
@@ -46,7 +46,7 @@ def db_path(tmp_path, monkeypatch, vector_index):
     conn.close()
     tokens = tmp_path / "api-tokens.json"
     tokens.write_text(json.dumps(
-        {AGENT: {"name": "vivy-agent", "products": ["vivy"]}}))
+        {AGENT: {"name": "fennick-agent", "products": ["fennick"]}}))
     vector_index(db)
     monkeypatch.setattr(store, "DB_PATH", db)
     monkeypatch.setattr(identity, "TOKENS", tokens)
@@ -72,7 +72,7 @@ def _h():
 
 def _body():
     return {"source": "github", "kind": "note", "actor": "someone",
-            "product": "vivy", "body": "a thing happened"}
+            "product": "fennick", "body": "a thing happened"}
 
 
 def _busy_error(tmp_path) -> sqlite3.OperationalError:

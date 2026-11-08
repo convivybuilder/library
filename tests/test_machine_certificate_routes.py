@@ -20,7 +20,7 @@ import identity
 import protocol
 import store
 
-AGENT = "agent-token-vivy"
+AGENT = "agent-token-fennick"
 SYSTEM = "system-token"
 CLIENT = "orient-token"
 VERIFY = "bosun-verify-token"
@@ -66,7 +66,7 @@ def client(tmp_path, monkeypatch):
 
     tokens = tmp_path / "api-tokens.json"
     tokens.write_text(json.dumps({
-        AGENT: {"name": "vivy-agent", "products": ["vivy"]},
+        AGENT: {"name": "fennick-agent", "products": ["fennick"]},
         SYSTEM: {"name": "capture", "products": ["*"], "kind": "system"},
         VERIFY: {"name": "bosun", "products": ["*"],
                  "grants": ["machine.verify"]},

@@ -84,8 +84,8 @@ def upgrade() -> None:
     # `ix_issue_leases_live_root` and `ae5e7a024ffb`'s own choice of the same
     # spelling over `op.create_index`'s `sqlite_where` kwarg — one way to say
     # a partial index in this repo, not two. Scoped to `product` because the
-    # key alone is not unique across products, the same way `E9` in `vivy`
-    # and `E9` in `constance` are two different epics.
+    # key alone is not unique across products, the same way `E9` in `northwind`
+    # and `E9` in `lintwood` are two different epics.
     op.execute(
         "CREATE UNIQUE INDEX ix_issue_items_product_item_key "
         "ON issue_items (product, item_key) WHERE item_key IS NOT NULL")

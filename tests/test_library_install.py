@@ -22,11 +22,11 @@ describes.
 """
 from __future__ import annotations
 
-import http.server
 import os
 import shutil
 import subprocess
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -200,28 +200,28 @@ def deployed_sha(repo: Path, home: Path) -> str:
     return _git(repo, "rev-parse", "main").stdout.strip()
 
 
-class _HealthHandler(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):  # noqa: N802 - stdlib's own method name
-        body = self.server.health_body.encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def log_message(self, *args):  # silence stdlib's default access log
-        pass
-
-
 @pytest.fixture
-def health_server():
-    server = http.server.HTTPServer(("127.0.0.1", 0), _HealthHandler)
-    server.health_body = '{"status":"ok","commit":"unset"}'
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    yield server
-    server.shutdown()
-    thread.join(timeout=5)
+def health_file(tmp_path):
+    """A file:// substitute for a real /health endpoint. `_fetch_health`
+    only ever shells out to `curl`, which reads a `file://` URL the same
+    way it reads an `http://` one — no listening socket involved, so this
+    exercises step (e)'s real polling code without binding a port (which a
+    sandboxed test run may not be permitted to do at all)."""
+    path = tmp_path / "health.json"
+    path.write_text('{"status":"ok","commit":"unset"}')
+    return path
+
+
+def _health_file_url(path: Path) -> str:
+    return f"file://{path}"
+
+
+# Written into $DEPLOY_DIR/app.py by the tests below that need step (e)'s
+# poll to time out — a tiny _DRAIN_DEADLINE_SECONDS keeps
+# _health_poll_deadline_seconds's total deadline (that value plus the
+# fixed _HEALTH_POLL_STARTUP_ALLOWANCE_S) in the low tens of seconds
+# instead of the real app.py's 50s, or the no-app.py fallback of 120s.
+FAST_DRAIN_APP_PY = "_DRAIN_DEADLINE_SECONDS = 1\n"
 
 
 # --- static: the no-agent-no-test rule is stated in the header -------------
@@ -400,7 +400,7 @@ def test_redirect_variable_pointed_at_the_real_path_is_refused(seed_repo, home):
     assert not log.exists()
 
 
-def test_redirect_variable_sends_the_deploy_call_elsewhere(seed_repo, home, tmp_path):
+def test_redirect_variable_sends_the_deploy_call_elsewhere(seed_repo, home, health_file, tmp_path):
     # Break the repo's own stub so a run that reached it would fail, and
     # point the redirect at a second, working stub placed outside the repo
     # entirely — if library-install still succeeds, it used the redirect.
@@ -434,7 +434,7 @@ exit 0
     (external / "install-library").chmod(0o755)
     result = run_library_install(
         seed_repo, home,
-        extra_env={"LIBRARY_INSTALL_TEST_INSTALL_LIBRARY": str(external / "install-library")})
+        extra_env=_confirmed_health_env(health_file, target, external / "install-library"))
     assert result.returncode == 0, result.stdout + result.stderr
 
 
@@ -563,7 +563,7 @@ def test_diverged_main_is_refused_and_never_calls_the_stub(seed_repo, home, tmp_
     assert not log.exists()
 
 
-def test_a_tag_named_main_does_not_change_the_target(seed_repo, home):
+def test_a_tag_named_main_does_not_change_the_target(seed_repo, home, health_file, tmp_path):
     # A lightweight tag literally named "main", pointing at a commit other
     # than the branch tip — git's own ref-disambiguation order resolves a
     # bare "main" to the tag before the branch, so the target must be read
@@ -580,7 +580,9 @@ def test_a_tag_named_main_does_not_change_the_target(seed_repo, home):
     _git(seed_repo, "tag", "main", decoy)
     _git(seed_repo, "reset", "-q", "--hard", baseline)
 
-    result = run_library_install(seed_repo, home)
+    stub = _external_stub(seed_repo, tmp_path / "ext")
+    result = run_library_install(
+        seed_repo, home, extra_env=_confirmed_health_env(health_file, baseline, stub))
     assert result.returncode == 0, result.stdout + result.stderr
     assert baseline in result.stdout
     assert decoy not in result.stdout
@@ -589,12 +591,14 @@ def test_a_tag_named_main_does_not_change_the_target(seed_repo, home):
 # --- (c): the range report, the alembic refusal, the plist warning ---------
 
 
-def test_nothing_to_deploy_skips_the_pr_listing_and_still_deploys(seed_repo, home):
+def test_nothing_to_deploy_skips_the_pr_listing_and_still_deploys(seed_repo, home, health_file, tmp_path):
     baseline = _git(seed_repo, "rev-parse", "main").stdout.strip()
     deploy_dir = home / ".local" / "deploy" / "library"
     deploy_dir.mkdir(parents=True)
     (deploy_dir / "DEPLOYED_COMMIT").write_text(f"ref: main\ncommit: {baseline}\n")
-    result = run_library_install(seed_repo, home)
+    stub = _external_stub(seed_repo, tmp_path / "ext")
+    result = run_library_install(
+        seed_repo, home, extra_env=_confirmed_health_env(health_file, baseline, stub))
     assert result.returncode == 0, result.stdout + result.stderr
     assert "nothing new to deploy" in result.stdout
 
@@ -667,7 +671,8 @@ def test_a_deployed_commit_naming_a_non_ancestor_commit_is_refused(seed_repo, ho
     assert not log.exists()
 
 
-def test_an_alembic_change_in_range_is_reported_and_handed_to_install_library(seed_repo, home):
+def test_an_alembic_change_in_range_is_reported_and_handed_to_install_library(
+        seed_repo, home, health_file, tmp_path):
     # install-library's own auto-migrate path (not this script) now backs up
     # and migrates the vault, so library-install only reports the range here
     # and still lets the deploy through to the stub.
@@ -683,7 +688,10 @@ def test_an_alembic_change_in_range_is_reported_and_handed_to_install_library(se
     target = _git(seed_repo, "rev-parse", "main").stdout.strip()
 
     log = home.parent / "calls.log"
-    result = run_library_install(seed_repo, home, call_log=log)
+    stub = _external_stub(seed_repo, tmp_path / "ext")
+    result = run_library_install(
+        seed_repo, home, call_log=log,
+        extra_env=_confirmed_health_env(health_file, target, stub))
     assert result.returncode == 0, result.stdout + result.stderr
     assert "alembic/versions" in result.stdout
     assert "0001_x.py" in result.stdout
@@ -691,7 +699,7 @@ def test_an_alembic_change_in_range_is_reported_and_handed_to_install_library(se
     assert target in (deploy_dir / "DEPLOYED_COMMIT").read_text()
 
 
-def test_no_migrate_flag_reaches_install_library(seed_repo, home):
+def test_no_migrate_flag_reaches_install_library(seed_repo, home, health_file, tmp_path):
     baseline = _git(seed_repo, "rev-parse", "main").stdout.strip()
     deploy_dir = home / ".local" / "deploy" / "library"
     deploy_dir.mkdir(parents=True)
@@ -701,9 +709,13 @@ def test_no_migrate_flag_reaches_install_library(seed_repo, home):
     _git(seed_repo, "add", "-A")
     _git(seed_repo, "commit", "-q", "-m", "feat: add a thing")
     _git(seed_repo, "push", "-q", "origin", "main")
+    target = _git(seed_repo, "rev-parse", "main").stdout.strip()
 
     log = home.parent / "calls.log"
-    result = run_library_install(seed_repo, home, call_log=log, args=["--no-migrate"])
+    stub = _external_stub(seed_repo, tmp_path / "ext")
+    result = run_library_install(
+        seed_repo, home, call_log=log, args=["--no-migrate"],
+        extra_env=_confirmed_health_env(health_file, target, stub))
     assert result.returncode == 0, result.stdout + result.stderr
     calls = log.read_text().splitlines()
     assert calls[0] == "--no-migrate"
@@ -745,7 +757,8 @@ def test_a_refusing_install_library_stops_before_the_verdict(seed_repo, home):
     assert "verdict:" not in result.stderr
 
 
-def test_a_launchd_change_other_than_the_managed_plist_warns_but_still_deploys(seed_repo, home):
+def test_a_launchd_change_other_than_the_managed_plist_warns_but_still_deploys(
+        seed_repo, home, health_file, tmp_path):
     deployed = _git(seed_repo, "rev-parse", "main").stdout.strip()
     deploy_dir = home / ".local" / "deploy" / "library"
     deploy_dir.mkdir(parents=True)
@@ -755,14 +768,17 @@ def test_a_launchd_change_other_than_the_managed_plist_warns_but_still_deploys(s
     _git(seed_repo, "add", "-A")
     _git(seed_repo, "commit", "-q", "-m", "feat: add a mover job")
     _git(seed_repo, "push", "-q", "origin", "main")
+    target = _git(seed_repo, "rev-parse", "main").stdout.strip()
 
-    result = run_library_install(seed_repo, home)
+    stub = _external_stub(seed_repo, tmp_path / "ext")
+    result = run_library_install(
+        seed_repo, home, extra_env=_confirmed_health_env(health_file, target, stub))
     assert result.returncode == 0, result.stdout + result.stderr
     assert "does not manage" in result.stderr
     assert "cold-tier.plist" in result.stderr
 
 
-def test_merged_pr_titles_are_listed_between_deployed_and_target(seed_repo, home):
+def test_merged_pr_titles_are_listed_between_deployed_and_target(seed_repo, home, health_file, tmp_path):
     deployed = _git(seed_repo, "rev-parse", "main").stdout.strip()
     deploy_dir = home / ".local" / "deploy" / "library"
     deploy_dir.mkdir(parents=True)
@@ -772,13 +788,17 @@ def test_merged_pr_titles_are_listed_between_deployed_and_target(seed_repo, home
     _git(seed_repo, "add", "-A")
     _git(seed_repo, "commit", "-q", "-m", "feat: add a thing (#7)")
     _git(seed_repo, "push", "-q", "origin", "main")
+    target = _git(seed_repo, "rev-parse", "main").stdout.strip()
 
-    result = run_library_install(seed_repo, home)
+    stub = _external_stub(seed_repo, tmp_path / "ext")
+    result = run_library_install(
+        seed_repo, home, extra_env=_confirmed_health_env(health_file, target, stub))
     assert result.returncode == 0, result.stdout + result.stderr
     assert "feat: add a thing (#7)" in result.stdout
 
 
-def test_a_malicious_commit_subject_is_sanitized_in_the_pr_title_listing(seed_repo, home):
+def test_a_malicious_commit_subject_is_sanitized_in_the_pr_title_listing(
+        seed_repo, home, health_file, tmp_path):
     deployed = _git(seed_repo, "rev-parse", "main").stdout.strip()
     deploy_dir = home / ".local" / "deploy" / "library"
     deploy_dir.mkdir(parents=True)
@@ -790,8 +810,11 @@ def test_a_malicious_commit_subject_is_sanitized_in_the_pr_title_listing(seed_re
     subprocess.run(["git", "-C", str(seed_repo), "commit", "-q", "-m", subject],
                     check=True, capture_output=True, text=True)
     _git(seed_repo, "push", "-q", "origin", "main")
+    target = _git(seed_repo, "rev-parse", "main").stdout.strip()
 
-    result = run_library_install(seed_repo, home)
+    stub = _external_stub(seed_repo, tmp_path / "ext")
+    result = run_library_install(
+        seed_repo, home, extra_env=_confirmed_health_env(health_file, target, stub))
     assert result.returncode == 0, result.stdout + result.stderr
     # The script's own `say()` legitimately prints ANSI color codes (also
     # ESC-prefixed); only the injected OSC-looking sequence and the bare
@@ -823,19 +846,25 @@ def _external_stub(repo: Path, out_dir: Path) -> Path:
     LIBRARY_INSTALL_TEST_INSTALL_LIBRARY redirect target), with `repo`
     baked in rather than derived from its own $0 — it doesn't live next to
     `repo`'s bin/, so the co-location trick the real stub uses wouldn't
-    resolve."""
+    resolve. Logs every call the same way STUB_INSTALL_LIBRARY does, so a
+    test can swap over to this stub (required to pair with a
+    LIBRARY_INSTALL_TEST_HEALTH_URL override) without losing that
+    assertion."""
     out_dir.mkdir(parents=True, exist_ok=True)
     stub = out_dir / "install-library"
     stub.write_text(f"""#!/bin/sh
 set -eu
 REPO="{repo}"
 DEPLOY_DIR="$HOME/.local/deploy/library"
+if [ -n "${{STUB_INSTALL_LIBRARY_LOG:-}}" ]; then
+  echo "$*" >> "$STUB_INSTALL_LIBRARY_LOG"
+fi
 if [ "${{1:-}}" = "--status" ]; then
   if [ -f "$DEPLOY_DIR/DEPLOYED_COMMIT" ]; then cat "$DEPLOY_DIR/DEPLOYED_COMMIT"; exit 0; fi
   echo "install-library: nothing deployed yet" >&2
   exit 1
 fi
-SHA="$(git -C "$REPO" rev-parse main)"
+SHA="$(git -C "$REPO" rev-parse refs/heads/main)"
 mkdir -p "$DEPLOY_DIR"
 {{
   echo "ref: main"
@@ -848,58 +877,159 @@ exit 0
     return stub
 
 
-def test_verdict_confirms_when_status_and_health_both_agree(seed_repo, home, health_server, tmp_path):
+def _confirmed_health_env(health_file: Path, target: str, stub: Path) -> dict[str, str]:
+    """extra_env that makes step (e)'s poll resolve on its very first
+    /health check — the target is already "running" before
+    run_library_install is even called. For a test that exercises
+    something earlier than step (e) and does not care how the verdict
+    reads, this keeps it from waiting out any part of the new poll."""
+    health_file.write_text(f'{{"status":"ok","commit":"{target}","staged_commit":"{target}"}}')
+    return {"LIBRARY_INSTALL_TEST_HEALTH_URL": _health_file_url(health_file),
+            "LIBRARY_INSTALL_TEST_INSTALL_LIBRARY": str(stub)}
+
+
+def test_verdict_confirms_when_status_and_health_both_agree(seed_repo, home, health_file, tmp_path):
     target = _git(seed_repo, "rev-parse", "main").stdout.strip()
     deploy_dir = home / ".local" / "deploy" / "library"
     deploy_dir.mkdir(parents=True)
     (deploy_dir / "DEPLOYED_COMMIT").write_text(f"ref: main\ncommit: {target}\n")
-    health_server.health_body = f'{{"status":"ok","commit":"{target}","staged_commit":"{target}"}}'
-    port = health_server.server_address[1]
+    health_file.write_text(f'{{"status":"ok","commit":"{target}","staged_commit":"{target}"}}')
     stub = _external_stub(seed_repo, tmp_path / "ext")
     result = run_library_install(
         seed_repo, home,
-        extra_env={"LIBRARY_INSTALL_TEST_HEALTH_URL": f"http://127.0.0.1:{port}/health",
+        extra_env={"LIBRARY_INSTALL_TEST_HEALTH_URL": _health_file_url(health_file),
                    "LIBRARY_INSTALL_TEST_INSTALL_LIBRARY": str(stub)})
     assert result.returncode == 0, result.stdout + result.stderr
     assert "Deploy confirmed" in result.stdout
 
 
-def test_verdict_is_not_confirmed_when_health_disagrees(seed_repo, home, health_server, tmp_path):
+def test_verdict_confirms_once_health_catches_up_mid_poll(seed_repo, home, health_file, tmp_path):
+    # The server itself self-restarts onto the target commit partway
+    # through the poll — /health still answers with the old commit for a
+    # moment, then a background write (standing in for that self-restart)
+    # overwrites health_file with the target — and step (e) must catch
+    # that without waiting out the full deadline.
     target = _git(seed_repo, "rev-parse", "main").stdout.strip()
     deploy_dir = home / ".local" / "deploy" / "library"
     deploy_dir.mkdir(parents=True)
     (deploy_dir / "DEPLOYED_COMMIT").write_text(f"ref: main\ncommit: {target}\n")
-    health_server.health_body = '{"status":"ok","commit":"stale","staged_commit":"stale"}'
-    port = health_server.server_address[1]
+    (deploy_dir / "app.py").write_text(FAST_DRAIN_APP_PY)
+    health_file.write_text('{"status":"ok","commit":"stale","staged_commit":"stale"}')
     stub = _external_stub(seed_repo, tmp_path / "ext")
-    result = run_library_install(
-        seed_repo, home,
-        extra_env={"LIBRARY_INSTALL_TEST_HEALTH_URL": f"http://127.0.0.1:{port}/health",
-                   "LIBRARY_INSTALL_TEST_INSTALL_LIBRARY": str(stub)})
+
+    def _flip_after_a_moment():
+        time.sleep(2)
+        health_file.write_text(f'{{"status":"ok","commit":"{target}","staged_commit":"{target}"}}')
+
+    flipper = threading.Thread(target=_flip_after_a_moment, daemon=True)
+    flipper.start()
+    try:
+        result = run_library_install(
+            seed_repo, home, timeout=60,
+            extra_env={"LIBRARY_INSTALL_TEST_HEALTH_URL": _health_file_url(health_file),
+                       "LIBRARY_INSTALL_TEST_INSTALL_LIBRARY": str(stub)})
+    finally:
+        flipper.join(timeout=5)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "not yet confirmed" in result.stderr
+    assert "Deploy confirmed" in result.stdout
 
 
-def test_verdict_handles_health_being_unreachable(seed_repo, home, tmp_path):
+def test_verdict_does_not_confirm_on_staged_commit_alone(seed_repo, home, health_file, tmp_path):
+    # The drain window every deploy passes through: the deploy area has
+    # already updated (staged_commit == target) but the running process
+    # hasn't restarted onto it yet (commit still names the old release).
+    # The loop must key on commit alone — held here for the whole deadline,
+    # since nothing ever flips commit to the target.
     target = _git(seed_repo, "rev-parse", "main").stdout.strip()
     deploy_dir = home / ".local" / "deploy" / "library"
     deploy_dir.mkdir(parents=True)
     (deploy_dir / "DEPLOYED_COMMIT").write_text(f"ref: main\ncommit: {target}\n")
+    (deploy_dir / "app.py").write_text(FAST_DRAIN_APP_PY)
+    health_file.write_text(f'{{"status":"ok","commit":"stale","staged_commit":"{target}"}}')
     stub = _external_stub(seed_repo, tmp_path / "ext")
     result = run_library_install(
-        seed_repo, home,
+        seed_repo, home, timeout=60,
+        extra_env={"LIBRARY_INSTALL_TEST_HEALTH_URL": _health_file_url(health_file),
+                   "LIBRARY_INSTALL_TEST_INSTALL_LIBRARY": str(stub)})
+    assert result.returncode == 3, result.stdout + result.stderr
+    assert "the code is installed but the service is not serving it" in result.stderr
+    assert "commit=stale" in result.stderr
+    assert "Deploy confirmed" not in result.stdout
+
+
+def test_verdict_confirms_once_commit_itself_catches_up_after_staged_commit_led(seed_repo, home, health_file, tmp_path):
+    # Same drain window as above, but this time commit itself catches up
+    # mid-poll (standing in for the self-restart completing) — the verdict
+    # must wait for that, not confirm the moment staged_commit alone agreed.
+    target = _git(seed_repo, "rev-parse", "main").stdout.strip()
+    deploy_dir = home / ".local" / "deploy" / "library"
+    deploy_dir.mkdir(parents=True)
+    (deploy_dir / "DEPLOYED_COMMIT").write_text(f"ref: main\ncommit: {target}\n")
+    (deploy_dir / "app.py").write_text(FAST_DRAIN_APP_PY)
+    health_file.write_text(f'{{"status":"ok","commit":"stale","staged_commit":"{target}"}}')
+    stub = _external_stub(seed_repo, tmp_path / "ext")
+
+    def _flip_commit_after_a_moment():
+        time.sleep(2)
+        health_file.write_text(f'{{"status":"ok","commit":"{target}","staged_commit":"{target}"}}')
+
+    flipper = threading.Thread(target=_flip_commit_after_a_moment, daemon=True)
+    flipper.start()
+    try:
+        result = run_library_install(
+            seed_repo, home, timeout=60,
+            extra_env={"LIBRARY_INSTALL_TEST_HEALTH_URL": _health_file_url(health_file),
+                       "LIBRARY_INSTALL_TEST_INSTALL_LIBRARY": str(stub)})
+    finally:
+        flipper.join(timeout=5)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Deploy confirmed" in result.stdout
+
+
+def test_verdict_times_out_and_fails_when_health_never_reports_the_target(seed_repo, home, health_file, tmp_path):
+    target = _git(seed_repo, "rev-parse", "main").stdout.strip()
+    deploy_dir = home / ".local" / "deploy" / "library"
+    deploy_dir.mkdir(parents=True)
+    (deploy_dir / "DEPLOYED_COMMIT").write_text(f"ref: main\ncommit: {target}\n")
+    (deploy_dir / "app.py").write_text(FAST_DRAIN_APP_PY)
+    health_file.write_text('{"status":"ok","commit":"stale","staged_commit":"stale"}')
+    stub = _external_stub(seed_repo, tmp_path / "ext")
+    result = run_library_install(
+        seed_repo, home, timeout=60,
+        extra_env={"LIBRARY_INSTALL_TEST_HEALTH_URL": _health_file_url(health_file),
+                   "LIBRARY_INSTALL_TEST_INSTALL_LIBRARY": str(stub)})
+    assert result.returncode == 3, result.stdout + result.stderr
+    assert "the code is installed but the service is not serving it" in result.stderr
+    assert "commit=stale" in result.stderr
+    assert "Deploy confirmed" not in result.stdout
+    # The redirect is set in every case above, so the no-agent-no-test
+    # guard must have skipped the real launchctl diagnostic entirely.
+    assert "launchctl" not in (result.stdout + result.stderr)
+
+
+def test_verdict_times_out_and_fails_when_health_is_unreachable(seed_repo, home, tmp_path):
+    target = _git(seed_repo, "rev-parse", "main").stdout.strip()
+    deploy_dir = home / ".local" / "deploy" / "library"
+    deploy_dir.mkdir(parents=True)
+    (deploy_dir / "DEPLOYED_COMMIT").write_text(f"ref: main\ncommit: {target}\n")
+    (deploy_dir / "app.py").write_text(FAST_DRAIN_APP_PY)
+    stub = _external_stub(seed_repo, tmp_path / "ext")
+    result = run_library_install(
+        seed_repo, home, timeout=60,
         extra_env={"LIBRARY_INSTALL_TEST_HEALTH_URL": "http://127.0.0.1:1/health",
                    "LIBRARY_INSTALL_TEST_INSTALL_LIBRARY": str(stub)})
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert "not yet confirmed" in result.stderr
+    assert result.returncode == 3, result.stdout + result.stderr
+    assert "the code is installed but the service is not serving it" in result.stderr
+    assert "commit=none" in result.stderr
+    assert "Deploy confirmed" not in result.stdout
+    assert "launchctl" not in (result.stdout + result.stderr)
 
 
-def test_health_url_override_is_refused_without_the_install_library_redirect(seed_repo, home, health_server):
-    port = health_server.server_address[1]
+def test_health_url_override_is_refused_without_the_install_library_redirect(seed_repo, home):
     log = home.parent / "calls.log"
     result = run_library_install(
         seed_repo, home, call_log=log,
-        extra_env={"LIBRARY_INSTALL_TEST_HEALTH_URL": f"http://127.0.0.1:{port}/health"})
+        extra_env={"LIBRARY_INSTALL_TEST_HEALTH_URL": "http://127.0.0.1:1/health"})
     assert result.returncode == 1
     assert "LIBRARY_INSTALL_TEST_INSTALL_LIBRARY" in result.stderr
     assert not log.exists()

@@ -28,23 +28,23 @@ import projects
 import protocol
 import store
 
-AGENT = "agent-token-vivy"
+AGENT = "agent-token-fennick"
 SYSTEM = "system-token"
 CLIENT = "orient-token"
 WIDE = "agent-token-wide"
 
 REFUSALS = [
     # (id, at, item, product, requester, actor, blocking_root, holder, blocks_by)
-    ("ref_1", "2026-08-20 09:00:00", "issue_a", "vivy", "deck-co", "ops-mcp",
-     "root_vivy", "vivy-co", "ancestor"),
-    ("ref_2", "2026-08-20 10:00:00", "issue_b", "vivy", "vivy-co", "ops-mcp",
-     "root_vivy", "deck-co", "descendant"),
+    ("ref_1", "2026-08-20 09:00:00", "issue_a", "fennick", "deck-co", "ops-mcp",
+     "root_fennick", "fennick-co", "ancestor"),
+    ("ref_2", "2026-08-20 10:00:00", "issue_b", "fennick", "fennick-co", "ops-mcp",
+     "root_fennick", "deck-co", "descendant"),
     # SAME SECOND as ref_2's successor, which is what a collision storm looks
     # like and what makes ordering on `at` alone unstable.
-    ("ref_3", "2026-08-20 10:00:00", "issue_c", "vivy", "deck-co", "ops-mcp",
-     "root_hidden", "vivy-co", "ancestor"),
+    ("ref_3", "2026-08-20 10:00:00", "issue_c", "fennick", "deck-co", "ops-mcp",
+     "root_hidden", "fennick-co", "ancestor"),
     # ANOTHER PRODUCT, so the scope wall has something to exclude.
-    ("ref_4", "2026-08-20 11:00:00", "issue_d", "constance", "cst-co",
+    ("ref_4", "2026-08-20 11:00:00", "issue_d", "marlow", "cst-co",
      "ops-mcp", "root_hidden", "other-co", "ancestor"),
 ]
 
@@ -75,11 +75,11 @@ def client(tmp_path, monkeypatch):
             updated_by TEXT NOT NULL, updated_at TEXT NOT NULL);
     """)
     # The blocking ROOTS, whose product is a separate fact from the refused
-    # item's. `root_vivy` is in scope for a vivy token; `root_hidden` is not.
+    # item's. `root_fennick` is in scope for a fennick token; `root_hidden` is not.
     conn.executemany(
         "INSERT INTO issue_items (id, product, title, type, state) "
         "VALUES (?,?,'t','epic','open')",
-        [("root_vivy", "vivy"), ("root_hidden", "constance")])
+        [("root_fennick", "fennick"), ("root_hidden", "marlow")])
     conn.executemany(
         "INSERT INTO lease_refusals (id, at, requested_item_id, product, "
         "requester, actor, blocking_lease_id, blocking_root_id, "
@@ -90,7 +90,7 @@ def client(tmp_path, monkeypatch):
 
     tokens = tmp_path / "api-tokens.json"
     tokens.write_text(json.dumps({
-        AGENT: {"name": "vivy-agent", "products": ["vivy"]},
+        AGENT: {"name": "fennick-agent", "products": ["fennick"]},
         WIDE: {"name": "wide-agent", "products": ["*"]},
         SYSTEM: {"name": "capture", "products": ["*"], "kind": "system"},
     }))
@@ -119,7 +119,7 @@ def _h(token):
 
 def _capture(client, token=CLIENT, **body):
     payload = {"source": "gmail", "kind": "inbound_email",
-               "actor": "alice@example.org", "product": "vivy",
+               "actor": "alice@example.org", "product": "fennick",
                "body": "loved the demo", **body}
     return client.post("/signals", json=payload, headers=_h(token))
 
@@ -231,7 +231,7 @@ def test_the_fleet_wide_view_is_the_unfiltered_one(client):
 
 
 def test_the_crew_scoped_view_is_the_same_route_with_product(client):
-    assert set(_ids(_refusals(client, product="vivy"))) == {
+    assert set(_ids(_refusals(client, product="fennick"))) == {
         "ref_1", "ref_2", "ref_3"}
 
 
@@ -248,7 +248,7 @@ def test_a_blocker_outside_the_callers_scope_is_not_named(client):
     """**The requested item's product is not the blocking lease's**
     (security-reviewer, PR #48). `record_refusal` stamps `product` from the item
     that was refused, so the scope clause proves only that the caller may see
-    THAT. ref_3 is a vivy refusal whose blocking subtree sits in constance."""
+    THAT. ref_3 is a fennick refusal whose blocking subtree sits in marlow."""
     rows = {x["id"]: x for x in _refusals(client, token=AGENT).json()["refusals"]}
     assert rows["ref_3"]["blocked"] is True
     assert "blocking_holder" not in rows["ref_3"]
@@ -257,7 +257,7 @@ def test_a_blocker_outside_the_callers_scope_is_not_named(client):
     assert rows["ref_3"]["blocks_by"] == "ancestor"
     assert rows["ref_3"]["requested_item_id"] == "issue_c"
     # ...and an in-scope blocker is still named.
-    assert rows["ref_1"]["blocking_holder"] == "vivy-co"
+    assert rows["ref_1"]["blocking_holder"] == "fennick-co"
 
 
 def test_a_refusal_names_who_collided_with_whom(client):
@@ -265,7 +265,7 @@ def test_a_refusal_names_who_collided_with_whom(client):
     row = next(x for x in _refusals(client).json()["refusals"]
                if x["id"] == "ref_1")
     assert row["requester"] == "deck-co"
-    assert row["blocking_holder"] == "vivy-co"
+    assert row["blocking_holder"] == "fennick-co"
     assert row["blocks_by"] == "ancestor"
     assert row["requested_item_id"] == "issue_a"
 
@@ -273,7 +273,7 @@ def test_a_refusal_names_who_collided_with_whom(client):
 def test_scoping_is_the_identitys_and_a_product_param_cannot_widen_it(client):
     """`product` narrows WITHIN what the identity may see. A single-product
     token naming another product gets an empty page, not that product's rows."""
-    assert _ids(_refusals(client, token=AGENT, product="constance")) == []
+    assert _ids(_refusals(client, token=AGENT, product="marlow")) == []
     # ...and its unfiltered view is its own product only.
     assert set(_ids(_refusals(client, token=AGENT))) == {
         "ref_1", "ref_2", "ref_3"}
@@ -326,7 +326,7 @@ def _read_one(client, signal_id, token):
 
 
 def _read_list(client, token):
-    return client.get("/signals", params={"product": "vivy"}, headers=_h(token))
+    return client.get("/signals", params={"product": "fennick"}, headers=_h(token))
 
 
 def test_an_agent_cannot_read_back_the_person(client):
@@ -375,7 +375,7 @@ def test_an_idempotent_hit_does_not_leak_another_callers_person(client):
     assert first.status_code == 201
     again = client.post("/signals", json={
         "source": "gmail", "kind": "inbound_email", "actor": "alice@example.org",
-        "product": "vivy", "body": "loved the demo", "dedup_key": "k1"},
+        "product": "fennick", "body": "loved the demo", "dedup_key": "k1"},
         headers=_h(SYSTEM))
     assert again.status_code == 200 and again.json().get("idempotent") is True
     assert again.json()["acting_human"] == "operator@example.com"  # SYSTEM holds it
@@ -388,12 +388,12 @@ def test_filtering_on_a_hidden_holder_is_not_an_oracle(client):
     scope — and crew identities are a small enumerable set, so a boolean count
     is a full oracle for the fact the withholding exists to keep.
 
-    ref_3 is a vivy refusal (so it passes the listing's own scope clause) whose
-    blocking subtree is in constance. `vivy-co` genuinely holds it. A correct
+    ref_3 is a fennick refusal (so it passes the listing's own scope clause) whose
+    blocking subtree is in marlow. `fennick-co` genuinely holds it. A correct
     guess must be indistinguishable from a wrong one."""
-    correct = _refusals(client, token=AGENT, blocking_holder="vivy-co")
+    correct = _refusals(client, token=AGENT, blocking_holder="fennick-co")
     wrong = _refusals(client, token=AGENT, blocking_holder="no-such-crew")
-    # ref_1 is the in-scope row `vivy-co` also holds, so a correct guess still
+    # ref_1 is the in-scope row `fennick-co` also holds, so a correct guess still
     # returns what the caller may legitimately see — and nothing more.
     assert _ids(correct) == ["ref_1"]
     assert correct.json()["total"] == 1
@@ -405,7 +405,7 @@ def test_filtering_on_a_hidden_holder_is_not_an_oracle(client):
 def test_a_wide_token_still_sees_the_hidden_row_by_holder(client):
     """The guard narrows to what the caller may see, and must not break the
     filter for a caller that may see everything."""
-    r = _refusals(client, token=WIDE, blocking_holder="vivy-co")
+    r = _refusals(client, token=WIDE, blocking_holder="fennick-co")
     assert set(_ids(r)) == {"ref_1", "ref_2", "ref_3"} - {"ref_2"}
 
 

@@ -46,14 +46,14 @@ def test_the_crew_column_is_unique(tmp_path):
     conn.execute(
         "INSERT INTO black_box_registrations "
         "(crew, model, gateway, created_at, created_by, updated_at, "
-        " updated_by) VALUES ('cfo', 'sonnet', 'anthropic', '2026-01-01', "
+        " updated_by) VALUES ('quill', 'sonnet', 'anthropic', '2026-01-01', "
         "'operator', '2026-01-01', 'operator')")
     conn.commit()
     try:
         conn.execute(
             "INSERT INTO black_box_registrations "
             "(crew, model, gateway, created_at, created_by, updated_at, "
-            " updated_by) VALUES ('cfo', 'opus', 'bedrock', '2026-01-02', "
+            " updated_by) VALUES ('quill', 'opus', 'bedrock', '2026-01-02', "
             "'operator', '2026-01-02', 'operator')")
         conn.commit()
         raised = False

@@ -273,10 +273,20 @@ EMBEDDED_SIGNAL_KINDS = frozenset({
 # `DISCARDED_SIGNAL_KINDS` below, so `discard_sweep.py`, the cold tier and the
 # storage report share one copy of the decision's kind lists rather than each
 # deriving its own.
+#
+# `ci_workflow_run` (CQ·253) needs its own amendment to library/decisions/0001,
+# filed alongside this change but not yet merged — it is added here on the
+# strength of the same filter-not-text reasoning the rest of this set already
+# documents, matching `pr_state`'s own entry.
+#
+# `code_coverage` (CQ·253) needs its own amendment to library/decisions/0001,
+# filed alongside this change in convivy/knowledge#1164 but not yet merged —
+# it is added here on the strength of the same filter-not-text reasoning the
+# rest of this set already documents, matching `test-result`'s own entry.
 KEPT_NOT_EMBEDDED_SIGNAL_KINDS = frozenset({
-    "pr_state", "model_resolution", "changelog",
+    "pr_state", "ci_workflow_run", "model_resolution", "changelog",
     "alert", "ops-alert", "deploy_failure", "capability-restored",
-    "session-follow-leak-recovered", "test-result",
+    "session-follow-leak-recovered", "test-result", "code_coverage",
     "review_verdict", "review_comment", "review-completed",
     "notification", "deletion-record",
 })
@@ -308,10 +318,12 @@ HOT_WINDOW_DAYS: dict[str, int | None] = {
     "capability-restored": 90,
     "session-follow-leak-recovered": 90,
     "test-result": 90,
+    "code_coverage": 90,
     # Must stay after the 180 spread above, which now covers this kind too:
     # the later key is the one that wins. Pinned by test_cold_tier.py.
     "transcript-turn": 30,
     "pr_state": 30,
+    "ci_workflow_run": 30,
     "model_resolution": 30,
     "notification": 0,
     "deletion-record": None,

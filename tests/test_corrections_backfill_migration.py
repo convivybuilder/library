@@ -64,35 +64,35 @@ def _seed(db):
         "state, type, created_by, created_at, parent_id) "
         "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         [
-            # vivy: an open correction and a CLOSED one — both get the
+            # fennick: an open correction and a CLOSED one — both get the
             # queue (the operator's ruling, 2026-10-09: closed
             # corrections get it too, "for cleanliness").
-            ("c_v1", "vivy", "open correction", "b", "{}", "low", "open",
+            ("c_v1", "fennick", "open correction", "b", "{}", "low", "open",
              "bug", "t", "2026-01-01", None),
-            ("c_v2", "vivy", "closed correction", "b", "{}", "low", "fixed",
+            ("c_v2", "fennick", "closed correction", "b", "{}", "low", "fixed",
              "bug", "t", "2026-01-01", None),
-            # vivy: an untyped open correction, matching what library PR
+            # fennick: an untyped open correction, matching what library PR
             # 236's migration leaves an open non-epic item as.
-            ("c_v3", "vivy", "untyped correction", "b", "{}", "low", "open",
+            ("c_v3", "fennick", "untyped correction", "b", "{}", "low", "open",
              None, "t", "2026-01-01", None),
-            # vivy: an epic with a NULL parent — stays top-level, untouched.
-            ("e_v1", "vivy", "epic", "b", "{}", "low", "open", "epic", "t",
+            # fennick: an epic with a NULL parent — stays top-level, untouched.
+            ("e_v1", "fennick", "epic", "b", "{}", "low", "open", "epic", "t",
              "2026-01-01", None),
-            # vivy: a work item already under the epic — untouched; its
+            # fennick: a work item already under the epic — untouched; its
             # parent is not NULL, so the migration's WHERE clause never
             # reaches it.
-            ("t_v1", "vivy", "under the epic", "b", "{}", "low", "open",
+            ("t_v1", "fennick", "under the epic", "b", "{}", "low", "open",
              None, "t", "2026-01-01", "e_v1"),
-            # vivy: a dangling parent — left exactly as it is. Its
+            # fennick: a dangling parent — left exactly as it is. Its
             # `parent_id` is not NULL, so this migration does not touch it;
             # `GET /items?home=invalid` is what surfaces it afterward.
-            ("d_v1", "vivy", "dangling parent", "b", "{}", "low", "open",
+            ("d_v1", "fennick", "dangling parent", "b", "{}", "low", "open",
              "bug", "t", "2026-01-01", "issue_does_not_exist"),
-            # archy: a correction in a product PR 1's own migration never
+            # spindle: a correction in a product PR 1's own migration never
             # saw — seeded here, after that migration ran, the way a
             # product's first correction filed in the gap between PR 1's
             # deploy and this one's would look. No queue exists for it yet.
-            ("c_a1", "archy", "archy's first correction", "b", "{}", "low",
+            ("c_a1", "spindle", "spindle's first correction", "b", "{}", "low",
              "open", "bug", "t", "2026-01-01", None),
         ])
     conn.execute(
@@ -100,7 +100,7 @@ def _seed(db):
         "ingested_at, source, product, reported_by, epic_id) "
         "VALUES (?,?,?,?,?,?,?,?,?,?)",
         ("lde_v1", "ld_v", "2026-01-01", 100, "2026-01-01", "2026-01-01",
-         "agentctl", "vivy", "t", "corrections"))
+         "agentctl", "fennick", "t", "corrections"))
     # A ledger entry naming a product with no `issue_items` correction at
     # all — the other way `8d88e5026d39` seeded a queue, and the other way
     # this migration has to resolve one.
@@ -109,14 +109,14 @@ def _seed(db):
         "ingested_at, source, product, reported_by, epic_id) "
         "VALUES (?,?,?,?,?,?,?,?,?,?)",
         ("lde_a1", "ld_a", "2026-01-01", 100, "2026-01-01", "2026-01-01",
-         "agentctl", "archy", "t", "corrections"))
+         "agentctl", "spindle", "t", "corrections"))
     conn.commit()
-    # PR 1's own migration, simulated: a queue already exists for `vivy`
+    # PR 1's own migration, simulated: a queue already exists for `fennick`
     # (the state the live vault was in before this migration ran), but not
-    # for `archy`, which filed its first correction afterward.
+    # for `spindle`, which filed its first correction afterward.
     conn.execute(
         "INSERT INTO corrections_queues (id, product, created_at) "
-        "VALUES ('cq_vivy', 'vivy', '2026-01-01 00:00:00')")
+        "VALUES ('cq_fennick', 'fennick', '2026-01-01 00:00:00')")
     conn.commit()
     conn.close()
 
@@ -136,8 +136,8 @@ def _upgraded_copy(tmp_path, seed=True):
 def test_upgrade_backfills_open_and_closed_corrections_to_the_queue(tmp_path):
     copy = _upgraded_copy(tmp_path)
     items = _items(copy)
-    queue_id = _queues(copy)["vivy"]
-    assert queue_id == "cq_vivy"
+    queue_id = _queues(copy)["fennick"]
+    assert queue_id == "cq_fennick"
     assert items["c_v1"]["parent_id"] == queue_id
     assert items["c_v2"]["parent_id"] == queue_id          # closed, too
     assert items["c_v3"]["parent_id"] == queue_id          # untyped, too
@@ -156,23 +156,23 @@ def test_upgrade_leaves_a_dangling_parent_as_it_is(tmp_path):
 
 
 def test_upgrade_reseeds_a_queue_for_a_product_pr1_never_saw(tmp_path):
-    """`archy` had no `corrections_queues` row before this migration ran —
+    """`spindle` had no `corrections_queues` row before this migration ran —
     PR 1's own migration seeded only what existed at ITS deploy time, and
-    `archy`'s first correction was filed after that. The backfill still
+    `spindle`'s first correction was filed after that. The backfill still
     resolves it, by minting the missed queue first."""
     copy = _upgraded_copy(tmp_path)
     queues = _queues(copy)
-    assert "archy" in queues
-    assert queues["archy"].startswith("cq_")
-    assert _items(copy)["c_a1"]["parent_id"] == queues["archy"]
+    assert "spindle" in queues
+    assert queues["spindle"].startswith("cq_")
+    assert _items(copy)["c_a1"]["parent_id"] == queues["spindle"]
 
 
 def test_upgrade_backfills_the_ledger_literal_to_the_queue_id(tmp_path):
     copy = _upgraded_copy(tmp_path)
     queues = _queues(copy)
     ledger = _ledger(copy)
-    assert ledger["lde_v1"]["epic_id"] == queues["vivy"]
-    assert ledger["lde_a1"]["epic_id"] == queues["archy"]
+    assert ledger["lde_v1"]["epic_id"] == queues["fennick"]
+    assert ledger["lde_a1"]["epic_id"] == queues["spindle"]
 
 
 def test_upgrade_changes_no_other_column(tmp_path):

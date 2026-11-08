@@ -26,7 +26,7 @@ import protocol
 import reference
 import store
 
-AGENT = "agent-token-vivy"
+AGENT = "agent-token-fennick"
 
 BLOCK_ID = "platform/blocks/verify-before-report"
 BLOCK_EXTRA = {"binds_crews": ["platform"],
@@ -40,7 +40,7 @@ BLOCK_EXTRA = {"binds_crews": ["platform"],
                "source_author": "steward"}
 
 PARTIAL_ID = "platform/blocks/floor-only"
-PARTIAL_EXTRA = {"binds_crews": ["platform", "vivy"]}  # no scope/binds_roles
+PARTIAL_EXTRA = {"binds_crews": ["platform", "fennick"]}  # no scope/binds_roles
 
 DECISION_ID = "platform/decisions/0022-library-repo"
 DECISION_EXTRA = {"source_author": "operator"}  # non-block; must not leak the two
@@ -98,7 +98,7 @@ def client(tmp_path, monkeypatch):
 
     tokens = tmp_path / "api-tokens.json"
     tokens.write_text(json.dumps({
-        AGENT: {"name": "vivy-agent", "products": ["vivy"]},
+        AGENT: {"name": "fennick-agent", "products": ["fennick"]},
     }))
 
     monkeypatch.setattr(store, "DB_PATH", control)

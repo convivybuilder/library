@@ -21,8 +21,8 @@ import lease
 import protocol
 import store
 
-AGENT = "agent-token-vivy"
-ACTOR = "vivy-agent"
+AGENT = "agent-token-fennick"
+ACTOR = "fennick-agent"
 CONDITION = "the vendor replies"
 
 
@@ -72,15 +72,15 @@ def client(tmp_path, monkeypatch):
         "INSERT INTO issue_items (id, product, title, type, state, severity, "
         "needs, created_by_kind, created_at, refs, parent_id, prerequisites) "
         "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-        [("epic", "vivy", "An epic", "epic", "open", "medium", "agent", "agent",
+        [("epic", "fennick", "An epic", "epic", "open", "medium", "agent", "agent",
           _ts(days=2), "{}", None, None),
-         ("task", "vivy", "A task", "task", "open", "low", "agent", "agent",
+         ("task", "fennick", "A task", "task", "open", "low", "agent", "agent",
           _ts(days=2), "{}", "epic", prerequisites)])
     conn.commit()
     conn.close()
 
     tokens = tmp_path / "api-tokens.json"
-    tokens.write_text(json.dumps({AGENT: {"name": ACTOR, "products": ["vivy"]}}))
+    tokens.write_text(json.dumps({AGENT: {"name": ACTOR, "products": ["fennick"]}}))
     monkeypatch.setattr(store, "DB_PATH", db)
     monkeypatch.setattr(identity, "TOKENS", tokens)
     monkeypatch.setattr(store, "WRITES_ENABLED", True)

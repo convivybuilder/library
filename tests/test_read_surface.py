@@ -34,7 +34,7 @@ import reference
 import store
 import vectors
 
-AGENT = "agent-token-vivy"
+AGENT = "agent-token-fennick"
 WIDE = "agent-token-wide"
 SYSTEM = "system-token"
 NOSCOPE = "agent-token-noscope"
@@ -138,11 +138,11 @@ def _build_client(tmp_path, monkeypatch):
         # so it is computed relative to test-run time instead
         # (issue_01M1HPV2VS51RFGF3X8ZJTD4EH — a pinned date there fell out of
         # its own window exactly 30 days after the date it named).
-        [("issue_v1", "vivy", "A vivy item", "bug", "open",
+        [("issue_v1", "fennick", "A fennick item", "bug", "open",
           "2026-08-01 12:00:00.111111", "k1", '["a"]'),
-         ("issue_v2", "vivy", "A vivy epic", "epic", "open",
+         ("issue_v2", "fennick", "A fennick epic", "epic", "open",
           "2026-08-02 12:00:00.222222", "k2", "[]"),
-         ("issue_c1", "constance", "A constance item", "bug", "open",
+         ("issue_c1", "marlow", "A marlow item", "bug", "open",
           _window_safe_ts(2), "k3", "[]")])
     conn.executemany(
         "INSERT INTO courses (id, product, title, entries, status, version, "
@@ -156,39 +156,39 @@ def _build_client(tmp_path, monkeypatch):
         # merely different — an unrevised Course sorted wherever SQLite puts
         # NULL.
         #
-        # The vivy Course carries a cross-product entry (`issue_c1`) alongside a
+        # The fennick Course carries a cross-product entry (`issue_c1`) alongside a
         # dangling one. Both are data-integrity faults rather than normal states,
         # and both have to resolve to `missing` rather than to a disclosure or a
         # silently shorter list.
-        [("course_v", "vivy", "Vivy's route",
+        [("course_v", "fennick", "Fennick's route",
           json.dumps(["issue_v2", "issue_gone", "issue_c1"]), "live", 3,
           "2026-08-06 09:15:00.123456", "2026-08-04 11:00:00.000000"),
          # A SECOND COURSE IN ANOTHER PRODUCT. Without it every scope assertion on
          # this route is vacuous — one row and one scope means the filter can
          # never remove anything (reviewer, PR #1).
-         ("course_c", "constance", "Constance's route", json.dumps([]),
+         ("course_c", "marlow", "Marlow's route", json.dumps([]),
           "live", 1, "2026-08-09 08:00:00.000000", None),
-         ("course_old", "vivy", "What vivy used to intend", json.dumps([]),
+         ("course_old", "fennick", "What fennick used to intend", json.dumps([]),
           "superseded", 1, "2026-08-01 10:00:00.000000",
           "2026-08-03 10:00:00.000000")])
     conn.executemany(
         "INSERT INTO signals (id, product, kind, body, privacy_class, ingested_at) "
         "VALUES (?,?,?,?,?,?)",
-        [("sig_v1", "vivy", "note", "an internal note", "internal",
+        [("sig_v1", "fennick", "note", "an internal note", "internal",
           "2026-08-01 07:30:00.444444"),
-         ("sig_v2", "vivy", "note", "a customer said this", "customer",
+         ("sig_v2", "fennick", "note", "a customer said this", "customer",
           "2026-08-02 07:30:00.555555")])
     conn.commit()
     conn.close()
 
     tokens = tmp_path / "api-tokens.json"
     tokens.write_text(json.dumps({
-        AGENT: {"name": "vivy-agent", "products": ["vivy"]},
+        AGENT: {"name": "fennick-agent", "products": ["fennick"]},
         WIDE: {"name": "wide-agent", "products": ["*"]},
         SYSTEM: {"name": "capture", "products": ["*"], "kind": "system"},
         NOSCOPE: {"name": "scopeless", "products": []},
         MULTI: {"name": "many-products",
-                "products": ["vivy", "constance", "hollis"]},
+                "products": ["fennick", "marlow", "bramwell"]},
     }))
     monkeypatch.setattr(store, "DB_PATH", db)
     monkeypatch.setattr(identity, "TOKENS", tokens)
@@ -273,7 +273,7 @@ def test_a_list_is_scoped_and_the_total_is_scoped_with_it(client):
     filter tells an out-of-scope caller how much it cannot see."""
     r = client.get("/items", headers=_h())
     body = r.json()
-    assert {i["product"] for i in body["items"]} == {"vivy"}
+    assert {i["product"] for i in body["items"]} == {"fennick"}
     assert body["total"] == 2, "total counted rows outside the caller's scope"
 
 
@@ -317,7 +317,7 @@ def test_pagination_reports_count_total_and_truncation(client):
     assert last["truncated"] is False
 
 
-def _seed_tied_items(n=6, product="vivy"):
+def _seed_tied_items(n=6, product="fennick"):
     """`n` items sharing one `created_at`, inserted so that ROWID order is the
     REVERSE of id order.
 
@@ -367,7 +367,7 @@ def _seed_items(ids):
     _insert("issue_items",
             ("id", "product", "title", "type", "state", "created_at",
              "once_key", "topics"),
-            [(i, "vivy", f"tied {i}", "bug", "open", TIE_TS, f"k-{i}", "[]")
+            [(i, "fennick", f"tied {i}", "bug", "open", TIE_TS, f"k-{i}", "[]")
              for i in reversed(ids)])
 
 
@@ -375,14 +375,14 @@ def _seed_courses(ids):
     _insert("courses",
             ("id", "product", "title", "entries", "status", "version",
              "created_at"),
-            [(i, "vivy", f"tied {i}", "[]", "live", 1, TIE_TS)
+            [(i, "fennick", f"tied {i}", "[]", "live", 1, TIE_TS)
              for i in reversed(ids)])
 
 
 def _seed_signals(ids):
     _insert("signals",
             ("id", "product", "kind", "body", "privacy_class", "ingested_at"),
-            [(i, "vivy", "note", f"tied {i}", "internal", TIE_TS)
+            [(i, "fennick", "note", f"tied {i}", "internal", TIE_TS)
              for i in reversed(ids)])
 
 
@@ -395,7 +395,7 @@ def _seed_signals_produced_at(ids):
     _insert("signals",
             ("id", "product", "kind", "body", "privacy_class", "ingested_at",
              "produced_at"),
-            [(i, "vivy", "note", f"tied {i}", "internal", TIE_TS, TIE_TS)
+            [(i, "fennick", "note", f"tied {i}", "internal", TIE_TS, TIE_TS)
              for i in reversed(ids)])
 
 
@@ -423,7 +423,7 @@ def _seed_tied_leases(ids):
     _insert("issue_items",
             ("id", "product", "title", "type", "state", "created_at",
              "once_key", "topics"),
-            [(f"issue_root_{r[-1]}", "vivy", f"root of {i}", "epic", "open",
+            [(f"issue_root_{r[-1]}", "fennick", f"root of {i}", "epic", "open",
               TIE_TS, f"k-root-{r[-1]}", "[]") for i, r in pairs])
     _insert("issue_leases",
             ("id", "root_id", "taken_for", "holder", "run_id", "taken_at",
@@ -555,7 +555,7 @@ def test_items_list_refuses_an_unrecognised_parameter(client):
 
 
 def test_items_list_ordinary_request_still_succeeds(client):
-    r = client.get("/items?product=vivy&state=open&limit=5&offset=0"
+    r = client.get("/items?product=fennick&state=open&limit=5&offset=0"
                    "&sort=created_at", headers=_h(WIDE))
     assert r.status_code == 200
 
@@ -587,7 +587,7 @@ def test_a_cross_product_course_entry_is_not_resolved_into_a_disclosure(client):
     assert "title" not in entry, "a cross-product entry disclosed its body"
     # And a wildcard caller, which MAY see it, gets the real item.
     wide = client.get("/courses/course_v", headers=_h(WIDE)).json()
-    assert wide["items"][2]["title"] == "A constance item"
+    assert wide["items"][2]["title"] == "A marlow item"
 
 
 def test_a_course_list_is_scoped_and_the_total_is_scoped_with_it(client):
@@ -605,12 +605,12 @@ def test_a_course_list_resolves_product_through_the_registry(client, tmp_path, m
     silently returned nothing where Orient resolves the query param first
     (reviewer, PR #23)."""
     registry = tmp_path / "projects.json"
-    registry.write_text(json.dumps({"vivy": {"aliases": ["viv"], "repos": []}}))
+    registry.write_text(json.dumps({"fennick": {"aliases": ["viv"], "repos": []}}))
     with monkeypatch.context() as m:
         m.setattr(projects, "REGISTRY_PATH", registry)
         projects.reload()
         alias = client.get("/courses?product=viv", headers=_h(WIDE)).json()
-        cased = client.get("/courses?product=VIVY", headers=_h(WIDE)).json()
+        cased = client.get("/courses?product=FENNICK", headers=_h(WIDE)).json()
     projects.reload()
     assert [c["id"] for c in alias["courses"]] == ["course_v"]
     assert [c["id"] for c in cased["courses"]] == ["course_v"]
@@ -748,17 +748,17 @@ def _conn():
 def _seed_leases():
     """A live lease per product, plus a released one and a refusal — enough to
     exercise scoping, `state`, `holder` and the checkout formatter reused from
-    `lease.py`. `issue_v2` (a vivy epic) and `issue_c1` (a constance item) are
+    `lease.py`. `issue_v2` (a fennick epic) and `issue_c1` (a marlow item) are
     both parentless-or-epic, so each leases itself and stands in as a root."""
     conn = _conn()
     conn.executemany(
         "INSERT INTO issue_leases (id, root_id, taken_for, holder, run_id, "
         "taken_at, heartbeat_at, released_at, release_reason, released_by, "
         "note) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-        [("lease_v1", "issue_v2", "issue_v2", "holder-vivy", "run-1",
+        [("lease_v1", "issue_v2", "issue_v2", "holder-fennick", "run-1",
           "2026-08-10 09:00:00", "2026-08-10 09:00:00", None, None, None,
           None),
-         ("lease_c1", "issue_c1", "issue_c1", "holder-constance", "run-2",
+         ("lease_c1", "issue_c1", "issue_c1", "holder-marlow", "run-2",
           "2026-08-10 08:00:00", "2026-08-10 08:00:00", None, None, None,
           None),
          ("lease_v0", "issue_v1", "issue_v1", "holder-old", "run-0",
@@ -777,8 +777,8 @@ def _seed_leases():
         "INSERT INTO lease_refusals (id, at, requested_item_id, product, "
         "requester, actor, blocking_lease_id, blocking_root_id, "
         "blocking_holder, blocks_by) VALUES (?,?,?,?,?,?,?,?,?,?)",
-        ("ref_v1", _window_safe_ts(1, microseconds=False), "issue_v1", "vivy",
-         "someone", "someone", "lease_v1", "issue_v2", "holder-vivy",
+        ("ref_v1", _window_safe_ts(1, microseconds=False), "issue_v1", "fennick",
+         "someone", "someone", "lease_v1", "issue_v2", "holder-fennick",
          "ancestor"))
     conn.commit()
     conn.close()
@@ -812,8 +812,8 @@ def test_leases_state_param_is_validated(client):
 
 def test_leases_holder_narrows_to_one_session(client):
     _seed_leases()
-    body = client.get("/leases?holder=holder-vivy", headers=_h(WIDE)).json()
-    assert [ln["holder"] for ln in body["leases"]] == ["holder-vivy"]
+    body = client.get("/leases?holder=holder-fennick", headers=_h(WIDE)).json()
+    assert [ln["holder"] for ln in body["leases"]] == ["holder-fennick"]
 
 
 def test_a_dead_lease_is_listed_and_marked_dead(client):
@@ -862,7 +862,7 @@ def test_lease_timestamps_are_rfc3339(client):
 
 def test_leases_requires_its_own_capability(client, tmp_path, monkeypatch):
     toks = tmp_path / "narrow.json"
-    toks.write_text(json.dumps({"narrow": {"name": "n", "products": ["vivy"]}}))
+    toks.write_text(json.dumps({"narrow": {"name": "n", "products": ["fennick"]}}))
     monkeypatch.setattr(identity, "TOKENS", toks)
     monkeypatch.setattr(identity, "CLIENT_TOKENS", tmp_path / "no-clients.json")
     monkeypatch.setattr(identity, "ROLE_CAPS", {"agent": frozenset({"course.read"})})
@@ -879,7 +879,7 @@ def test_leases_refuses_an_unrecognised_parameter(client):
 
 def test_leases_ordinary_request_still_succeeds(client):
     _seed_leases()
-    r = client.get("/leases?state=all&holder=holder-vivy&limit=5&offset=0",
+    r = client.get("/leases?state=all&holder=holder-fennick&limit=5&offset=0",
                    headers=_h(WIDE))
     assert r.status_code == 200
 
@@ -893,7 +893,7 @@ def test_librarian_metrics_requires_a_product_for_a_scoped_identity(client):
 
 
 def test_librarian_metrics_refuses_a_product_outside_scope(client):
-    r = client.get("/metrics/librarian?product=constance", headers=_h())
+    r = client.get("/metrics/librarian?product=marlow", headers=_h())
     assert r.status_code == 404
 
 
@@ -906,7 +906,7 @@ def test_librarian_metrics_reports_all_four_measurements(client):
     """Two real, two `available: false` with the evidence — a metric that
     silently reads 0 because nothing feeds it is the failure ADR-0019 exists
     to catch."""
-    body = client.get("/metrics/librarian?product=vivy", headers=_h()).json()
+    body = client.get("/metrics/librarian?product=fennick", headers=_h()).json()
     assert body["duplicate_filing_rate"]["available"] is True
     assert body["lease_refusals"]["available"] is True
     assert body["bundle_miss_rate"]["available"] is False
@@ -916,15 +916,15 @@ def test_librarian_metrics_reports_all_four_measurements(client):
 
 
 def test_librarian_metrics_window_days_is_validated(client):
-    r = client.get("/metrics/librarian?product=vivy&window_days=0", headers=_h())
+    r = client.get("/metrics/librarian?product=fennick&window_days=0", headers=_h())
     assert r.status_code == 400
-    r2 = client.get("/metrics/librarian?product=vivy&window_days=nope",
+    r2 = client.get("/metrics/librarian?product=fennick&window_days=nope",
                     headers=_h())
     assert r2.status_code == 400
 
 
 def test_librarian_metrics_counts_duplicate_filings_in_the_window(client):
-    """Cohorted by filing date: `issue_c1` is the only constance filing in the
+    """Cohorted by filing date: `issue_c1` is the only marlow filing in the
     fixture, and marking it a duplicate should move both the numerator and the
     still-unresolved count."""
     conn = _conn()
@@ -932,7 +932,7 @@ def test_librarian_metrics_counts_duplicate_filings_in_the_window(client):
                  "state = 'duplicate' WHERE id = 'issue_c1'")
     conn.commit()
     conn.close()
-    body = client.get("/metrics/librarian?product=constance",
+    body = client.get("/metrics/librarian?product=marlow",
                       headers=_h(WIDE)).json()
     rate = body["duplicate_filing_rate"]
     assert rate["filed"] == 1 and rate["resolved_duplicate"] == 1
@@ -942,18 +942,18 @@ def test_librarian_metrics_counts_duplicate_filings_in_the_window(client):
 
 def test_librarian_metrics_reads_lease_refusals_scoped_by_product(client):
     _seed_leases()
-    body = client.get("/metrics/librarian?product=vivy", headers=_h()).json()
+    body = client.get("/metrics/librarian?product=fennick", headers=_h()).json()
     refusals = body["lease_refusals"]
     assert refusals["refusals"] == 1
     assert refusals["by_direction"] == {"ancestor": 1}
-    other = client.get("/metrics/librarian?product=constance",
+    other = client.get("/metrics/librarian?product=marlow",
                        headers=_h(WIDE)).json()
     assert other["lease_refusals"]["refusals"] == 0, (
-        "a refusal filed under vivy leaked into another product's count")
+        "a refusal filed under fennick leaked into another product's count")
 
 
 def test_librarian_metrics_refuses_an_unrecognised_parameter(client):
-    r = client.get("/metrics/librarian?product=vivy&since=2026-01-01",
+    r = client.get("/metrics/librarian?product=fennick&since=2026-01-01",
                    headers=_h())
     assert r.status_code == 400
     assert r.json()["unknown"] == ["since"]
@@ -996,21 +996,21 @@ def test_librarian_metrics_window_fixtures_survive_a_year_of_clock_drift(
     conn.commit()
     conn.close()
 
-    dup = client.get("/metrics/librarian?product=constance",
+    dup = client.get("/metrics/librarian?product=marlow",
                      headers=_h(WIDE)).json()["duplicate_filing_rate"]
     assert dup["filed"] == 1 and dup["resolved_duplicate"] == 1
 
-    ref = client.get("/metrics/librarian?product=vivy", headers=_h()).json()
+    ref = client.get("/metrics/librarian?product=fennick", headers=_h()).json()
     assert ref["lease_refusals"]["refusals"] == 1
 
 
 def test_librarian_metrics_requires_its_own_capability(client, tmp_path, monkeypatch):
     toks = tmp_path / "narrow.json"
-    toks.write_text(json.dumps({"narrow": {"name": "n", "products": ["vivy"]}}))
+    toks.write_text(json.dumps({"narrow": {"name": "n", "products": ["fennick"]}}))
     monkeypatch.setattr(identity, "TOKENS", toks)
     monkeypatch.setattr(identity, "CLIENT_TOKENS", tmp_path / "no-clients.json")
     monkeypatch.setattr(identity, "ROLE_CAPS", {"agent": frozenset({"course.read"})})
-    r = client.get("/metrics/librarian?product=vivy", headers=_h("narrow"))
+    r = client.get("/metrics/librarian?product=fennick", headers=_h("narrow"))
     assert r.status_code == 403 and "item.read" in r.json()["error"]
 
 
@@ -1054,7 +1054,7 @@ def test_signal_get_refuses_any_parameter(client):
 
 
 def _seed_signal_filters():
-    """Two more vivy signals distinguishing `source` and `kind` from the base
+    """Two more fennick signals distinguishing `source` and `kind` from the base
     fixture's `sig_v1`/`sig_v2`, and disagreeing with each other on
     `produced_at` vs `ingested_at` order — enough to exercise repeatable
     filters and the `order` whitelist without disturbing the two-row fixture
@@ -1063,10 +1063,10 @@ def _seed_signal_filters():
     conn.executemany(
         "INSERT INTO signals (id, product, source, kind, body, privacy_class, "
         "produced_at, ingested_at, embedded_at) VALUES (?,?,?,?,?,?,?,?,?)",
-        [("sig_ci", "vivy", "ci", "build", "a ci row", "internal",
+        [("sig_ci", "fennick", "ci", "build", "a ci row", "internal",
           "2026-08-03 00:00:00.000000", "2026-08-01 08:00:00.000000",
           "2026-08-01 08:05:00.000000"),
-         ("sig_slack", "vivy", "slack", "chat", "a slack row", "internal",
+         ("sig_slack", "fennick", "slack", "chat", "a slack row", "internal",
           None, "2026-08-01 09:00:00.000000", None)])
     conn.commit()
     conn.close()
@@ -1092,7 +1092,7 @@ def test_signals_source_filter_is_repeatable(client):
 
 
 def _seed_signal_streams():
-    """Three vivy signals on two distinct `stream` values, plus one
+    """Three fennick signals on two distinct `stream` values, plus one
     customer-class row sharing a stream with a visible one — enough to
     exercise a repeatable `stream` filter and the customer wall holding
     through it, without disturbing the base fixture's `sig_v1`/`sig_v2`."""
@@ -1100,11 +1100,11 @@ def _seed_signal_streams():
     conn.executemany(
         "INSERT INTO signals (id, product, source, kind, stream, body, "
         "privacy_class, ingested_at) VALUES (?,?,?,?,?,?,?,?)",
-        [("sig_audit1", "vivy", "co", "note", "kb-audit", "an audit row",
+        [("sig_audit1", "fennick", "co", "note", "kb-audit", "an audit row",
           "internal", "2026-08-01 08:00:00.000000"),
-         ("sig_release", "vivy", "co", "note", "release-notes",
+         ("sig_release", "fennick", "co", "note", "release-notes",
           "a release row", "internal", "2026-08-01 09:00:00.000000"),
-         ("sig_audit_cust", "vivy", "co", "note", "kb-audit",
+         ("sig_audit_cust", "fennick", "co", "note", "kb-audit",
           "a customer audit row", "customer", "2026-08-01 10:00:00.000000")])
     conn.commit()
     conn.close()
@@ -1157,15 +1157,15 @@ def _seed_changelog():
     conn.executemany(
         "INSERT INTO signals (id, product, source, kind, body, privacy_class, "
         "produced_at, ingested_at) VALUES (?,?,?,?,?,?,?,?)",
-        [("sig_old", "vivy", "github", "changelog", "an old merge", "internal",
+        [("sig_old", "fennick", "github", "changelog", "an old merge", "internal",
           "2026-10-11 12:59:59", "2026-10-11 13:00:05.000000"),
-         ("sig_edge", "vivy", "github", "changelog", "a merge on the bound",
+         ("sig_edge", "fennick", "github", "changelog", "a merge on the bound",
           "internal", "2026-10-11 13:00:00", "2026-10-11 13:00:06.000000"),
-         ("sig_new", "vivy", "github", "changelog", "a new merge", "internal",
+         ("sig_new", "fennick", "github", "changelog", "a new merge", "internal",
           "2026-10-11 13:00:00.250000", "2026-10-11 13:00:07.000000"),
-         ("sig_entry", "vivy", "co", "changelog", "an entry", "internal",
+         ("sig_entry", "fennick", "co", "changelog", "an entry", "internal",
           "2026-10-12 09:00:00", "2026-10-12 09:00:01.000000"),
-         ("sig_undated", "vivy", "github", "changelog", "no produced_at",
+         ("sig_undated", "fennick", "github", "changelog", "no produced_at",
           "internal", None, "2026-10-12 10:00:00.000000")])
     conn.commit()
     conn.close()
@@ -1274,7 +1274,7 @@ def test_signals_order_rejects_an_unknown_value_rather_than_falling_back(client)
 
 
 def _seed_proposals():
-    """Three vivy proposals and the decisions that settle two of them.
+    """Three fennick proposals and the decisions that settle two of them.
 
     `prop_open` is settled by nothing. `prop_decided` is settled by a decision
     recording it at `refs.proposal`. `prop_other_key` is settled by one
@@ -1285,16 +1285,16 @@ def _seed_proposals():
     conn.executemany(
         "INSERT INTO signals (id, product, source, kind, body, privacy_class, "
         "refs, ingested_at) VALUES (?,?,?,?,?,?,?,?)",
-        [("prop_open", "vivy", "co", "proposal", "still live", "internal",
+        [("prop_open", "fennick", "co", "proposal", "still live", "internal",
           None, "2026-08-02 01:00:00.000000"),
-         ("prop_decided", "vivy", "co", "proposal", "approved", "internal",
+         ("prop_decided", "fennick", "co", "proposal", "approved", "internal",
           None, "2026-08-02 02:00:00.000000"),
-         ("prop_other_key", "vivy", "co", "proposal", "declined", "internal",
+         ("prop_other_key", "fennick", "co", "proposal", "declined", "internal",
           None, "2026-08-02 03:00:00.000000"),
-         ("dec_1", "vivy", "co", "proposal_decision", "approve", "internal",
+         ("dec_1", "fennick", "co", "proposal_decision", "approve", "internal",
           '{"proposal": "prop_decided", "item": "issue_x"}',
           "2026-08-02 04:00:00.000000"),
-         ("dec_2", "vivy", "co", "proposal_decision", "decline", "internal",
+         ("dec_2", "fennick", "co", "proposal_decision", "decline", "internal",
           '{"subject": "prop_other_key"}', "2026-08-02 05:00:00.000000")])
     conn.commit()
     conn.close()
@@ -1342,7 +1342,7 @@ def test_a_malformed_refs_blob_does_not_take_the_listing_down(client):
     conn.execute(
         "INSERT INTO signals (id, product, source, kind, body, privacy_class, "
         "refs, ingested_at) VALUES (?,?,?,?,?,?,?,?)",
-        ("dec_bad", "vivy", "co", "proposal_decision", "junk refs", "internal",
+        ("dec_bad", "fennick", "co", "proposal_decision", "junk refs", "internal",
          "not json at all", "2026-08-02 06:00:00.000000"))
     conn.commit()
     conn.close()
@@ -1362,7 +1362,7 @@ def test_a_decision_with_no_refs_settles_nothing(client):
     conn.execute(
         "INSERT INTO signals (id, product, source, kind, body, privacy_class, "
         "refs, ingested_at) VALUES (?,?,?,?,?,?,?,?)",
-        ("dec_norefs", "vivy", "co", "proposal_decision", "no refs at all",
+        ("dec_norefs", "fennick", "co", "proposal_decision", "no refs at all",
          "internal", None, "2026-08-02 08:00:00.000000"))
     conn.commit()
     conn.close()
@@ -1381,7 +1381,7 @@ def test_a_decision_behind_the_customer_wall_does_not_hide_its_proposal(client):
     conn.execute(
         "INSERT INTO signals (id, product, source, kind, body, privacy_class, "
         "refs, ingested_at) VALUES (?,?,?,?,?,?,?,?)",
-        ("dec_cust", "vivy", "co", "proposal_decision", "customer-class",
+        ("dec_cust", "fennick", "co", "proposal_decision", "customer-class",
          "customer", '{"proposal": "prop_open"}',
          "2026-08-02 07:00:00.000000"))
     conn.commit()
@@ -1443,9 +1443,9 @@ def test_signal_facets_by_kind_reports_each_kind_with_its_true_count(client):
     conn.executemany(
         "INSERT INTO signals (id, product, source, kind, body, privacy_class, "
         "ingested_at) VALUES (?,?,?,?,?,?,?)",
-        [("sig_ci2", "vivy", "ci", "build", "a second build", "internal",
+        [("sig_ci2", "fennick", "ci", "build", "a second build", "internal",
           "2026-08-01 08:30:00.000000"),
-         ("sig_ci3", "vivy", "ci", "build", "a customer build", "customer",
+         ("sig_ci3", "fennick", "ci", "build", "a customer build", "customer",
           "2026-08-01 08:31:00.000000")])
     conn.commit()
     conn.close()
@@ -1483,20 +1483,20 @@ def test_signal_facets_is_scoped_like_the_list_route(client):
     conn.execute(
         "INSERT INTO signals (id, product, kind, body, privacy_class, "
         "ingested_at) VALUES (?,?,?,?,?,?)",
-        ("sig_c1", "constance", "note", "a constance note", "internal",
+        ("sig_c1", "marlow", "note", "a marlow note", "internal",
          "2026-08-01 07:00:00.000000"))
     conn.commit()
     conn.close()
     scoped = client.get("/signals/facets", headers=_h()).json()
-    assert scoped["total"] == 1 and scoped["products"] == ["vivy"]
+    assert scoped["total"] == 1 and scoped["products"] == ["fennick"]
     wide = client.get("/signals/facets", headers=_h(WIDE)).json()
     assert wide["total"] == 2, "sig_v2 stays walled even for a wildcard agent"
-    assert set(wide["products"]) == {"vivy", "constance"}
+    assert set(wide["products"]) == {"fennick", "marlow"}
 
 
 def test_signal_facets_requires_signal_read(client, tmp_path, monkeypatch):
     toks = tmp_path / "narrow.json"
-    toks.write_text(json.dumps({"narrow": {"name": "n", "products": ["vivy"]}}))
+    toks.write_text(json.dumps({"narrow": {"name": "n", "products": ["fennick"]}}))
     monkeypatch.setattr(identity, "TOKENS", toks)
     monkeypatch.setattr(identity, "CLIENT_TOKENS", tmp_path / "no-clients.json")
     monkeypatch.setattr(identity, "ROLE_CAPS", {"agent": frozenset({"item.read"})})
@@ -1526,7 +1526,7 @@ def _seed_repo_signals():
     """`pr_state` rows the way the Keel's producer writes them: `meta.repo` as
     `owner/name`. Two rows for `convivy-deck`, one for `agent-platform`
     (distinguishing a single `repo` from the repeatable form), one under
-    product `constance` for a repo that has no row anywhere in `vivy` (the
+    product `marlow` for a repo that has no row anywhere in `fennick` (the
     cross-scope case), one customer-class `convivy-deck` row (the wall), and
     one row with no `repo` key at all in `meta` (the unfiltered-vs-filtered
     case)."""
@@ -1534,25 +1534,25 @@ def _seed_repo_signals():
     conn.executemany(
         "INSERT INTO signals (id, product, source, kind, body, privacy_class, "
         "meta, ingested_at) VALUES (?,?,?,?,?,?,?,?)",
-        [("sig_deck_1", "vivy", "keel", "pr_state", "deck pr 1", "internal",
+        [("sig_deck_1", "fennick", "keel", "pr_state", "deck pr 1", "internal",
           json.dumps({"repo": "convivy/convivy-deck"}),
           "2026-08-05 01:00:00.000000"),
-         ("sig_deck_2", "vivy", "keel", "pr_state", "deck pr 2", "internal",
+         ("sig_deck_2", "fennick", "keel", "pr_state", "deck pr 2", "internal",
           json.dumps({"repo": "convivy/convivy-deck"}),
           "2026-08-05 02:00:00.000000"),
-         ("sig_agent_platform", "vivy", "keel", "pr_state",
+         ("sig_agent_platform", "fennick", "keel", "pr_state",
           "agent-platform pr", "internal",
           json.dumps({"repo": "convivy/agent-platform"}),
           "2026-08-05 03:00:00.000000"),
-         ("sig_selector_other_product", "constance", "keel", "pr_state",
-          "a selector pr, filed under constance", "internal",
-          json.dumps({"repo": "convivy/selector"}),
+         ("sig_thistle_other_product", "marlow", "keel", "pr_state",
+          "a thistle pr, filed under marlow", "internal",
+          json.dumps({"repo": "convivy/thistle"}),
           "2026-08-05 04:00:00.000000"),
-         ("sig_deck_customer", "vivy", "keel", "pr_state",
+         ("sig_deck_customer", "fennick", "keel", "pr_state",
           "customer-class deck row", "customer",
           json.dumps({"repo": "convivy/convivy-deck"}),
           "2026-08-05 05:00:00.000000"),
-         ("sig_no_repo", "vivy", "keel", "pr_state", "no repo key at all",
+         ("sig_no_repo", "fennick", "keel", "pr_state", "no repo key at all",
           "internal", json.dumps({"pr": 42}),
           "2026-08-05 06:00:00.000000")])
     conn.commit()
@@ -1577,7 +1577,7 @@ def test_repo_filter_is_repeatable(client):
 def test_repo_filter_ands_with_kind_and_product(client):
     _seed_repo_signals()
     ids = {s["id"] for s in client.get(
-        "/signals?kind=pr_state&product=vivy&repo=convivy/convivy-deck",
+        "/signals?kind=pr_state&product=fennick&repo=convivy/convivy-deck",
         headers=_h(WIDE)).json()["signals"]}
     assert ids == {"sig_deck_1", "sig_deck_2"}
 
@@ -1590,11 +1590,11 @@ def test_repo_filter_unknown_repo_is_an_empty_list_not_an_error(client):
 
 
 def test_repo_filter_cannot_reach_across_scope(client):
-    """`sig_selector_other_product` matches the repo but lives under
-    `constance`; an identity scoped to `vivy` must get nothing, not the
+    """`sig_thistle_other_product` matches the repo but lives under
+    `marlow`; an identity scoped to `fennick` must get nothing, not the
     out-of-scope row."""
     _seed_repo_signals()
-    body = client.get("/signals?repo=convivy/selector", headers=_h()).json()
+    body = client.get("/signals?repo=convivy/thistle", headers=_h()).json()
     assert body["signals"] == [] and body["total"] == 0
 
 
@@ -1631,7 +1631,7 @@ def test_facets_honours_repo_the_same_way_the_listing_does(client):
 
 
 def _pr_meta(**overrides):
-    meta = {"repo": "convivy/vivy", "number": 1, "title": "a pr",
+    meta = {"repo": "convivy/fennick", "number": 1, "title": "a pr",
             "author": "someone", "draft": False, "head_sha": "sha-default",
             "state": "OPEN"}
     meta.update(overrides)
@@ -1650,7 +1650,7 @@ def _insert_pr_state(conn, id_, product, meta, *, privacy_class="internal",
 
 def test_pr_state_returns_an_open_pr(client):
     conn = _conn()
-    _insert_pr_state(conn, "sig_open1", "vivy", _pr_meta(number=1),
+    _insert_pr_state(conn, "sig_open1", "fennick", _pr_meta(number=1),
                      ingested_at=_window_safe_ts(0))
     conn.commit()
     conn.close()
@@ -1661,7 +1661,7 @@ def test_pr_state_returns_an_open_pr(client):
 
 def test_pr_state_returns_a_closed_pr_inside_the_window(client):
     conn = _conn()
-    _insert_pr_state(conn, "sig_closed1", "vivy",
+    _insert_pr_state(conn, "sig_closed1", "fennick",
                      _pr_meta(number=2, state="CLOSED"),
                      ingested_at=_window_safe_ts(5))
     conn.commit()
@@ -1672,7 +1672,7 @@ def test_pr_state_returns_a_closed_pr_inside_the_window(client):
 
 def test_pr_state_excludes_a_closed_pr_outside_the_window(client):
     conn = _conn()
-    _insert_pr_state(conn, "sig_closed_old", "vivy",
+    _insert_pr_state(conn, "sig_closed_old", "fennick",
                      _pr_meta(number=3, state="CLOSED"),
                      ingested_at=_window_safe_ts(30))
     conn.commit()
@@ -1709,7 +1709,7 @@ def test_pr_state_closed_within_days_moves_the_window(client):
     """A PR closed 10 days ago appears under the 14-day default, drops out of a
     7-day window, and appears again under 30 days."""
     conn = _conn()
-    _insert_pr_state(conn, "sig_closed10", "vivy",
+    _insert_pr_state(conn, "sig_closed10", "fennick",
                      _pr_meta(number=7, state="CLOSED"),
                      ingested_at=_window_safe_ts(10))
     conn.commit()
@@ -1723,10 +1723,10 @@ def test_pr_state_closed_within_days_moves_the_window(client):
 
 def test_pr_state_two_rows_returns_only_the_newer(client):
     conn = _conn()
-    _insert_pr_state(conn, "sig_old_row", "vivy",
+    _insert_pr_state(conn, "sig_old_row", "fennick",
                      _pr_meta(number=4, head_sha="sha-old"),
                      ingested_at=_window_safe_ts(2))
-    _insert_pr_state(conn, "sig_new_row", "vivy",
+    _insert_pr_state(conn, "sig_new_row", "fennick",
                      _pr_meta(number=4, head_sha="sha-new"),
                      ingested_at=_window_safe_ts(0))
     conn.commit()
@@ -1743,9 +1743,9 @@ def test_pr_state_tie_on_ingested_at_higher_id_wins(client):
     `sig_tie_a`, so this fails if the tie-break is ever flipped to `id ASC`."""
     conn = _conn()
     ts = _window_safe_ts(0)
-    _insert_pr_state(conn, "sig_tie_a", "vivy",
+    _insert_pr_state(conn, "sig_tie_a", "fennick",
                      _pr_meta(number=5, head_sha="sha-a"), ingested_at=ts)
-    _insert_pr_state(conn, "sig_tie_b", "vivy",
+    _insert_pr_state(conn, "sig_tie_b", "fennick",
                      _pr_meta(number=5, head_sha="sha-b"), ingested_at=ts)
     conn.commit()
     conn.close()
@@ -1760,10 +1760,10 @@ def test_pr_state_produced_at_set_ranks_before_null(client):
     `produced_at`. The set one must win — `produced_at` outranks
     `ingested_at` whatever the two say about each other."""
     conn = _conn()
-    _insert_pr_state(conn, "sig_no_produced", "vivy",
+    _insert_pr_state(conn, "sig_no_produced", "fennick",
                      _pr_meta(number=6, head_sha="sha-null"),
                      ingested_at=_window_safe_ts(0))
-    _insert_pr_state(conn, "sig_has_produced", "vivy",
+    _insert_pr_state(conn, "sig_has_produced", "fennick",
                      _pr_meta(number=6, head_sha="sha-set"),
                      produced_at=_window_safe_ts(3),
                      ingested_at=_window_safe_ts(3))
@@ -1776,29 +1776,29 @@ def test_pr_state_produced_at_set_ranks_before_null(client):
 
 def test_pr_state_repo_filter_narrows_and_is_repeatable(client):
     conn = _conn()
-    _insert_pr_state(conn, "sig_repo_a", "vivy",
-                     _pr_meta(repo="convivy/vivy", number=10),
+    _insert_pr_state(conn, "sig_repo_a", "fennick",
+                     _pr_meta(repo="convivy/fennick", number=10),
                      ingested_at=_window_safe_ts(0))
-    _insert_pr_state(conn, "sig_repo_b", "vivy",
+    _insert_pr_state(conn, "sig_repo_b", "fennick",
                      _pr_meta(repo="convivy/convivy-deck", number=11),
                      ingested_at=_window_safe_ts(0))
-    _insert_pr_state(conn, "sig_repo_c", "vivy",
-                     _pr_meta(repo="convivy/selector", number=12),
+    _insert_pr_state(conn, "sig_repo_c", "fennick",
+                     _pr_meta(repo="convivy/thistle", number=12),
                      ingested_at=_window_safe_ts(0))
     conn.commit()
     conn.close()
     one = {p["id"] for p in client.get(
-        "/signals/pr-state?repo=convivy/vivy", headers=_h()).json()["prs"]}
+        "/signals/pr-state?repo=convivy/fennick", headers=_h()).json()["prs"]}
     assert one == {"sig_repo_a"}
     two = {p["id"] for p in client.get(
-        "/signals/pr-state?repo=convivy/vivy&repo=convivy/convivy-deck",
+        "/signals/pr-state?repo=convivy/fennick&repo=convivy/convivy-deck",
         headers=_h()).json()["prs"]}
     assert two == {"sig_repo_a", "sig_repo_b"}
 
 
 def test_pr_state_scoped_caller_sees_nothing_from_another_product(client):
     conn = _conn()
-    _insert_pr_state(conn, "sig_constance_pr", "constance",
+    _insert_pr_state(conn, "sig_marlow_pr", "marlow",
                      _pr_meta(number=20), ingested_at=_window_safe_ts(0))
     conn.commit()
     conn.close()
@@ -1807,15 +1807,15 @@ def test_pr_state_scoped_caller_sees_nothing_from_another_product(client):
 
 
 def test_pr_state_drops_pr_when_newest_row_is_out_of_scope(client):
-    """`sig_scope_new`, the true latest row for PR 30, sits under `constance`
-    — outside this AGENT token's `vivy`-only scope. The caller must not fall
+    """`sig_scope_new`, the true latest row for PR 30, sits under `marlow`
+    — outside this AGENT token's `fennick`-only scope. The caller must not fall
     back to `sig_scope_old` and report it as latest; the whole PR must be
     absent."""
     conn = _conn()
-    _insert_pr_state(conn, "sig_scope_old", "vivy",
+    _insert_pr_state(conn, "sig_scope_old", "fennick",
                      _pr_meta(number=30, head_sha="sha-old-inscope"),
                      ingested_at=_window_safe_ts(2))
-    _insert_pr_state(conn, "sig_scope_new", "constance",
+    _insert_pr_state(conn, "sig_scope_new", "marlow",
                      _pr_meta(number=30, head_sha="sha-new-outscope"),
                      ingested_at=_window_safe_ts(0))
     conn.commit()
@@ -1826,7 +1826,7 @@ def test_pr_state_drops_pr_when_newest_row_is_out_of_scope(client):
 
 def test_pr_state_customer_class_row_stays_walled(client):
     conn = _conn()
-    _insert_pr_state(conn, "sig_customer_pr", "vivy", _pr_meta(number=40),
+    _insert_pr_state(conn, "sig_customer_pr", "fennick", _pr_meta(number=40),
                      privacy_class="customer", ingested_at=_window_safe_ts(0))
     conn.commit()
     conn.close()
@@ -1855,7 +1855,7 @@ def test_pr_state_path_does_not_resolve_as_a_signal_id(client):
 def test_pr_state_pagination_totals(client):
     conn = _conn()
     for i in range(3):
-        _insert_pr_state(conn, f"sig_page_{i}", "vivy",
+        _insert_pr_state(conn, f"sig_page_{i}", "fennick",
                          _pr_meta(number=50 + i), ingested_at=_window_safe_ts(0))
     conn.commit()
     conn.close()
@@ -1873,7 +1873,7 @@ def test_pr_state_pagination_totals(client):
 
 def _insert_test_result(conn, id_, product, *, commit, conclusion,
                         workflow="ci",
-                        run_url="https://github.com/convivy/vivy/actions/runs/1",
+                        run_url="https://github.com/convivy/fennick/actions/runs/1",
                         privacy_class="internal", produced_at=None,
                         ingested_at):
     conn.execute(
@@ -1889,33 +1889,33 @@ def _insert_test_result(conn, id_, product, *, commit, conclusion,
 
 def test_pr_state_joins_the_ci_conclusion_for_its_head_sha(client):
     conn = _conn()
-    _insert_pr_state(conn, "sig_ci_pr", "vivy",
+    _insert_pr_state(conn, "sig_ci_pr", "fennick",
                      _pr_meta(number=60, head_sha="sha-ci-1"),
                      ingested_at=_window_safe_ts(0))
-    _insert_test_result(conn, "sig_ci_result_1", "vivy", commit="sha-ci-1",
+    _insert_test_result(conn, "sig_ci_result_1", "fennick", commit="sha-ci-1",
                         conclusion="success", workflow="e2e",
-                        run_url="https://github.com/convivy/vivy/actions/runs/2",
+                        run_url="https://github.com/convivy/fennick/actions/runs/2",
                         ingested_at=_window_safe_ts(0))
     conn.commit()
     conn.close()
     pr = client.get("/signals/pr-state", headers=_h()).json()["prs"][0]
     assert pr["ci_conclusion"] == "success"
     assert pr["ci_workflow"] == "e2e"
-    assert pr["ci_run_url"] == "https://github.com/convivy/vivy/actions/runs/2"
+    assert pr["ci_run_url"] == "https://github.com/convivy/fennick/actions/runs/2"
     assert pr["ci_captured"] is True
 
 
 def test_pr_state_distinguishes_two_prs_with_different_ci_runs(client):
     conn = _conn()
-    _insert_pr_state(conn, "sig_ci_pr_a", "vivy",
+    _insert_pr_state(conn, "sig_ci_pr_a", "fennick",
                      _pr_meta(number=61, head_sha="sha-ci-a"),
                      ingested_at=_window_safe_ts(0))
-    _insert_pr_state(conn, "sig_ci_pr_b", "vivy",
+    _insert_pr_state(conn, "sig_ci_pr_b", "fennick",
                      _pr_meta(number=62, head_sha="sha-ci-b"),
                      ingested_at=_window_safe_ts(0))
-    _insert_test_result(conn, "sig_ci_a", "vivy", commit="sha-ci-a",
+    _insert_test_result(conn, "sig_ci_a", "fennick", commit="sha-ci-a",
                         conclusion="success", ingested_at=_window_safe_ts(0))
-    _insert_test_result(conn, "sig_ci_b", "vivy", commit="sha-ci-b",
+    _insert_test_result(conn, "sig_ci_b", "fennick", commit="sha-ci-b",
                         conclusion="failure", ingested_at=_window_safe_ts(0))
     conn.commit()
     conn.close()
@@ -1930,10 +1930,10 @@ def test_pr_state_no_matching_ci_row_is_explicit_absence_when_captured(client):
     Deck's "checks have not run for this commit", not "this repo is not
     captured"."""
     conn = _conn()
-    _insert_pr_state(conn, "sig_ci_no_match", "vivy",
+    _insert_pr_state(conn, "sig_ci_no_match", "fennick",
                      _pr_meta(number=63, head_sha="sha-ci-nomatch"),
                      ingested_at=_window_safe_ts(0))
-    _insert_test_result(conn, "sig_ci_other_commit", "vivy",
+    _insert_test_result(conn, "sig_ci_other_commit", "fennick",
                         commit="sha-ci-elsewhere", conclusion="success",
                         ingested_at=_window_safe_ts(0))
     conn.commit()
@@ -1950,7 +1950,7 @@ def test_pr_state_distinguishes_not_captured_from_no_result(client):
     Library captures no CI for it at all, the `unavailable` state Deck's
     cockpit already assumes for every PR today."""
     conn = _conn()
-    _insert_pr_state(conn, "sig_ci_uncaptured", "vivy",
+    _insert_pr_state(conn, "sig_ci_uncaptured", "fennick",
                      _pr_meta(number=64, head_sha="sha-ci-uncaptured"),
                      ingested_at=_window_safe_ts(0))
     conn.commit()
@@ -1958,17 +1958,20 @@ def test_pr_state_distinguishes_not_captured_from_no_result(client):
     pr = client.get("/signals/pr-state", headers=_h()).json()["prs"][0]
     assert pr["ci_conclusion"] is None
     assert pr["ci_captured"] is False
+    assert pr["ci_last_captured_at"] is None
+    assert pr["ci_capture_stale"] is False, (
+        "an uncaptured repo reads 'unavailable', never 'stale'")
 
 
 def test_pr_state_ci_newest_result_wins_on_a_rerun(client):
     conn = _conn()
-    _insert_pr_state(conn, "sig_ci_rerun_pr", "vivy",
+    _insert_pr_state(conn, "sig_ci_rerun_pr", "fennick",
                      _pr_meta(number=65, head_sha="sha-ci-rerun"),
                      ingested_at=_window_safe_ts(0))
-    _insert_test_result(conn, "sig_ci_rerun_old", "vivy",
+    _insert_test_result(conn, "sig_ci_rerun_old", "fennick",
                         commit="sha-ci-rerun", conclusion="failure",
                         ingested_at=_window_safe_ts(2))
-    _insert_test_result(conn, "sig_ci_rerun_new", "vivy",
+    _insert_test_result(conn, "sig_ci_rerun_new", "fennick",
                         commit="sha-ci-rerun", conclusion="success",
                         ingested_at=_window_safe_ts(0))
     conn.commit()
@@ -1983,12 +1986,12 @@ def test_pr_state_ci_tie_on_ingested_at_higher_id_wins(client):
     `pr_state` itself, here for the CI join's own ranking."""
     conn = _conn()
     ts = _window_safe_ts(0)
-    _insert_pr_state(conn, "sig_ci_tie_pr", "vivy",
+    _insert_pr_state(conn, "sig_ci_tie_pr", "fennick",
                      _pr_meta(number=66, head_sha="sha-ci-tie"),
                      ingested_at=ts)
-    _insert_test_result(conn, "sig_ci_tie_a", "vivy", commit="sha-ci-tie",
+    _insert_test_result(conn, "sig_ci_tie_a", "fennick", commit="sha-ci-tie",
                         conclusion="failure", ingested_at=ts)
-    _insert_test_result(conn, "sig_ci_tie_b", "vivy", commit="sha-ci-tie",
+    _insert_test_result(conn, "sig_ci_tie_b", "fennick", commit="sha-ci-tie",
                         conclusion="success", ingested_at=ts)
     conn.commit()
     conn.close()
@@ -2002,10 +2005,10 @@ def test_pr_state_ci_from_another_product_is_not_joined(client):
     product outside this caller's scope, must not be joined — the caller
     sees the explicit absence, not a cross-scope conclusion."""
     conn = _conn()
-    _insert_pr_state(conn, "sig_ci_scoped_pr", "vivy",
+    _insert_pr_state(conn, "sig_ci_scoped_pr", "fennick",
                      _pr_meta(number=67, head_sha="sha-ci-outscope"),
                      ingested_at=_window_safe_ts(0))
-    _insert_test_result(conn, "sig_ci_outscope", "constance",
+    _insert_test_result(conn, "sig_ci_outscope", "marlow",
                         commit="sha-ci-outscope", conclusion="success",
                         ingested_at=_window_safe_ts(0))
     conn.commit()
@@ -2013,31 +2016,31 @@ def test_pr_state_ci_from_another_product_is_not_joined(client):
     pr = client.get("/signals/pr-state", headers=_h()).json()["prs"][0]
     assert pr["ci_conclusion"] is None
     assert pr["ci_captured"] is False, (
-        "the constance row must not count as this vivy-scoped caller's own "
+        "the marlow row must not count as this fennick-scoped caller's own "
         "product being captured either")
 
 
 def test_pr_state_ci_captured_is_keyed_on_repo_not_product(client):
-    """`vivy` covers two repos (`convivy/vivy` and
-    `convivy/vivy-ownerrez-sandbox-tools`, per `ci_tracked.py`'s
-    `TRACKED`), and only `convivy/vivy` has ever had a `test-result` row.
+    """`fennick` covers two repos (`convivy/fennick` and
+    `convivy/fennick-ownerrez-sandbox-tools`, per `ci_tracked.py`'s
+    `tracked()`), and only `convivy/fennick` has ever had a `test-result` row.
     The sandbox repo's PR must read `ci_captured: false` — a captured
     sibling under the same product must not leak into it — while the
-    `convivy/vivy` PR reads `ci_captured: true` even though the one
+    `convivy/fennick` PR reads `ci_captured: true` even though the one
     captured row is for a different commit."""
     conn = _conn()
-    _insert_pr_state(conn, "sig_ci_captured_repo", "vivy",
-                     _pr_meta(repo="convivy/vivy", number=70,
+    _insert_pr_state(conn, "sig_ci_captured_repo", "fennick",
+                     _pr_meta(repo="convivy/fennick", number=70,
                               head_sha="sha-ci-captured-repo"),
                      ingested_at=_window_safe_ts(0))
-    _insert_pr_state(conn, "sig_ci_uncaptured_repo", "vivy",
-                     _pr_meta(repo="convivy/vivy-ownerrez-sandbox-tools",
+    _insert_pr_state(conn, "sig_ci_uncaptured_repo", "fennick",
+                     _pr_meta(repo="convivy/fennick-ownerrez-sandbox-tools",
                               number=71, head_sha="sha-ci-uncaptured-repo"),
                      ingested_at=_window_safe_ts(0))
     _insert_test_result(
-        conn, "sig_ci_captured_repo_row", "vivy",
+        conn, "sig_ci_captured_repo_row", "fennick",
         commit="sha-ci-captured-repo-elsewhere", conclusion="success",
-        run_url="https://github.com/convivy/vivy/actions/runs/42",
+        run_url="https://github.com/convivy/fennick/actions/runs/42",
         ingested_at=_window_safe_ts(0))
     conn.commit()
     conn.close()
@@ -2046,8 +2049,8 @@ def test_pr_state_ci_captured_is_keyed_on_repo_not_product(client):
     assert by_number[70]["ci_conclusion"] is None
     assert by_number[70]["ci_captured"] is True
     assert by_number[71]["ci_captured"] is False, (
-        "convivy/vivy-ownerrez-sandbox-tools shares vivy's product with "
-        "convivy/vivy but has no test-result row of its own")
+        "convivy/fennick-ownerrez-sandbox-tools shares fennick's product with "
+        "convivy/fennick but has no test-result row of its own")
 
 
 def test_pr_state_ci_captured_ignores_an_unparseable_run_url(client):
@@ -2056,11 +2059,11 @@ def test_pr_state_ci_captured_ignores_an_unparseable_run_url(client):
     docstring — it must not make any `(product, repo)` pair read as
     captured."""
     conn = _conn()
-    _insert_pr_state(conn, "sig_ci_malformed_pr", "vivy",
-                     _pr_meta(repo="convivy/vivy", number=72,
+    _insert_pr_state(conn, "sig_ci_malformed_pr", "fennick",
+                     _pr_meta(repo="convivy/fennick", number=72,
                               head_sha="sha-ci-malformed"),
                      ingested_at=_window_safe_ts(0))
-    _insert_test_result(conn, "sig_ci_malformed_row", "vivy",
+    _insert_test_result(conn, "sig_ci_malformed_row", "fennick",
                         commit="sha-ci-malformed-elsewhere",
                         conclusion="success", run_url="not-a-github-url",
                         ingested_at=_window_safe_ts(0))
@@ -2076,14 +2079,14 @@ def test_pr_state_ci_customer_class_row_stays_walled(client):
     not populate `ci_conclusion`/`ci_workflow`/`ci_run_url`, and must not
     count toward `ci_captured`, for a caller lacking `signal.customer`."""
     conn = _conn()
-    _insert_pr_state(conn, "sig_ci_wall_pr", "vivy",
-                     _pr_meta(repo="convivy/vivy", number=73,
+    _insert_pr_state(conn, "sig_ci_wall_pr", "fennick",
+                     _pr_meta(repo="convivy/fennick", number=73,
                               head_sha="sha-ci-wall"),
                      ingested_at=_window_safe_ts(0))
     _insert_test_result(
-        conn, "sig_ci_wall_result", "vivy", commit="sha-ci-wall",
+        conn, "sig_ci_wall_result", "fennick", commit="sha-ci-wall",
         conclusion="success", privacy_class="customer",
-        run_url="https://github.com/convivy/vivy/actions/runs/7",
+        run_url="https://github.com/convivy/fennick/actions/runs/7",
         ingested_at=_window_safe_ts(0))
     conn.commit()
     conn.close()
@@ -2098,6 +2101,436 @@ def test_pr_state_ci_customer_class_row_stays_walled(client):
     assert privileged["ci_captured"] is True
 
 
+# --- pr-state latest: ci_capture_stale, issue_01M5T2QH3ZNYW185GG9HXBK2EY -------
+
+
+def test_pr_state_ci_capture_stale_true_when_head_is_newer_than_last_capture(client):
+    """Capture has written nothing for this repo since the PR's current head
+    appeared — the live state on 2026-10-25, with ci-result-capture stopped
+    since 2026-10-22. Must read `unknown`, not Deck's `checks have not run`."""
+    conn = _conn()
+    _insert_pr_state(conn, "sig_stale_pr", "fennick",
+                     _pr_meta(number=80, head_sha="sha-stale-1"),
+                     ingested_at=_window_safe_ts(0))
+    captured_at = _window_safe_ts(5)
+    _insert_test_result(conn, "sig_stale_old_result", "fennick",
+                        commit="sha-stale-elsewhere", conclusion="success",
+                        ingested_at=captured_at)
+    conn.commit()
+    conn.close()
+    pr = client.get("/signals/pr-state", headers=_h()).json()["prs"][0]
+    assert pr["ci_conclusion"] is None
+    assert pr["ci_captured"] is True
+    assert pr["ci_last_captured_at"] == store._iso(captured_at)
+    assert pr["ci_capture_stale"] is True
+
+
+def test_pr_state_ci_capture_stale_false_when_capture_ran_after_the_head_appeared(
+        client):
+    """The repo's capture is simply behind this one commit, not stopped: a
+    newer `test-result` row exists for a different commit, captured after
+    this head appeared. Reads `ci_captured: true` and `ci_capture_stale:
+    false` — Deck's plain "checks have not run"."""
+    conn = _conn()
+    _insert_pr_state(conn, "sig_notstale_pr", "fennick",
+                     _pr_meta(number=81, head_sha="sha-notstale-1"),
+                     ingested_at=_window_safe_ts(5))
+    _insert_test_result(conn, "sig_notstale_result", "fennick",
+                        commit="sha-notstale-elsewhere", conclusion="success",
+                        ingested_at=_window_safe_ts(0))
+    conn.commit()
+    conn.close()
+    pr = client.get("/signals/pr-state", headers=_h()).json()["prs"][0]
+    assert pr["ci_conclusion"] is None
+    assert pr["ci_captured"] is True
+    assert pr["ci_capture_stale"] is False
+
+
+def test_pr_state_ci_capture_stale_false_when_result_exists_at_head(client):
+    """A result for this exact commit, even one captured before the head's
+    first sighting (which would otherwise look stale by timestamp alone),
+    forces `ci_capture_stale` false — a present `ci_conclusion` is never
+    `unknown`."""
+    conn = _conn()
+    _insert_pr_state(conn, "sig_atresult_pr", "fennick",
+                     _pr_meta(number=82, head_sha="sha-atresult-1"),
+                     ingested_at=_window_safe_ts(0))
+    _insert_test_result(conn, "sig_atresult_result", "fennick",
+                        commit="sha-atresult-1", conclusion="success",
+                        ingested_at=_window_safe_ts(5))
+    conn.commit()
+    conn.close()
+    pr = client.get("/signals/pr-state", headers=_h()).json()["prs"][0]
+    assert pr["ci_conclusion"] == "success"
+    assert pr["ci_capture_stale"] is False
+
+
+def test_pr_state_ci_capture_stale_customer_row_does_not_freshen_for_a_walled_caller(
+        client):
+    """A customer-class `test-result` row captured after the head appeared
+    must not freshen a walled caller's view: that caller cannot see it, so
+    its own in-scope capture — older than the head — is all it has, and the
+    PR must still read stale. A caller with `signal.customer` sees the
+    fresher row and reads not stale."""
+    # Each timestamp is read from the clock once and reused in its assertion:
+    # calling `_window_safe_ts` again at assert time failed this test when a
+    # second ticked between the two reads (library#346's CI, 2026-11-02).
+    old_ts = _window_safe_ts(5)
+    new_ts = _window_safe_ts(0)
+    conn = _conn()
+    _insert_pr_state(conn, "sig_wallstale_pr", "fennick",
+                     _pr_meta(number=83, head_sha="sha-wallstale-1"),
+                     ingested_at=_window_safe_ts(3))
+    _insert_test_result(conn, "sig_wallstale_old", "fennick",
+                        commit="sha-wallstale-elsewhere-1",
+                        conclusion="success", ingested_at=old_ts)
+    _insert_test_result(conn, "sig_wallstale_new", "fennick",
+                        commit="sha-wallstale-elsewhere-2",
+                        conclusion="success", privacy_class="customer",
+                        ingested_at=new_ts)
+    conn.commit()
+    conn.close()
+    plain = client.get("/signals/pr-state", headers=_h()).json()["prs"][0]
+    assert plain["ci_captured"] is True
+    assert plain["ci_last_captured_at"] == store._iso(old_ts)
+    assert plain["ci_capture_stale"] is True
+    privileged = client.get(
+        "/signals/pr-state", headers=_h(SYSTEM)).json()["prs"][0]
+    assert privileged["ci_last_captured_at"] == store._iso(new_ts)
+    assert privileged["ci_capture_stale"] is False
+
+
+def test_pr_state_ci_capture_stale_scope_clause_bounds_the_earliest_sighting(
+        client):
+    """A `pr_state` row recording this same head sha, filed under a product
+    outside the caller's scope, must not count as an earlier sighting of
+    that head than the caller's own in-scope row. Dropping `{scope}` from
+    `head_first_seen`'s query would let the out-of-scope row at day 10 push
+    the "first seen" timestamp earlier than the day-5 capture, reading not
+    stale; applied correctly, the in-scope row at day 3 is the first
+    sighting this caller can prove, which the day-5 capture predates."""
+    conn = _conn()
+    _insert_pr_state(conn, "sig_scope_current", "fennick",
+                     _pr_meta(number=84, head_sha="sha-scope-current"),
+                     ingested_at=_window_safe_ts(3))
+    _insert_pr_state(conn, "sig_scope_outofscope", "marlow",
+                     _pr_meta(number=84, head_sha="sha-scope-current"),
+                     ingested_at=_window_safe_ts(10))
+    _insert_test_result(conn, "sig_scope_result", "fennick",
+                        commit="sha-scope-elsewhere", conclusion="success",
+                        ingested_at=_window_safe_ts(5))
+    conn.commit()
+    conn.close()
+    pr = client.get("/signals/pr-state", headers=_h()).json()["prs"][0]
+    assert pr["ci_conclusion"] is None
+    assert pr["ci_captured"] is True
+    assert pr["ci_capture_stale"] is True, (
+        "the out-of-scope row at day 10 must not read as this head's first "
+        "sighting")
+
+
+# --- pr-state latest: the four CQ·253 fields (mergeable, review_decision, ----
+# created_at, merged_at) -----------------------------------------------------
+
+
+def test_pr_state_serves_the_four_cq253_fields_from_meta(client):
+    conn = _conn()
+    _insert_pr_state(conn, "sig_cq253_full", "fennick",
+                     _pr_meta(number=90, mergeable="MERGEABLE",
+                              review_decision="APPROVED",
+                              created_at="2026-10-01T12:00:00Z",
+                              merged_at="2026-10-02T08:00:00Z"),
+                     ingested_at=_window_safe_ts(0))
+    conn.commit()
+    conn.close()
+    pr = client.get("/signals/pr-state", headers=_h()).json()["prs"][0]
+    assert pr["mergeable"] == "MERGEABLE"
+    assert pr["review_decision"] == "APPROVED"
+    assert pr["created_at"] == "2026-10-01T12:00:00Z"
+    assert pr["merged_at"] == "2026-10-02T08:00:00Z"
+
+
+def test_pr_state_pre_capture_row_serves_the_four_cq253_fields_as_null(client):
+    """A row captured before agent-platform#1112 has none of these keys in
+    `meta` at all — `_pr_meta`'s defaults omit every one of them — and the
+    route must answer `null` for each rather than a missing key."""
+    conn = _conn()
+    _insert_pr_state(conn, "sig_cq253_old", "fennick", _pr_meta(number=91),
+                     ingested_at=_window_safe_ts(0))
+    conn.commit()
+    conn.close()
+    pr = client.get("/signals/pr-state", headers=_h()).json()["prs"][0]
+    assert pr["mergeable"] is None
+    assert pr["review_decision"] is None
+    assert pr["created_at"] is None
+    assert pr["merged_at"] is None
+
+
+# --- ci-workflow-runs: the latest N `ci_workflow_run` rows per repo --------
+
+
+def _cwr_meta(**overrides):
+    meta = {"repo": "convivy/fennick", "run_id": 1, "branch": "main",
+            "head_sha": "sha-default", "event": "push", "status": "completed",
+            "conclusion": "success", "created_at": "2026-10-01T00:00:00Z",
+            "updated_at": "2026-10-01T00:05:00Z"}
+    meta.update(overrides)
+    return meta
+
+
+def _insert_ci_workflow_run(conn, id_, product, meta, *, privacy_class="internal",
+                            produced_at=None, ingested_at):
+    conn.execute(
+        "INSERT INTO signals (id, product, source, kind, body, "
+        "privacy_class, meta, produced_at, ingested_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        (id_, product, "keel", "ci_workflow_run", "a ci_workflow_run row",
+         privacy_class, json.dumps(meta), produced_at, ingested_at))
+
+
+def test_ci_workflow_runs_returns_the_newest_count_per_repo(client):
+    conn = _conn()
+    for i in range(5):
+        _insert_ci_workflow_run(
+            conn, f"sig_cwr_{i}", "fennick",
+            _cwr_meta(run_id=i, created_at=f"2026-10-0{i + 1}T00:00:00Z"),
+            ingested_at=_window_safe_ts(0))
+    conn.commit()
+    conn.close()
+    body = client.get("/signals/ci-workflow-runs?count=2", headers=_h()).json()
+    run_ids = [r["run_id"] for r in body["runs"]]
+    assert run_ids == [4, 3], "newest two by meta.created_at, newest first"
+
+
+def test_ci_workflow_runs_defaults_to_twenty(client):
+    conn = _conn()
+    for i in range(25):
+        _insert_ci_workflow_run(
+            conn, f"sig_cwr_default_{i}", "fennick",
+            _cwr_meta(run_id=i, created_at=f"2026-09-{i + 1:02d}T00:00:00Z"),
+            ingested_at=_window_safe_ts(0))
+    conn.commit()
+    conn.close()
+    body = client.get("/signals/ci-workflow-runs", headers=_h()).json()
+    assert body["count"] == libapp.DEFAULT_CI_WORKFLOW_RUN_COUNT == 20
+
+
+def test_ci_workflow_runs_branch_filter_narrows(client):
+    conn = _conn()
+    _insert_ci_workflow_run(conn, "sig_cwr_main", "fennick",
+                            _cwr_meta(run_id=10, branch="main"),
+                            ingested_at=_window_safe_ts(0))
+    _insert_ci_workflow_run(conn, "sig_cwr_feature", "fennick",
+                            _cwr_meta(run_id=11, branch="feature-x"),
+                            ingested_at=_window_safe_ts(0))
+    conn.commit()
+    conn.close()
+    body = client.get(
+        "/signals/ci-workflow-runs?branch=main", headers=_h()).json()
+    assert [r["run_id"] for r in body["runs"]] == [10]
+
+
+def test_ci_workflow_runs_repo_filter_narrows(client):
+    conn = _conn()
+    _insert_ci_workflow_run(conn, "sig_cwr_fennick", "fennick",
+                            _cwr_meta(run_id=20, repo="convivy/fennick"),
+                            ingested_at=_window_safe_ts(0))
+    _insert_ci_workflow_run(conn, "sig_cwr_other", "fennick",
+                            _cwr_meta(run_id=21, repo="convivy/agent-platform"),
+                            ingested_at=_window_safe_ts(0))
+    conn.commit()
+    conn.close()
+    body = client.get(
+        "/signals/ci-workflow-runs?repo=convivy/agent-platform",
+        headers=_h()).json()
+    assert [r["run_id"] for r in body["runs"]] == [21]
+
+
+def test_ci_workflow_runs_scoped_caller_sees_nothing_from_another_product(client):
+    conn = _conn()
+    _insert_ci_workflow_run(conn, "sig_cwr_marlow", "marlow", _cwr_meta(),
+                            ingested_at=_window_safe_ts(0))
+    conn.commit()
+    conn.close()
+    body = client.get("/signals/ci-workflow-runs", headers=_h()).json()
+    assert body["runs"] == [] and body["count"] == 0
+
+
+def test_ci_workflow_runs_customer_class_row_stays_walled(client):
+    conn = _conn()
+    _insert_ci_workflow_run(conn, "sig_cwr_customer", "fennick", _cwr_meta(),
+                            privacy_class="customer",
+                            ingested_at=_window_safe_ts(0))
+    conn.commit()
+    conn.close()
+    plain = client.get("/signals/ci-workflow-runs", headers=_h()).json()
+    assert plain["runs"] == []
+    privileged = client.get(
+        "/signals/ci-workflow-runs", headers=_h(SYSTEM)).json()
+    assert len(privileged["runs"]) == 1
+
+
+def test_ci_workflow_runs_count_over_the_cap_is_refused(client):
+    r = client.get(
+        f"/signals/ci-workflow-runs?count={libapp.MAX_CI_WORKFLOW_RUN_COUNT + 1}",
+        headers=_h())
+    assert r.status_code == 400
+    assert str(libapp.MAX_CI_WORKFLOW_RUN_COUNT) in r.json()["error"]
+
+
+def test_ci_workflow_runs_count_at_the_cap_is_accepted(client):
+    r = client.get(
+        f"/signals/ci-workflow-runs?count={libapp.MAX_CI_WORKFLOW_RUN_COUNT}",
+        headers=_h())
+    assert r.status_code == 200
+
+
+def test_ci_workflow_runs_refuses_an_unrecognised_parameter(client):
+    r = client.get("/signals/ci-workflow-runs?state=queued", headers=_h())
+    assert r.status_code == 400
+    assert r.json()["unknown"] == ["state"]
+
+
+def test_ci_workflow_runs_registered_before_signal_id_route():
+    paths = [r.path for r in libapp.app.routes if getattr(r, "methods", None)]
+    assert (paths.index("/signals/ci-workflow-runs")
+            < paths.index("/signals/{signal_id}"))
+
+
+def test_ci_workflow_runs_path_does_not_resolve_as_a_signal_id(client):
+    r = client.get("/signals/ci-workflow-runs", headers=_h())
+    assert r.status_code == 200, (
+        "a 404 here means the path fell through to /signals/{signal_id} "
+        "looking up a signal literally named 'ci-workflow-runs'")
+    assert "runs" in r.json()
+
+
+# --- pr-merged-counts: merged PRs per repo in a trailing window ------------
+
+
+def test_pr_merged_counts_counts_a_merged_pr_inside_the_window(client):
+    conn = _conn()
+    _insert_pr_state(conn, "sig_merged_1", "fennick",
+                     _pr_meta(number=100, state="MERGED",
+                              merged_at=_window_safe_ts(2)),
+                     ingested_at=_window_safe_ts(2))
+    conn.commit()
+    conn.close()
+    body = client.get("/signals/pr-merged-counts?window_days=90",
+                      headers=_h()).json()
+    assert {"repo": "convivy/fennick", "count": 1} in body["merged_counts"]
+
+
+def test_pr_merged_counts_excludes_an_open_pr(client):
+    conn = _conn()
+    _insert_pr_state(conn, "sig_open_not_merged", "fennick",
+                     _pr_meta(number=101, state="OPEN"),
+                     ingested_at=_window_safe_ts(0))
+    conn.commit()
+    conn.close()
+    body = client.get("/signals/pr-merged-counts", headers=_h()).json()
+    assert body["merged_counts"] == []
+
+
+def test_pr_merged_counts_excludes_a_merge_outside_the_window(client):
+    conn = _conn()
+    _insert_pr_state(conn, "sig_merged_old", "fennick",
+                     _pr_meta(number=102, state="MERGED",
+                              merged_at="2020-01-01T00:00:00Z"),
+                     ingested_at=_window_safe_ts(0))
+    conn.commit()
+    conn.close()
+    body = client.get("/signals/pr-merged-counts?window_days=30",
+                      headers=_h()).json()
+    assert body["merged_counts"] == []
+
+
+def test_pr_merged_counts_ranks_latest_before_scoping_like_pr_state(client):
+    """The newest row for PR 103 sits under `marlow`, outside this caller's
+    scope — the whole PR must drop out of the count rather than falling
+    back to the older `fennick` row's `MERGED` state, the same rule
+    `test_pr_state_drops_pr_when_newest_row_is_out_of_scope` pins for
+    `pr_state_latest` itself."""
+    conn = _conn()
+    _insert_pr_state(conn, "sig_merge_scope_old", "fennick",
+                     _pr_meta(number=103, state="MERGED",
+                              merged_at=_window_safe_ts(2)),
+                     ingested_at=_window_safe_ts(10))
+    _insert_pr_state(conn, "sig_merge_scope_new", "marlow",
+                     _pr_meta(number=103, state="OPEN"),
+                     ingested_at=_window_safe_ts(1))
+    conn.commit()
+    conn.close()
+    body = client.get("/signals/pr-merged-counts", headers=_h()).json()
+    assert body["merged_counts"] == []
+
+
+def test_pr_merged_counts_scoped_caller_sees_nothing_from_another_product(client):
+    conn = _conn()
+    _insert_pr_state(conn, "sig_merged_marlow", "marlow",
+                     _pr_meta(number=104, state="MERGED",
+                              merged_at="2026-10-20T00:00:00Z"),
+                     ingested_at=_window_safe_ts(0))
+    conn.commit()
+    conn.close()
+    body = client.get("/signals/pr-merged-counts", headers=_h()).json()
+    assert body["merged_counts"] == []
+
+
+def test_pr_merged_counts_customer_class_row_stays_walled(client):
+    conn = _conn()
+    _insert_pr_state(conn, "sig_merged_customer", "fennick",
+                     _pr_meta(number=105, state="MERGED",
+                              merged_at=_window_safe_ts(2)),
+                     privacy_class="customer",
+                     ingested_at=_window_safe_ts(0))
+    conn.commit()
+    conn.close()
+    plain = client.get("/signals/pr-merged-counts", headers=_h()).json()
+    assert plain["merged_counts"] == []
+    privileged = client.get(
+        "/signals/pr-merged-counts", headers=_h(SYSTEM)).json()
+    assert {"repo": "convivy/fennick", "count": 1} in privileged["merged_counts"]
+
+
+def test_pr_merged_counts_window_days_over_the_cap_is_refused(client):
+    r = client.get(
+        f"/signals/pr-merged-counts?window_days="
+        f"{libapp.MAX_MERGED_COUNT_WINDOW_DAYS + 1}",
+        headers=_h())
+    assert r.status_code == 400
+    assert str(libapp.MAX_MERGED_COUNT_WINDOW_DAYS) in r.json()["error"]
+
+
+def test_pr_merged_counts_window_days_at_the_cap_is_accepted(client):
+    r = client.get(
+        f"/signals/pr-merged-counts?window_days="
+        f"{libapp.MAX_MERGED_COUNT_WINDOW_DAYS}",
+        headers=_h())
+    assert r.status_code == 200
+
+
+def test_pr_merged_counts_refuses_an_unrecognised_parameter(client):
+    r = client.get("/signals/pr-merged-counts?repo=convivy/fennick",
+                   headers=_h())
+    assert r.status_code == 400
+    assert r.json()["unknown"] == ["repo"]
+
+
+def test_pr_merged_counts_registered_before_signal_id_route():
+    paths = [r.path for r in libapp.app.routes if getattr(r, "methods", None)]
+    assert (paths.index("/signals/pr-merged-counts")
+            < paths.index("/signals/{signal_id}"))
+
+
+def test_pr_merged_counts_path_does_not_resolve_as_a_signal_id(client):
+    r = client.get("/signals/pr-merged-counts", headers=_h())
+    assert r.status_code == 200, (
+        "a 404 here means the path fell through to /signals/{signal_id} "
+        "looking up a signal literally named 'pr-merged-counts'")
+    assert "merged_counts" in r.json()
+
+
 # --- ci-capture: are CI results reaching the Archives for every tracked pair? --
 
 
@@ -2109,15 +2542,22 @@ def _ci_tracked(*pairs):
 
 @pytest.fixture
 def ci_capture(client, monkeypatch):
-    """`ci_tracked.TRACKED`/`NOT_CAPTURED` pinned to a small, test-owned
+    """`ci_tracked.tracked()`/`not_captured()` pinned to a small, test-owned
     fixture, so a `GET /signals/ci-capture` test never depends on this
-    machine's real tracked-repo list."""
-    monkeypatch.setattr(libapp.ci_tracked, "TRACKED", _ci_tracked(
-        ("convivy/vivy", "ci.yml", "vivy"),
-        ("convivy/hollis", "ci.yml", "vivy"),
+    machine's real tracked-repo list or registry. `projects.projects()` is
+    pinned too, to a non-empty fixture dict — a usable registry, which is
+    what the route now reads `registry.available` from directly — the
+    dedicated tests below exercise the unreadable/malformed/metadata-only
+    registry path instead, against the real `ci_tracked` and `projects`
+    functions rather than this fixture's. Every monkeypatched `ci_tracked`
+    function still takes the route's `reg` positional argument, even though
+    these three ignore it, because the route now passes one to all of them."""
+    monkeypatch.setattr(libapp.ci_tracked, "tracked", lambda reg=None: _ci_tracked(
+        ("convivy/fennick", "ci.yml", "fennick"),
+        ("convivy/bramwell", "ci.yml", "fennick"),
     ))
-    monkeypatch.setattr(libapp.ci_tracked, "NOT_CAPTURED", {})
-    monkeypatch.setattr(libapp.ci_tracked, "NOT_CAPTURED_BY_NAME", {})
+    monkeypatch.setattr(libapp.ci_tracked, "not_captured", lambda reg=None: {})
+    monkeypatch.setattr(projects, "projects", lambda: {"fixture-crew": {}})
     return client
 
 
@@ -2126,35 +2566,35 @@ def test_ci_capture_never_captured_for_a_repo_with_zero_signals_not_for_one_with
     """A tracked repo with no `test-result` signal at all appears in
     `never_captured`; a sibling that has one does not."""
     conn = _conn()
-    _insert_test_result(conn, "sig_cap_has_one", "vivy",
+    _insert_test_result(conn, "sig_cap_has_one", "fennick",
                         commit="sha-cap-1", conclusion="success",
-                        run_url="https://github.com/convivy/vivy/actions/runs/1",
+                        run_url="https://github.com/convivy/fennick/actions/runs/1",
                         ingested_at=_window_safe_ts(0))
     conn.commit()
     conn.close()
     body = ci_capture.get("/signals/ci-capture", headers=_h()).json()
-    assert {t["repo"] for t in body["never_captured"]} == {"convivy/hollis"}
+    assert {t["repo"] for t in body["never_captured"]} == {"convivy/bramwell"}
     tracked_by_repo = {t["repo"]: t for t in body["tracked"]}
-    assert tracked_by_repo["convivy/vivy"]["test_result_count"] == 1
-    assert tracked_by_repo["convivy/hollis"]["test_result_count"] == 0
+    assert tracked_by_repo["convivy/fennick"]["test_result_count"] == 1
+    assert tracked_by_repo["convivy/bramwell"]["test_result_count"] == 0
 
 
 def test_ci_capture_counts_each_workflow_of_one_repo_separately(
         ci_capture, monkeypatch):
-    """`TRACKED` holds two `convivy/vivy` pairs, `ci.yml` and
+    """`tracked()` holds two `convivy/fennick` pairs, `ci.yml` and
     `e2e-stage-smoke.yml`. Each reports only its own workflow's rows, so a
     workflow with none is `never_captured` even though its sibling on the
     same repo has some. **Fails on the pre-fix code**, which counted by
     repo alone and gave both pairs the `ci.yml` row."""
-    monkeypatch.setattr(libapp.ci_tracked, "TRACKED", _ci_tracked(
-        ("convivy/vivy", "ci.yml", "vivy"),
-        ("convivy/vivy", "e2e-stage-smoke.yml", "vivy"),
+    monkeypatch.setattr(libapp.ci_tracked, "tracked", lambda reg=None: _ci_tracked(
+        ("convivy/fennick", "ci.yml", "fennick"),
+        ("convivy/fennick", "e2e-stage-smoke.yml", "fennick"),
     ))
     conn = _conn()
-    _insert_test_result(conn, "sig_cap_two_wf", "vivy",
+    _insert_test_result(conn, "sig_cap_two_wf", "fennick",
                         commit="sha-cap-two-wf", conclusion="success",
                         workflow="ci",
-                        run_url="https://github.com/convivy/vivy/actions/runs/3",
+                        run_url="https://github.com/convivy/fennick/actions/runs/3",
                         ingested_at=_window_safe_ts(0))
     conn.commit()
     conn.close()
@@ -2173,9 +2613,9 @@ def test_ci_capture_keeps_the_retired_fetcher_s_fields_at_their_absent_values(
     received whenever that file was missing (issue_01M2XGCSGYW6F0QEZAQ0VKN7CQ),
     even for a pair that has captured rows."""
     conn = _conn()
-    _insert_test_result(conn, "sig_cap_retired_fields", "vivy",
+    _insert_test_result(conn, "sig_cap_retired_fields", "fennick",
                         commit="sha-cap-retired", conclusion="success",
-                        run_url="https://github.com/convivy/vivy/actions/runs/2",
+                        run_url="https://github.com/convivy/fennick/actions/runs/2",
                         ingested_at=_window_safe_ts(1))
     conn.commit()
     conn.close()
@@ -2190,7 +2630,7 @@ def test_ci_capture_keeps_the_retired_fetcher_s_fields_at_their_absent_values(
 
 
 def test_ci_capture_refuses_any_parameter(ci_capture):
-    resp = ci_capture.get("/signals/ci-capture?repo=convivy/vivy", headers=_h())
+    resp = ci_capture.get("/signals/ci-capture?repo=convivy/fennick", headers=_h())
     assert resp.status_code == 400
     assert resp.json()["unknown"] == ["repo"]
     assert resp.json()["supported"] == []
@@ -2200,84 +2640,68 @@ def test_ci_capture_lists_a_repo_deck_draws_that_is_neither_tracked_nor_explaine
         ci_capture, monkeypatch):
     monkeypatch.setattr(
         libapp.ci_tracked, "deck_tracked_repos",
-        lambda: [{"repo": "convivy/vivy", "product": "vivy"},
-                 {"repo": "convivy/mystery", "product": "vivy"}])
+        lambda reg=None: [{"repo": "convivy/fennick", "product": "fennick"},
+                           {"repo": "convivy/mystery", "product": "fennick"}])
     body = ci_capture.get("/signals/ci-capture", headers=_h()).json()
     assert [u["repo"] for u in body["untracked"]] == ["convivy/mystery"]
 
 
 def test_ci_capture_does_not_list_a_not_captured_repo_as_untracked(
         ci_capture, monkeypatch):
-    monkeypatch.setattr(libapp.ci_tracked, "NOT_CAPTURED",
-                        {"convivy/signals": "no GitHub Actions workflows"})
+    monkeypatch.setattr(
+        libapp.ci_tracked, "not_captured",
+        lambda reg=None: {"convivy/signals": "no GitHub Actions workflows"})
     monkeypatch.setattr(
         libapp.ci_tracked, "deck_tracked_repos",
-        lambda: [{"repo": "convivy/vivy", "product": "vivy"},
-                 {"repo": "convivy/signals", "product": "vivy"}])
+        lambda reg=None: [{"repo": "convivy/fennick", "product": "fennick"},
+                           {"repo": "convivy/signals", "product": "fennick"}])
     body = ci_capture.get("/signals/ci-capture", headers=_h()).json()
     assert body["untracked"] == []
     assert body["not_captured"] == [
         {"repo": "convivy/signals", "reason": "no GitHub Actions workflows"}]
 
 
-def test_ci_capture_resolves_a_by_name_not_captured_entry_to_its_full_name(
-        ci_capture, monkeypatch):
-    """A `NOT_CAPTURED_BY_NAME` entry takes the owner `deck_tracked_repos()`
-    gives it, is reported under that full name, and keeps that repository
-    out of `untracked`."""
-    monkeypatch.setattr(libapp.ci_tracked, "NOT_CAPTURED_BY_NAME",
-                        {"side-project": "404 from the GitHub API"})
-    monkeypatch.setattr(
-        libapp.ci_tracked, "deck_tracked_repos",
-        lambda: [{"repo": "convivy/vivy", "product": "vivy"},
-                 {"repo": "example-owner/side-project", "product": "vivy"}])
-    body = ci_capture.get("/signals/ci-capture", headers=_h()).json()
-    assert body["untracked"] == []
-    assert body["not_captured"] == [
-        {"repo": "example-owner/side-project", "reason": "404 from the GitHub API"}]
-
-
 @pytest.fixture
 def ci_capture_multi_product(client, monkeypatch):
     """Every list `GET /signals/ci-capture` returns, carrying repos from TWO
-    products — `AGENT` is scoped to `vivy` alone (see `_build_client`), so a
+    products — `AGENT` is scoped to `fennick` alone (see `_build_client`), so a
     fixture with every tracked, untracked and not-captured repo under that
     one product would pass a scope leak silently (reviewer and
     security-reviewer, PR #229 round 1: the original fixture did exactly
     that, which is why no test caught the gap `/signals/facets` had already
     fixed in PR #185).
 
-    `convivy/orphan` names a `NOT_CAPTURED` repo `deck_tracked_repos()` does
+    `convivy/orphan` names a `not_captured()` repo `deck_tracked_repos()` does
     not yield at all, so its product cannot be determined — shown only to
     the wildcard caller.
     """
-    monkeypatch.setattr(libapp.ci_tracked, "TRACKED", _ci_tracked(
-        ("convivy/vivy", "ci.yml", "vivy"),
-        ("convivy/constance", "ci.yml", "constance"),
+    monkeypatch.setattr(libapp.ci_tracked, "tracked", lambda reg=None: _ci_tracked(
+        ("convivy/fennick", "ci.yml", "fennick"),
+        ("convivy/marlow", "ci.yml", "marlow"),
     ))
-    monkeypatch.setattr(libapp.ci_tracked, "NOT_CAPTURED", {
-        "convivy/signals-vivy": "no GitHub Actions workflows",
-        "convivy/signals-constance": "no GitHub Actions workflows",
+    monkeypatch.setattr(libapp.ci_tracked, "not_captured", lambda reg=None: {
+        "convivy/signals-fennick": "no GitHub Actions workflows",
+        "convivy/signals-marlow": "no GitHub Actions workflows",
         "convivy/orphan": "404 from the GitHub API",
     })
-    monkeypatch.setattr(libapp.ci_tracked, "NOT_CAPTURED_BY_NAME", {})
     monkeypatch.setattr(
         libapp.ci_tracked, "deck_tracked_repos",
-        lambda: [
-            {"repo": "convivy/vivy", "product": "vivy"},
-            {"repo": "convivy/constance", "product": "constance"},
-            {"repo": "convivy/mystery-vivy", "product": "vivy"},
-            {"repo": "convivy/mystery-constance", "product": "constance"},
-            {"repo": "convivy/signals-vivy", "product": "vivy"},
-            {"repo": "convivy/signals-constance", "product": "constance"},
+        lambda reg=None: [
+            {"repo": "convivy/fennick", "product": "fennick"},
+            {"repo": "convivy/marlow", "product": "marlow"},
+            {"repo": "convivy/mystery-fennick", "product": "fennick"},
+            {"repo": "convivy/mystery-marlow", "product": "marlow"},
+            {"repo": "convivy/signals-fennick", "product": "fennick"},
+            {"repo": "convivy/signals-marlow", "product": "marlow"},
         ])
+    monkeypatch.setattr(projects, "projects", lambda: {"fixture-crew": {}})
     return client
 
 
 def test_ci_capture_scoped_caller_sees_only_its_own_product_everywhere(
         ci_capture_multi_product):
-    """A `vivy`-scoped caller (`AGENT`) must not see `constance`'s repo,
-    workflow file or `NOT_CAPTURED` reason in any of the six lists — the
+    """A `fennick`-scoped caller (`AGENT`) must not see `marlow`'s repo,
+    workflow file or `not_captured()` reason in any of the six lists — the
     disclosure both reviewers flagged on PR #229."""
     body = ci_capture_multi_product.get(
         "/signals/ci-capture", headers=_h(AGENT)).json()
@@ -2285,14 +2709,14 @@ def test_ci_capture_scoped_caller_sees_only_its_own_product_everywhere(
     for key in ("tracked", "never_captured", "quiet_this_run",
                "unreadable_last_run"):
         repos = {t["repo"] for t in body[key]}
-        assert "convivy/constance" not in repos, key
+        assert "convivy/marlow" not in repos, key
         products = {t["product"] for t in body[key]}
-        assert "constance" not in products, key
+        assert "marlow" not in products, key
 
-    assert {t["repo"] for t in body["tracked"]} == {"convivy/vivy"}
-    assert {u["repo"] for u in body["untracked"]} == {"convivy/mystery-vivy"}
+    assert {t["repo"] for t in body["tracked"]} == {"convivy/fennick"}
+    assert {u["repo"] for u in body["untracked"]} == {"convivy/mystery-fennick"}
     assert body["not_captured"] == [
-        {"repo": "convivy/signals-vivy",
+        {"repo": "convivy/signals-fennick",
          "reason": "no GitHub Actions workflows"}]
 
 
@@ -2304,30 +2728,30 @@ def test_ci_capture_unscoped_caller_sees_every_product(
         "/signals/ci-capture", headers=_h(WIDE)).json()
 
     assert {t["repo"] for t in body["tracked"]} == {
-        "convivy/vivy", "convivy/constance"}
+        "convivy/fennick", "convivy/marlow"}
     assert {u["repo"] for u in body["untracked"]} == {
-        "convivy/mystery-vivy", "convivy/mystery-constance"}
+        "convivy/mystery-fennick", "convivy/mystery-marlow"}
     assert {n["repo"] for n in body["not_captured"]} == {
-        "convivy/signals-vivy", "convivy/signals-constance", "convivy/orphan"}
+        "convivy/signals-fennick", "convivy/signals-marlow", "convivy/orphan"}
 
 
 def test_ci_capture_not_captured_product_lookup_is_per_entry(
         ci_capture_multi_product):
-    """`NOT_CAPTURED` maps a repo straight to a reason, with no product of
-    its own — `convivy/signals-vivy`'s product comes from its matching
+    """`not_captured()` maps a repo straight to a reason, with no product of
+    its own — `convivy/signals-fennick`'s product comes from its matching
     `deck_tracked_repos()` entry, and that lookup must be per entry: the
-    `vivy` reader sees its own repo and not `constance`'s, which proves the
+    `fennick` reader sees its own repo and not `marlow`'s, which proves the
     product was resolved rather than the whole section merely gated once on
     the caller's first-seen product."""
-    vivy = ci_capture_multi_product.get(
+    fennick = ci_capture_multi_product.get(
         "/signals/ci-capture", headers=_h(AGENT)).json()
-    assert {n["repo"] for n in vivy["not_captured"]} == {
-        "convivy/signals-vivy"}
+    assert {n["repo"] for n in fennick["not_captured"]} == {
+        "convivy/signals-fennick"}
 
 
 def test_ci_capture_not_captured_entry_with_no_known_product_is_wildcard_only(
         ci_capture_multi_product):
-    """`convivy/orphan` is in `NOT_CAPTURED` but `deck_tracked_repos()` names
+    """`convivy/orphan` is in `not_captured()` but `deck_tracked_repos()` names
     no entry for it, so its product cannot be resolved — it must be shown
     only to a wildcard caller, exactly what `identity.in_scope(ident, None)`
     already returns."""
@@ -2354,6 +2778,351 @@ def test_ci_capture_path_does_not_resolve_as_a_signal_id(ci_capture):
         "a 404 here means the path fell through to /signals/{signal_id} "
         "looking up a signal literally named 'ci-capture'")
     assert "tracked" in r.json()
+
+
+def test_ci_capture_reports_a_usable_registry_when_it_is_one(ci_capture):
+    """The common case: `registry.available` is `True` and `reason` is
+    `None`, additive under Library-Protocol 1 alongside every other field a
+    client already reads."""
+    body = ci_capture.get("/signals/ci-capture", headers=_h()).json()
+    assert body["registry"] == {"available": True, "reason": None}
+
+
+# --- ci-capture: an unusable registry says so, rather than tracking nothing
+# by a fallback literal (issue_01M5GYC0EBWS1JBQF7DA6FQ1CG). These three
+# exercise the real `ci_tracked.tracked`/`not_captured`/`deck_tracked_repos`
+# and `projects` module, never the `ci_capture`/`ci_capture_multi_product`
+# fixtures' monkeypatched stand-ins, so the whole real path is proven rather
+# than only this test file's own fixture of it.
+
+
+def test_ci_capture_says_so_for_an_unreadable_registry(client, tmp_path, monkeypatch):
+    missing = tmp_path / "does-not-exist.json"
+    with monkeypatch.context() as m:
+        m.setattr(projects, "REGISTRY_PATH", missing)
+        projects.reload()
+        body = client.get("/signals/ci-capture", headers=_h(WIDE)).json()
+    projects.reload()
+    assert body["registry"]["available"] is False
+    assert body["registry"]["reason"]
+    assert body["tracked"] == []
+    assert body["never_captured"] == []
+    assert body["untracked"] == []
+    assert body["not_captured"] == []
+
+
+def test_ci_capture_says_so_for_a_malformed_registry(client, tmp_path, monkeypatch):
+    registry = tmp_path / "projects.json"
+    registry.write_text("{not valid json")
+    with monkeypatch.context() as m:
+        m.setattr(projects, "REGISTRY_PATH", registry)
+        projects.reload()
+        body = client.get("/signals/ci-capture", headers=_h(WIDE)).json()
+    projects.reload()
+    assert body["registry"]["available"] is False
+    assert body["registry"]["reason"]
+    assert body["tracked"] == []
+    assert body["never_captured"] == []
+    assert body["untracked"] == []
+    assert body["not_captured"] == []
+
+
+def test_ci_capture_says_so_for_a_metadata_only_registry(client, tmp_path, monkeypatch):
+    """Valid JSON, parses cleanly, and names no project past its metadata
+    keys — the condition `projects._Snapshot.available` exists to catch,
+    distinct from a registry a raw-read check would call healthy."""
+    registry = tmp_path / "projects.json"
+    registry.write_text(json.dumps({
+        "_meta": {"doc": "not a project"},
+        "_scopes": {"platform": {}},
+    }))
+    with monkeypatch.context() as m:
+        m.setattr(projects, "REGISTRY_PATH", registry)
+        projects.reload()
+        body = client.get("/signals/ci-capture", headers=_h(WIDE)).json()
+    projects.reload()
+    assert body["registry"]["available"] is False
+    assert body["registry"]["reason"]
+    assert body["tracked"] == []
+    assert body["never_captured"] == []
+    assert body["untracked"] == []
+    assert body["not_captured"] == []
+
+
+def test_ci_capture_reads_the_registry_exactly_once_per_request(
+        client, tmp_path, monkeypatch):
+    """`registry`, `tracked`, `untracked` and `not_captured` all have to come
+    from the SAME read of the project registry, not up to four independent
+    ones split across the threadpool await (reviewer + security-reviewer,
+    round 2 of issue_01M5GYC0EBWS1JBQF7DA6FQ1CG) — a registry file replaced
+    between two of those reads could otherwise make `registry.available`
+    describe a different read than the lists beside it.
+
+    Proven by counting calls into `projects.projects()`, the one function
+    the route calls to read the registry: exactly one call serves the whole
+    request, so there is no window left for the file to change underneath
+    it."""
+    registry = tmp_path / "projects.json"
+    registry.write_text(json.dumps({
+        "wrenfield": {"class": "product", "lifecycle": "active", "owner": "convivy",
+                      "repos": ["wrenfield"]},
+    }))
+    calls = []
+    real_projects = projects.projects
+
+    def _counting():
+        calls.append(1)
+        return real_projects()
+
+    with monkeypatch.context() as m:
+        m.setattr(projects, "REGISTRY_PATH", registry)
+        projects.reload()
+        m.setattr(projects, "projects", _counting)
+        body = client.get("/signals/ci-capture", headers=_h(WIDE)).json()
+    projects.reload()
+    assert len(calls) == 1
+    assert body["registry"] == {"available": True, "reason": None}
+    assert {t["repo"] for t in body["tracked"]} == {"convivy/wrenfield"}
+
+
+# --- coverage: the latest `code_coverage` row per registered repo (CQ·253) ----
+
+
+def _coverage_meta(**overrides):
+    meta = {"repo": "convivy/fennick", "percent": 87.5,
+            "source": "totals.percent_covered", "artifact_id": "art-default",
+            "workflow_run_id": 501, "head_sha": "sha-default",
+            "branch": "main", "artifact_created_at": "2026-10-01T00:00:00Z"}
+    meta.update(overrides)
+    return meta
+
+
+def _insert_code_coverage(conn, id_, product, meta, *, privacy_class="internal",
+                          produced_at=None, ingested_at):
+    conn.execute(
+        "INSERT INTO signals (id, product, source, kind, body, "
+        "privacy_class, meta, produced_at, ingested_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        (id_, product, "keel", "code_coverage", "a code_coverage row",
+         privacy_class, json.dumps(meta), produced_at, ingested_at))
+
+
+@pytest.fixture
+def coverage(client, monkeypatch):
+    """`ci_tracked.deck_tracked_repos()` pinned to a small, test-owned
+    fixture spanning two products, so `GET /signals/coverage` never depends
+    on this machine's real registry — the same reason `ci_capture` pins it.
+    `projects.projects()` is pinned too, to a non-empty fixture dict, the
+    same stand-in `ci_capture` uses for its own single read."""
+    monkeypatch.setattr(
+        libapp.ci_tracked, "deck_tracked_repos",
+        lambda reg=None: [
+            {"repo": "convivy/fennick", "product": "fennick"},
+            {"repo": "convivy/marlow", "product": "marlow"},
+        ])
+    monkeypatch.setattr(projects, "projects", lambda: {"fixture-crew": {}})
+    return client
+
+
+def test_coverage_two_rows_for_one_repo_the_latest_wins(coverage):
+    conn = _conn()
+    _insert_code_coverage(conn, "sig_cov_old", "fennick",
+                          _coverage_meta(percent=50.0, workflow_run_id=1,
+                                         artifact_created_at="2026-09-01T00:00:00Z"),
+                          ingested_at=_window_safe_ts(5))
+    _insert_code_coverage(conn, "sig_cov_new", "fennick",
+                          _coverage_meta(percent=90.0, workflow_run_id=2,
+                                         artifact_created_at="2026-10-01T00:00:00Z"),
+                          ingested_at=_window_safe_ts(0))
+    conn.commit()
+    conn.close()
+    body = coverage.get("/signals/coverage", headers=_h()).json()
+    assert body["coverage"] == [{
+        "repo": "convivy/fennick", "percent": 90.0,
+        "source": "totals.percent_covered", "workflow_run_id": 2,
+        "head_sha": "sha-default", "branch": "main",
+        "artifact_created_at": "2026-10-01T00:00:00Z", "reason": None,
+    }]
+
+
+def test_coverage_a_newer_feature_branch_row_loses_to_an_older_main_row(
+        coverage):
+    """A branch build's artifact is routinely newer than main's own, so
+    ranking across every branch would serve the branch build's figure as
+    the repo's coverage. The older `main` row must win instead."""
+    conn = _conn()
+    _insert_code_coverage(conn, "sig_cov_main_older", "fennick",
+                          _coverage_meta(percent=50.0, workflow_run_id=1,
+                                         branch="main",
+                                         artifact_created_at="2026-09-01T00:00:00Z"),
+                          ingested_at=_window_safe_ts(5))
+    _insert_code_coverage(conn, "sig_cov_branch_newer", "fennick",
+                          _coverage_meta(percent=90.0, workflow_run_id=2,
+                                         branch="agent/platform-coder-work-item",
+                                         artifact_created_at="2026-10-01T00:00:00Z"),
+                          ingested_at=_window_safe_ts(0))
+    conn.commit()
+    conn.close()
+    body = coverage.get("/signals/coverage", headers=_h()).json()
+    assert body["coverage"] == [{
+        "repo": "convivy/fennick", "percent": 50.0,
+        "source": "totals.percent_covered", "workflow_run_id": 1,
+        "head_sha": "sha-default", "branch": "main",
+        "artifact_created_at": "2026-09-01T00:00:00Z", "reason": None,
+    }]
+
+
+def test_coverage_a_repo_with_only_feature_branch_rows_reads_null(coverage):
+    """A repo whose only rows are branch builds must read exactly like a
+    repo with no rows at all, not like one with a visible figure."""
+    conn = _conn()
+    _insert_code_coverage(conn, "sig_cov_branch_only", "fennick",
+                          _coverage_meta(percent=90.0,
+                                         branch="agent/platform-coder-work-item"),
+                          ingested_at=_window_safe_ts(0))
+    conn.commit()
+    conn.close()
+    body = coverage.get("/signals/coverage", headers=_h()).json()
+    assert body["coverage"] == [{
+        "repo": "convivy/fennick", "percent": None, "source": None,
+        "workflow_run_id": None, "head_sha": None, "branch": None,
+        "artifact_created_at": None, "reason": libapp._NO_COVERAGE_REASON,
+    }]
+
+
+def test_coverage_a_repo_with_no_rows_serves_null_with_a_reason(coverage):
+    body = coverage.get("/signals/coverage", headers=_h()).json()
+    assert body["coverage"] == [{
+        "repo": "convivy/fennick", "percent": None, "source": None,
+        "workflow_run_id": None, "head_sha": None, "branch": None,
+        "artifact_created_at": None, "reason": libapp._NO_COVERAGE_REASON,
+    }]
+
+
+def test_coverage_scoped_caller_sees_neither_the_figure_nor_a_null_entry(
+        coverage):
+    """`AGENT` is scoped to `fennick` alone. `convivy/marlow`'s own project
+    is `marlow`, out of scope, so it must not appear at all — not as a
+    figure, and not as a null entry either."""
+    conn = _conn()
+    _insert_code_coverage(conn, "sig_cov_marlow", "marlow",
+                          _coverage_meta(repo="convivy/marlow", percent=77.0),
+                          ingested_at=_window_safe_ts(0))
+    conn.commit()
+    conn.close()
+    body = coverage.get("/signals/coverage", headers=_h()).json()
+    assert [c["repo"] for c in body["coverage"]] == ["convivy/fennick"]
+
+
+def test_coverage_customer_class_row_stays_walled(coverage):
+    conn = _conn()
+    _insert_code_coverage(conn, "sig_cov_customer", "fennick",
+                          _coverage_meta(percent=99.0),
+                          privacy_class="customer",
+                          ingested_at=_window_safe_ts(0))
+    conn.commit()
+    conn.close()
+    plain = coverage.get("/signals/coverage", headers=_h()).json()
+    entry = [c for c in plain["coverage"] if c["repo"] == "convivy/fennick"][0]
+    assert entry["percent"] is None
+    assert entry["reason"] == libapp._NO_COVERAGE_REASON
+    privileged = coverage.get("/signals/coverage", headers=_h(SYSTEM)).json()
+    priv_entry = [c for c in privileged["coverage"]
+                 if c["repo"] == "convivy/fennick"][0]
+    assert priv_entry["percent"] == 99.0
+
+
+def test_coverage_a_newer_customer_row_hides_the_older_figure_too(coverage):
+    """Rank-then-check (`pr_state_latest`'s own shape): the newer, walled row
+    must win the per-repo rank and then be dropped for a caller that cannot
+    see it, never fall through to the older, visible row underneath it. A
+    caller without `signal.customer` reading the older row's 50% back would
+    be shown a stale figure dressed as current."""
+    conn = _conn()
+    _insert_code_coverage(conn, "sig_cov_older_visible", "fennick",
+                          _coverage_meta(percent=50.0, workflow_run_id=1,
+                                         artifact_created_at="2026-09-01T00:00:00Z"),
+                          ingested_at=_window_safe_ts(5))
+    _insert_code_coverage(conn, "sig_cov_newer_customer", "fennick",
+                          _coverage_meta(percent=95.0, workflow_run_id=2,
+                                         artifact_created_at="2026-10-01T00:00:00Z"),
+                          privacy_class="customer",
+                          ingested_at=_window_safe_ts(0))
+    conn.commit()
+    conn.close()
+
+    plain = coverage.get("/signals/coverage", headers=_h()).json()
+    entry = [c for c in plain["coverage"] if c["repo"] == "convivy/fennick"][0]
+    assert entry["percent"] is None
+    assert entry["reason"] == libapp._NO_COVERAGE_REASON
+
+    privileged = coverage.get("/signals/coverage", headers=_h(SYSTEM)).json()
+    priv_entry = [c for c in privileged["coverage"]
+                 if c["repo"] == "convivy/fennick"][0]
+    assert priv_entry["percent"] == 95.0
+    assert priv_entry["workflow_run_id"] == 2
+    assert priv_entry["reason"] is None
+
+
+def test_coverage_hidden_winner_and_no_rows_share_the_same_reason_text(
+        coverage):
+    """The response must never tell a caller whether a hidden row exists:
+    a repo whose winning row this caller cannot see, and a repo with no
+    rows at all, read the identical `reason` string."""
+    conn = _conn()
+    _insert_code_coverage(conn, "sig_cov_hidden_winner", "fennick",
+                          _coverage_meta(percent=95.0),
+                          privacy_class="customer",
+                          ingested_at=_window_safe_ts(0))
+    conn.commit()
+    conn.close()
+
+    # `convivy/fennick` has a winning row this caller (scoped to `fennick`,
+    # no `signal.customer`) cannot see. `convivy/marlow` is out of this
+    # caller's product scope, so it is checked separately, via `WIDE`
+    # (in-scope for both) narrowed to just the repo with no rows at all.
+    hidden_winner_body = coverage.get("/signals/coverage", headers=_h()).json()
+    hidden_winner_reason = [
+        c for c in hidden_winner_body["coverage"]
+        if c["repo"] == "convivy/fennick"][0]["reason"]
+
+    no_rows_body = coverage.get(
+        "/signals/coverage?repo=convivy/marlow", headers=_h(WIDE)).json()
+    no_rows_reason = no_rows_body["coverage"][0]["reason"]
+
+    assert hidden_winner_reason == no_rows_reason == libapp._NO_COVERAGE_REASON
+
+
+def test_coverage_repo_filter_narrows(coverage):
+    conn = _conn()
+    _insert_code_coverage(conn, "sig_cov_filter", "fennick",
+                          _coverage_meta(percent=42.0),
+                          ingested_at=_window_safe_ts(0))
+    conn.commit()
+    conn.close()
+    body = coverage.get(
+        "/signals/coverage?repo=convivy/fennick", headers=_h(WIDE)).json()
+    assert [c["repo"] for c in body["coverage"]] == ["convivy/fennick"]
+
+
+def test_coverage_refuses_an_unrecognised_parameter(coverage):
+    r = coverage.get("/signals/coverage?percent=90", headers=_h())
+    assert r.status_code == 400
+    assert r.json()["unknown"] == ["percent"]
+
+
+def test_coverage_registered_before_signal_id_route():
+    paths = [r.path for r in libapp.app.routes if getattr(r, "methods", None)]
+    assert (paths.index("/signals/coverage")
+            < paths.index("/signals/{signal_id}"))
+
+
+def test_coverage_path_does_not_resolve_as_a_signal_id(coverage):
+    r = coverage.get("/signals/coverage", headers=_h())
+    assert r.status_code == 200, (
+        "a 404 here means the path fell through to /signals/{signal_id} "
+        "looking up a signal literally named 'coverage'")
+    assert "coverage" in r.json()
 
 
 # --- the shadow ----------------------------------------------------------------
@@ -2389,7 +3158,7 @@ def test_an_unrecognised_kind_resolves_as_agent_not_as_something_wider(tmp_path,
     """A typo in the token file must not mint a role with more capability than
     intended."""
     toks = tmp_path / "t.json"
-    toks.write_text(json.dumps({"tok": {"name": "x", "products": ["vivy"],
+    toks.write_text(json.dumps({"tok": {"name": "x", "products": ["fennick"],
                                         "kind": "superuser"}}))
     monkeypatch.setattr(identity, "TOKENS", toks)
     ident = identity.resolve("Bearer tok")
@@ -2423,25 +3192,31 @@ def test_the_role_table_names_only_roles_resolve_can_produce(tmp_path, monkeypat
 
     **This is the test that catches a role added to the table and left
     unreachable**, which is why it grew a `customer_reader` entry rather than an
-    exemption when that role landed, and an `orchestrator` one the same way when
-    that role landed: the point is that every name in `ROLE_CAPS` has a token
-    shape that produces it."""
+    exemption when that role landed, an `orchestrator` one the same way when
+    that role landed, a `review_record_writer` one when that role landed,
+    and a `registrar` one when that role landed:
+    the point is that every name in `ROLE_CAPS` has a token shape that
+    produces it."""
     toks = tmp_path / "t.json"
     toks.write_text(json.dumps({
-        "plain": {"name": "a", "products": ["vivy"]},
-        "sys": {"name": "b", "products": ["vivy"], "kind": "system"},
-        "reader": {"name": "d", "products": ["vivy"], "kind": "customer_reader"},
-        "orch": {"name": "e", "products": ["vivy"], "kind": "orchestrator"},
-        "wishful": {"name": "c", "products": ["vivy"], "kind": "human"},
+        "plain": {"name": "a", "products": ["fennick"]},
+        "sys": {"name": "b", "products": ["fennick"], "kind": "system"},
+        "reader": {"name": "d", "products": ["fennick"], "kind": "customer_reader"},
+        "orch": {"name": "e", "products": ["fennick"], "kind": "orchestrator"},
+        "writer": {"name": "f", "products": ["fennick"],
+                  "kind": "review_record_writer"},
+        "registrar": {"name": "g", "products": ["fennick"], "kind": "registrar"},
+        "wishful": {"name": "c", "products": ["fennick"], "kind": "human"},
     }))
     client_toks = tmp_path / "c.json"
     client_toks.write_text(json.dumps({
-        "orient": {"name": "orient", "products": ["vivy"]},
+        "orient": {"name": "orient", "products": ["fennick"]},
     }))
     monkeypatch.setattr(identity, "TOKENS", toks)
     monkeypatch.setattr(identity, "CLIENT_TOKENS", client_toks)
     produced = {identity.resolve(f"Bearer {t}").kind
-                for t in ("plain", "sys", "reader", "orch", "wishful", "orient")}
+                for t in ("plain", "sys", "reader", "orch", "writer",
+                          "registrar", "wishful", "orient")}
     assert produced == set(identity.ROLE_CAPS), (
         "ROLE_CAPS names a role resolve() cannot produce, or vice versa")
     # And the wishful one is an agent, which is the fail-closed direction.
@@ -2477,8 +3252,8 @@ def kb(tmp_path, monkeypatch):
         ("platform/decisions/0022-library-repo", "platform/decisions/0022.md",
          "decision", "platform", "The Library gets its own repository", "current",
          '["library","keel"]', "the Library is a service with its own storage"),
-        ("vivy/specs/guest-stay", "projects/vivy/specs/guest-stay.md",
-         "spec", "vivy", "Guest stay flow", "current",
+        ("fennick/specs/guest-stay", "projects/fennick/specs/guest-stay.md",
+         "spec", "fennick", "Guest stay flow", "current",
          # Mentions the search term ONLY in its body, so BM25's column weighting
          # is actually exercised: the document carrying it in id and title must
          # outrank this one. Without a second match the ranking assertions pass
@@ -2551,7 +3326,7 @@ def test_reference_search_hides_archived_unless_asked(client, kb):
 
 
 def test_reference_is_not_product_scoped_and_that_is_deliberate(client, kb):
-    """A vivy-scoped agent MUST be able to read the platform's design rationale —
+    """A fennick-scoped agent MUST be able to read the platform's design rationale —
     the dispatch machinery points several repos at that corpus on purpose. This is
     the one read surface where scoping items the usual way would be wrong."""
     body = client.get("/reference/search?q=library", headers=_h()).json()
@@ -2571,9 +3346,9 @@ def test_a_document_id_containing_slashes_resolves(client, kb):
 
 
 def test_a_project_filter_narrows_without_being_a_boundary(client, kb):
-    body = client.get("/reference/search?q=library&project=vivy",
+    body = client.get("/reference/search?q=library&project=fennick",
                       headers=_h()).json()
-    assert all(d["project"] == "vivy" for d in body["documents"])
+    assert all(d["project"] == "fennick" for d in body["documents"])
 
 
 def test_reference_search_filters_on_audience_like_its_listing_does(client, kb):
@@ -2698,7 +3473,7 @@ def test_reference_topics_refuses_any_parameter(client, kb):
 
 def test_the_reference_routes_need_their_own_capability(client, kb, tmp_path, monkeypatch):
     toks = tmp_path / "narrow.json"
-    toks.write_text(json.dumps({"narrow": {"name": "n", "products": ["vivy"]}}))
+    toks.write_text(json.dumps({"narrow": {"name": "n", "products": ["fennick"]}}))
     monkeypatch.setattr(identity, "TOKENS", toks)
     monkeypatch.setattr(identity, "CLIENT_TOKENS", tmp_path / "no-clients.json")
     monkeypatch.setattr(identity, "ROLE_CAPS", {"agent": frozenset({"item.read"})})
@@ -2811,10 +3586,10 @@ def vec(client, tmp_path, monkeypatch):
     conn.enable_load_extension(False)
     conn.execute(f"CREATE VIRTUAL TABLE {vectors.VEC_TABLE} USING "
                  f"vec0(embedding float[{vectors.EMBED_DIM}], vault text, +item_id text)")
-    # A constance signal, so the scope wall has something to remove.
+    # A marlow signal, so the scope wall has something to remove.
     conn.execute("INSERT INTO signals (id, product, kind, body, privacy_class, "
                  "ingested_at) VALUES (?,?,?,?,?,?)",
-                 ("sig_c1", "constance", "note", "a constance note", "internal",
+                 ("sig_c1", "marlow", "note", "a marlow note", "internal",
                   "2026-08-03"))
 
     def vector_for(seed: float) -> bytes:
@@ -2822,7 +3597,7 @@ def vec(client, tmp_path, monkeypatch):
         return struct.pack(f"{vectors.EMBED_DIM}f",
                            *([seed] + [0.0] * (vectors.EMBED_DIM - 1)))
 
-    # Distances ascend in this order, so the nearest row is the vivy internal one
+    # Distances ascend in this order, so the nearest row is the fennick internal one
     # and the walled rows sit behind it — a filter applied after the KNN rather
     # than to the joined rows would still return them.
     for sid, seed in (("sig_v1", 0.0), ("sig_v2", 0.1), ("sig_c1", 0.2)):
@@ -2845,8 +3620,8 @@ def test_semantic_search_returns_nearest_first_with_a_distance(vec):
 
 def test_semantic_search_is_not_a_side_door_around_product_scope(vec):
     """A caller that cannot LIST a row must not learn it exists through a
-    similarity score. The constance signal is nearer than nothing and must not
-    appear for a vivy-scoped caller."""
+    similarity score. The marlow signal is nearer than nothing and must not
+    appear for a fennick-scoped caller."""
     body = vec.get("/signals/search?q=anything", headers=_h()).json()
     assert "sig_c1" not in [s["id"] for s in body["signals"]]
     wide = vec.get("/signals/search?q=anything", headers=_h(WIDE)).json()
@@ -2920,7 +3695,7 @@ def test_a_short_page_says_whether_more_exists(vec):
 
 
 def _index_sourced_signals():
-    """Two more vivy signals carrying DIFFERENT sources, vectorised so the search
+    """Two more fennick signals carrying DIFFERENT sources, vectorised so the search
     window holds both. The base `vec` fixture's rows carry no source at all, so a
     source filter over them alone could never remove anything and every assertion
     about it would pass with the clause deleted."""
@@ -2933,9 +3708,9 @@ def _index_sourced_signals():
     conn.executemany(
         "INSERT INTO signals (id, product, source, kind, body, privacy_class, "
         "ingested_at) VALUES (?,?,?,?,?,?,?)",
-        [("sig_ci2", "vivy", "ci", "build", "a ci row", "internal",
+        [("sig_ci2", "fennick", "ci", "build", "a ci row", "internal",
           "2026-08-04 08:00:00.000000"),
-         ("sig_sl2", "vivy", "slack", "chat", "a slack row", "internal",
+         ("sig_sl2", "fennick", "slack", "chat", "a slack row", "internal",
           "2026-08-04 09:00:00.000000")])
     for sid, seed in (("sig_ci2", 0.3), ("sig_sl2", 0.4)):
         conn.execute(
@@ -3266,8 +4041,8 @@ def test_the_two_deliberate_omissions_stay_omitted(client):
 
 def test_whoami_reports_the_callers_own_resolved_identity(client):
     body = client.get("/whoami", headers=_h()).json()
-    assert body == {"actor": "vivy-agent", "kind": "agent",
-                    "products": ["vivy"],
+    assert body == {"actor": "fennick-agent", "kind": "agent",
+                    "products": ["fennick"],
                     "capabilities": sorted(identity.ROLE_CAPS["agent"])}
 
 
@@ -3341,7 +4116,7 @@ def test_whoami_reports_every_product_in_a_multi_product_scope(client):
     """Every other fixture token carries zero or one product, which left the
     multi-product path asserted by nothing (reviewer, PR #29)."""
     body = client.get("/whoami", headers=_h(MULTI)).json()
-    assert set(body["products"]) == {"vivy", "constance", "hollis"}
+    assert set(body["products"]) == {"fennick", "marlow", "bramwell"}
 
 
 def test_whoami_sorts_the_scope_it_reports(client, monkeypatch):
@@ -3361,9 +4136,9 @@ def test_whoami_sorts_the_scope_it_reports(client, monkeypatch):
     monkeypatch.setattr(
         identity, "resolve",
         lambda auth: identity.Identity(actor="fixed", kind="agent",
-                                       products=("vivy", "constance", "hollis")))
+                                       products=("fennick", "marlow", "bramwell")))
     body = client.get("/whoami", headers=_h()).json()
-    assert body["products"] == ["constance", "hollis", "vivy"]
+    assert body["products"] == ["bramwell", "fennick", "marlow"]
 
 
 # --- the transition logs, which were written and never read back ----------------
@@ -3382,7 +4157,7 @@ def test_an_item_carries_its_transition_log(client):
     park, escalate and link-pr, and was read back by nothing."""
     _event("issue_events", item_id="issue_v1", actor="ops-mcp", from_state=None,
            to_state="open", at="2026-08-01 12:00:00.000000")
-    _event("issue_events", item_id="issue_v1", actor="co-vivy", from_state="open",
+    _event("issue_events", item_id="issue_v1", actor="co-fennick", from_state="open",
            to_state="fixed", note="shipped in #12", at="2026-08-02 12:00:00.000000")
     events = client.get("/items/issue_v1", headers=_h()).json()["events"]
     assert [(e["from_state"], e["to_state"]) for e in events] == [
@@ -3511,7 +4286,8 @@ def test_search_accepts_the_status_all_sentinel(kb, client):
 
 
 @pytest.mark.parametrize("path", [
-    "/signals", "/signals/facets", "/signals/pr-state", "/signals/ci-capture"])
+    "/signals", "/signals/facets", "/signals/pr-state", "/signals/ci-capture",
+    "/signals/ci-workflow-runs", "/signals/pr-merged-counts"])
 def test_a_slow_signals_read_runs_off_the_event_loop(client, monkeypatch, path):
     """Each of these reads scans the whole signal set, 60 to 400ms on the
     live vault on 2026-10-12, and on the event loop one in-flight call raised
@@ -3537,3 +4313,92 @@ def test_a_slow_signals_read_runs_off_the_event_loop(client, monkeypatch, path):
     assert r.status_code == 200, r.text
     assert opened_on_loop, "the route opened no connection through store.connect"
     assert not any(opened_on_loop), f"{path} opened a connection on the event loop"
+
+
+def _seed_handoff_signal(sid="sig_handoff", product="fennick"):
+    _insert("signals", ("id", "product", "kind", "body", "privacy_class",
+                        "ingested_at"),
+            [(sid, product, "handoff", "a handoff note", "internal", TIE_TS)])
+
+
+# One entry per route this file's own fixture schema can exercise: a label,
+# and a request against `client`. `GET /people/*`, `POST /review-records`,
+# `PUT /ledgers` and `POST /reference/admission` also moved a `projects`
+# call off the loop (CQ·243), but each reads a table (`person_products`,
+# `review_records`, `ledgers`, or the separate Reference Room index) this
+# file's `_build_client` does not create, so exercising them would mean
+# building out schema this file deliberately keeps minimal — they are
+# covered by the full suite's own routes for those tables instead, run
+# under `PROJECTS_JSON` unset (table mode) alongside this file.
+_PROJECTS_READ_ROUTES = [
+    ("courses-list", lambda c: c.get("/courses?product=fennick", headers=_h(WIDE))),
+    ("courses-create", lambda c: c.post(
+        "/courses", json={"product": "bramwell", "title": "a new route"},
+        headers=_h(WIDE))),
+    ("items-create", lambda c: c.post(
+        "/items", json={"product": "fennick", "title": "a new item"},
+        headers=_h(WIDE))),
+    ("items-move", lambda c: c.post(
+        "/items/issue_v1/product", json={"product": "marlow"}, headers=_h(WIDE))),
+    ("signal-get", lambda c: c.get("/signals/sig_handoff", headers=_h(SYSTEM))),
+    ("signal-blob", lambda c: c.get("/signals/sig_handoff/blob", headers=_h(SYSTEM))),
+]
+
+
+@pytest.mark.parametrize("label,make_request", _PROJECTS_READ_ROUTES,
+                         ids=[r[0] for r in _PROJECTS_READ_ROUTES])
+def test_a_projects_read_runs_off_the_event_loop(client, monkeypatch, label,
+                                                 make_request):
+    """Every call into `projects` now opens a vault connection to check the
+    registry's freshness signature (CQ·243, platform/decisions/0098's
+    2026-10-25 amendment moved the registry from a file to the Chart House
+    table) — the same stall CQ·76 removed from the signal reads above, so
+    it has to run off the event loop too.
+
+    **Recorded at `projects._table_signature`/`_read_table_registry`
+    themselves, not at `store.connect`** (contrast the test above): several
+    of these routes still open their OWN, unrelated connection directly on
+    the loop for their own query, which `store.connect`-level recording
+    cannot tell apart from a `projects` read and would flag as a false
+    failure. Recording at the point the registry is actually read measures
+    only what this test is about.
+
+    **Forced into table mode** (`REGISTRY_PATH = None`), regardless of
+    whatever `PROJECTS_JSON` the process happens to carry, so this test
+    does not go quietly vacuous in an environment where that variable is
+    set — unlike a file-mode read, which costs a cached `stat()` and never
+    reaches either recorded function at all.
+    """
+    seed_handoff_signal = "signal" in label
+    if seed_handoff_signal:
+        _seed_handoff_signal()
+
+    seen: list[bool] = []
+
+    def _record(real):
+        def wrapper(*args, **kwargs):
+            try:
+                asyncio.get_running_loop()
+                seen.append(True)
+            except RuntimeError:
+                seen.append(False)
+            return real(*args, **kwargs)
+        return wrapper
+
+    monkeypatch.setattr(projects, "_table_signature",
+                        _record(projects._table_signature))
+    monkeypatch.setattr(projects, "_read_table_registry",
+                        _record(projects._read_table_registry))
+    monkeypatch.setattr(projects, "REGISTRY_PATH", None)
+    projects.reload()
+    try:
+        r = make_request(client)
+    finally:
+        projects.reload()
+    # `WritesDisabled` is a real, expected 503 here (the Library's writes
+    # are off during the shadow period) — the resolve this test is about
+    # already ran by the time a write route reaches it, so it counts as a
+    # route this test exercised rather than a crash.
+    assert r.status_code != 500, r.text
+    assert seen, f"{label} made no projects read"
+    assert not any(seen), f"{label} read the project registry on the event loop"

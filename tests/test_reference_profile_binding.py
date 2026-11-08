@@ -33,7 +33,7 @@ import reference
 import store
 
 AGENT = "agent-token-unbound"
-BOUND_VIVY = "agent-token-bound-vivy"
+BOUND_FENNICK = "agent-token-bound-fennick"
 BOUND_COMPANY = "agent-token-bound-company"
 BOUND_EMPTY = "agent-token-bound-empty"
 BOUND_UNRESOLVED = "agent-token-bound-unresolved"
@@ -47,19 +47,19 @@ PHRASE = "zylofoam gasket"
 # project/kind/status/audience is chosen so the two profiles below each have
 # both a match and a non-match to narrow away.
 DOCS = [
-    ("vivy/agents/coder", "agent", "vivy", "current", ["daytime"], ["widgets"]),
-    ("vivy/agents/reviewer", "agent", "vivy", "current", [], ["widgets"]),
-    ("vivy/agents/draft-thing", "agent", "vivy", "draft", [], ["widgets"]),
-    # Archived: excluded by the vivy/daytime profile's own rule (no explicit
+    ("fennick/agents/coder", "agent", "fennick", "current", ["daytime"], ["widgets"]),
+    ("fennick/agents/reviewer", "agent", "fennick", "current", [], ["widgets"]),
+    ("fennick/agents/draft-thing", "agent", "fennick", "draft", [], ["widgets"]),
+    # Archived: excluded by the fennick/daytime profile's own rule (no explicit
     # `status`, so it defaults to `reference.DEFAULT_STATUSES`) even though
     # its project and kind match.
-    ("vivy/agents/archived-thing", "agent", "vivy", "archived", [], ["widgets"]),
-    # Right kind, wrong project — narrowed away by the vivy/daytime profile's
+    ("fennick/agents/archived-thing", "agent", "fennick", "archived", [], ["widgets"]),
+    # Right kind, wrong project — narrowed away by the fennick/daytime profile's
     # `project` rule.
-    ("hollis/agents/other", "agent", "hollis", "current", [], ["widgets"]),
-    # Right project, wrong kind — narrowed away by the vivy/daytime profile's
+    ("bramwell/agents/other", "agent", "bramwell", "current", [], ["widgets"]),
+    # Right project, wrong kind — narrowed away by the fennick/daytime profile's
     # `kind` rule.
-    ("vivy/skills/dataviz", "skill", "vivy", "current", [], ["widgets"]),
+    ("fennick/skills/dataviz", "skill", "fennick", "current", [], ["widgets"]),
     # The company/contractor profile's three cases: right audience, and two
     # kinds of wrong (a different audience; the right audience under the
     # wrong project is not represented since this is the only project it
@@ -88,6 +88,7 @@ def client(tmp_path, monkeypatch):
         CREATE TABLE roster_agents (
             id INTEGER PRIMARY KEY,
             name TEXT NOT NULL UNIQUE,
+            source_doc TEXT,
             created_at TEXT NOT NULL,
             created_by TEXT NOT NULL,
             updated_at TEXT NOT NULL,
@@ -142,12 +143,12 @@ def client(tmp_path, monkeypatch):
     tokens = tmp_path / "api-tokens.json"
     tokens.write_text(json.dumps({
         AGENT: {"name": "unbound-agent", "products": ["*"]},
-        BOUND_VIVY: {"name": "vivy-crew", "products": ["*"],
-                    "profile": "vivy/daytime"},
+        BOUND_FENNICK: {"name": "fennick-crew", "products": ["*"],
+                    "profile": "fennick/daytime"},
         BOUND_COMPANY: {"name": "company-crew", "products": ["*"],
                         "profile": "company/contractor"},
         BOUND_EMPTY: {"name": "empty-crew", "products": ["*"],
-                     "profile": "vivy/empty"},
+                     "profile": "fennick/empty"},
         BOUND_UNRESOLVED: {"name": "unresolved-crew", "products": ["*"],
                            "profile": "nope/nope"},
     }))
@@ -158,13 +159,13 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(store, "WRITES_ENABLED", True)
 
     crew_registry.profile_put(
-        ORCHESTRATOR, "vivy", "daytime",
-        [{"kind": "agent", "project": ["vivy"]}], [])
+        ORCHESTRATOR, "fennick", "daytime",
+        [{"kind": "agent", "project": ["fennick"]}], [])
     crew_registry.profile_put(
         ORCHESTRATOR, "company", "contractor",
         [{"kind": "reference", "project": ["company"],
           "audience_contains": ["contractor"]}], [])
-    crew_registry.profile_put(ORCHESTRATOR, "vivy", "empty", [], [])
+    crew_registry.profile_put(ORCHESTRATOR, "fennick", "empty", [], [])
     return TestClient(libapp.app)
 
 
@@ -196,7 +197,7 @@ ALL_IDS = {d[0] for d in DOCS}
 
 
 @pytest.mark.parametrize("token, project, variant", [
-    (BOUND_VIVY, "vivy", "daytime"),
+    (BOUND_FENNICK, "fennick", "daytime"),
     (BOUND_COMPANY, "company", "contractor"),
 ])
 def test_listing_reach_equals_resolve(client, token, project, variant):
@@ -209,7 +210,7 @@ def test_listing_reach_equals_resolve(client, token, project, variant):
 
 
 @pytest.mark.parametrize("token, project, variant", [
-    (BOUND_VIVY, "vivy", "daytime"),
+    (BOUND_FENNICK, "fennick", "daytime"),
     (BOUND_COMPANY, "company", "contractor"),
 ])
 def test_search_reach_equals_resolve(client, token, project, variant):
@@ -222,7 +223,7 @@ def test_search_reach_equals_resolve(client, token, project, variant):
 
 
 @pytest.mark.parametrize("token, project, variant", [
-    (BOUND_VIVY, "vivy", "daytime"),
+    (BOUND_FENNICK, "fennick", "daytime"),
     (BOUND_COMPANY, "company", "contractor"),
 ])
 def test_all_vault_search_reach_equals_resolve(client, token, project, variant):
@@ -235,7 +236,7 @@ def test_all_vault_search_reach_equals_resolve(client, token, project, variant):
 
 
 @pytest.mark.parametrize("token, project, variant", [
-    (BOUND_VIVY, "vivy", "daytime"),
+    (BOUND_FENNICK, "fennick", "daytime"),
     (BOUND_COMPANY, "company", "contractor"),
 ])
 def test_single_document_reach_equals_resolve(client, token, project, variant):
@@ -250,7 +251,7 @@ def test_single_document_reach_equals_resolve(client, token, project, variant):
 
 
 @pytest.mark.parametrize("token, project, variant", [
-    (BOUND_VIVY, "vivy", "daytime"),
+    (BOUND_FENNICK, "fennick", "daytime"),
     (BOUND_COMPANY, "company", "contractor"),
 ])
 def test_checkout_status_reach_equals_resolve(client, token, project, variant):
@@ -265,7 +266,7 @@ def test_checkout_status_reach_equals_resolve(client, token, project, variant):
 
 
 @pytest.mark.parametrize("token, project, variant", [
-    (BOUND_VIVY, "vivy", "daytime"),
+    (BOUND_FENNICK, "fennick", "daytime"),
     (BOUND_COMPANY, "company", "contractor"),
 ])
 def test_checkout_post_reach_equals_resolve(client, token, project, variant):
@@ -281,7 +282,7 @@ def test_checkout_post_reach_equals_resolve(client, token, project, variant):
 
 def test_topics_reach_matches_the_scoped_corpus(client):
     """`GET /reference/topics` counts only documents the bound profile
-    selects — the `widgets` topic lives only on `vivy/agents/*` documents,
+    selects — the `widgets` topic lives only on `fennick/agents/*` documents,
     none of which the company profile's own scope ever reaches."""
     r = client.get("/reference/topics", headers=_h(BOUND_COMPANY))
     assert r.status_code == 200
@@ -289,7 +290,7 @@ def test_topics_reach_matches_the_scoped_corpus(client):
     assert "widgets" not in topics
     assert "policy" in topics
 
-    r = client.get("/reference/topics", headers=_h(BOUND_VIVY))
+    r = client.get("/reference/topics", headers=_h(BOUND_FENNICK))
     assert r.status_code == 200
     topics = {t["topic"] for t in r.json()["topics"]}
     assert "widgets" in topics
@@ -304,37 +305,37 @@ def test_an_out_of_scope_id_404s_identically_to_a_missing_id(client):
     enumeration oracle is a document outside the scope reading differently
     from one that does not exist at all."""
     missing_body = client.get("/reference/documents/does/not/exist",
-                              headers=_h(BOUND_VIVY)).json()
+                              headers=_h(BOUND_FENNICK)).json()
     for path in ("/reference/documents/{}", "/reference/documents/{}/checkout"):
         out_of_scope = client.get(path.format("company/reference/contractor-ok"),
-                                  headers=_h(BOUND_VIVY))
-        missing = client.get(path.format("does/not/exist"), headers=_h(BOUND_VIVY))
+                                  headers=_h(BOUND_FENNICK))
+        missing = client.get(path.format("does/not/exist"), headers=_h(BOUND_FENNICK))
         assert out_of_scope.status_code == missing.status_code == 404
         assert out_of_scope.json() == missing.json() == missing_body
 
     out_of_scope_post = client.post(
         "/reference/documents/company/reference/contractor-ok/checkout",
-        json={}, headers=_h(BOUND_VIVY))
+        json={}, headers=_h(BOUND_FENNICK))
     missing_post = client.post("/reference/documents/does/not/exist/checkout",
-                               json={}, headers=_h(BOUND_VIVY))
+                               json={}, headers=_h(BOUND_FENNICK))
     assert out_of_scope_post.status_code == missing_post.status_code == 404
     assert out_of_scope_post.json() == missing_post.json()
 
 
 def test_a_filter_outside_scope_narrows_to_nothing_rather_than_widening(client):
     """`project=company&kind=reference` on a credential bound to the
-    vivy/daytime profile, which never selects company's `reference` kind —
+    fennick/daytime profile, which never selects company's `reference` kind —
     the filter must not reach past the profile's own ceiling."""
     r = client.get("/reference/documents",
                    params={"project": "company", "kind": "reference"},
-                   headers=_h(BOUND_VIVY))
+                   headers=_h(BOUND_FENNICK))
     assert r.status_code == 200
     assert r.json()["documents"] == []
     assert r.json()["total"] == 0
 
     r = client.get("/reference/search",
                    params={"q": PHRASE, "project": "company", "kind": "reference"},
-                   headers=_h(BOUND_VIVY))
+                   headers=_h(BOUND_FENNICK))
     assert r.status_code == 200
     assert r.json()["documents"] == []
 
@@ -379,7 +380,7 @@ def test_an_unbound_credential_is_unaffected(client):
     listing = client.get("/reference/documents", headers=_h(AGENT))
     assert listing.status_code == 200
     assert {d["id"] for d in listing.json()["documents"]} == ALL_IDS - {
-        "vivy/agents/archived-thing"}  # excluded by the default status filter
+        "fennick/agents/archived-thing"}  # excluded by the default status filter
 
     search = client.get("/reference/search", params={"q": PHRASE, "limit": 100},
                         headers=_h(AGENT))

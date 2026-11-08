@@ -55,11 +55,11 @@ def client(tmp_path, monkeypatch, vector_index):
     tokens.write_text(json.dumps({
         SYSTEM: {"name": "system", "products": ["*"], "kind": "system"},
         AGENT: {"name": "an-agent", "products": ["*"]},
-        NARROW: {"name": "vivy-only", "products": ["vivy"], "kind": "system"}}))
+        NARROW: {"name": "fennick-only", "products": ["fennick"], "kind": "system"}}))
     registry = tmp_path / "projects.json"
     registry.write_text(json.dumps({
         "_meta": {}, "library": {"repos": ["library"]},
-        "vivy": {"repos": ["vivy"]}}))
+        "fennick": {"repos": ["fennick"]}}))
 
     monkeypatch.setattr(store, "DB_PATH", db)
     monkeypatch.setattr(identity, "TOKENS", tokens)
@@ -76,7 +76,8 @@ REPO_IDENTITY = "github:convivy/library"
 def seed(*, repo_identity=REPO_IDENTITY, product="library", pr=None,
          reviewed_ref="a" * 40, role="reviewer", run_id=None, verdict="APPROVE",
          findings=None, prose="", paths=None, doc_ids=None, item_ids=None,
-         auth="unverified", auth_reason="no run", source_comment_id=None):
+         auth="unverified", auth_reason="no run", verdict_bound=False,
+         source_comment_id=None):
     """One review record, written through the real store function —
     `write_review_record`'s own idempotent-or-supersede rule applies, so
     calling this twice on the same (repo_identity, run_id-or-content, role,
@@ -86,7 +87,7 @@ def seed(*, repo_identity=REPO_IDENTITY, product="library", pr=None,
         "reviewed_ref": reviewed_ref, "role": role, "run_id": run_id,
         "verdict": verdict, "findings": findings or [], "prose": prose,
         "paths": paths or [], "doc_ids": doc_ids or [], "item_ids": item_ids or [],
-        "auth": auth, "auth_reason": auth_reason,
+        "auth": auth, "auth_reason": auth_reason, "verdict_bound": verdict_bound,
         "source_comment_id": source_comment_id,
     }
     return store.write_review_record(row)

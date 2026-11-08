@@ -34,7 +34,7 @@ BASE_ROW = {
     "pr": 1, "reviewed_ref": "deadbeef", "role": "reviewer", "run_id": "run-1",
     "identity_key": "run-1", "verdict": "APPROVE", "findings": "[]", "prose": "",
     "paths": "[]", "doc_ids": "[]", "item_ids": "[]", "auth": "run-verified",
-    "auth_reason": None, "content_sha": "a" * 64, "version": 1,
+    "auth_reason": None, "verdict_bound": 1, "content_sha": "a" * 64, "version": 1,
     "source_comment_id": None, "signal_id": None,
     "created_at": "2026-01-01 00:00:00", "updated_at": "2026-01-01 00:00:00",
 }
@@ -52,8 +52,9 @@ def insert(conn, **over):
 
 def test_the_migration_creates_review_records_at_head(tmp_path):
     """Run at `head`, not at `468a1789d29e` alone — `e4894432e1aa` adds
-    `auth_reason` on top of this table, and this is the shape a caller of
-    this repo's `head` actually sees."""
+    `auth_reason` and `495cb5bcc41f` adds `verdict_bound` on top of this
+    table, and this is the shape a caller of this repo's `head` actually
+    sees."""
     db = upgraded(tmp_path)
     conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     try:
@@ -64,8 +65,9 @@ def test_the_migration_creates_review_records_at_head(tmp_path):
     assert columns == {
         "id", "repo_identity", "product", "pr", "reviewed_ref", "role",
         "run_id", "identity_key", "verdict", "findings", "prose", "paths",
-        "doc_ids", "item_ids", "auth", "auth_reason", "content_sha", "version",
-        "source_comment_id", "signal_id", "created_at", "updated_at"}
+        "doc_ids", "item_ids", "auth", "auth_reason", "verdict_bound",
+        "content_sha", "version", "source_comment_id", "signal_id",
+        "created_at", "updated_at"}
 
 
 def test_the_migration_creates_review_record_versions_at_head(tmp_path):
@@ -79,7 +81,8 @@ def test_the_migration_creates_review_record_versions_at_head(tmp_path):
     assert columns == {
         "record_id", "version", "product", "pr", "verdict", "findings",
         "prose", "paths", "doc_ids", "item_ids", "auth", "auth_reason",
-        "content_sha", "run_id", "source_comment_id", "signal_id", "written_at"}
+        "verdict_bound", "content_sha", "run_id", "source_comment_id",
+        "signal_id", "written_at"}
 
 
 def test_the_unique_key_refuses_an_exact_duplicate(tmp_path):
@@ -103,7 +106,7 @@ def test_the_unique_key_accepts_a_row_differing_in_repo_identity(tmp_path):
     conn = sqlite3.connect(db)
     try:
         insert(conn)
-        insert(conn, id="rvw_b", repo_identity="github:convivy/selector")
+        insert(conn, id="rvw_b", repo_identity="github:convivy/thistle")
     finally:
         conn.close()
 
@@ -269,8 +272,8 @@ def test_a_version_carries_every_record_column_but_the_key_and_record_only_ones(
         assert actual_columns == {
             "record_id", "version", "product", "pr", "verdict", "findings",
             "prose", "paths", "doc_ids", "item_ids", "auth", "auth_reason",
-            "content_sha", "run_id", "source_comment_id", "signal_id",
-            "written_at"}
+            "verdict_bound", "content_sha", "run_id", "source_comment_id",
+            "signal_id", "written_at"}
 
         insert(conn)
         carried_cols = [c for c in BASE_ROW

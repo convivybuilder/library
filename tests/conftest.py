@@ -308,3 +308,36 @@ def ledger_tables():
         conn.commit()
         conn.close()
     return build
+
+
+@pytest.fixture
+def kb_registry(tmp_path, monkeypatch):
+    """A synthetic project registry naming `library` as a central KB project
+    and `platform` as a scope, with `reference_admission`'s import-time
+    `_BASELINE`/`ID_PATTERN` recomputed from it.
+
+    **The baseline is computed once, at import, from whatever registry the
+    machine has.** On the machine that serves the Library that is the real
+    `<root>/install/projects.json`; in CI there is none, the baseline
+    is empty, and every frontmatter naming a project is refused (library#307's
+    first CI run: 26 failures that passed locally). Tests that validate
+    frontmatter use this so they read the same registry everywhere.
+    """
+    import json
+
+    import projects
+    import reference_admission
+
+    path = tmp_path / "kb-registry.json"
+    path.write_text(json.dumps({"_meta": {}, "library": {"kb": "central"},
+                                "_scopes": {"platform": {}}}))
+    monkeypatch.setattr(projects, "REGISTRY_PATH", path)
+    projects.reload()
+    baseline = reference_admission._registry_projects() or frozenset()
+    monkeypatch.setattr(reference_admission, "_BASELINE", baseline)
+    monkeypatch.setattr(reference_admission, "ID_PATTERN",
+                        reference_admission.id_pattern_for(baseline))
+    yield
+    # Cleared while `REGISTRY_PATH` still points here, so the next test's
+    # first read repopulates from whatever `monkeypatch` restores.
+    projects.reload()

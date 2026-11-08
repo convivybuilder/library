@@ -26,11 +26,11 @@ import store
 
 REPO = Path(__file__).resolve().parent.parent
 WIDE = "agent-token-wide"
-VIVY = "agent-token-vivy"
+FENNICK = "agent-token-fennick"
 TWO = "agent-token-two"
 REGISTRY = {
-    "vivy": {"aliases": ["viv"], "repos": ["vivy-app"]},
-    "constance": {"aliases": [], "repos": []},
+    "fennick": {"aliases": ["viv"], "repos": ["fennick-app"]},
+    "marlow": {"aliases": [], "repos": []},
 }
 T0 = "2026-08-01 12:00:00.000000"
 
@@ -64,30 +64,30 @@ def client(schema, tmp_path, monkeypatch):
     conn = sqlite3.connect(db)
     conn.executemany(
         "INSERT INTO corrections_queues (id, product, created_at) VALUES (?,?,?)",
-        [("cq_vivy", "vivy", T0), ("cq_constance", "constance", T0)])
-    # vivy: E1 with two sub-items and a sub-epic E2 holding one of its own.
-    _item(conn, "e1", "vivy", "E1", type_="epic")
-    _item(conn, "w1", "vivy", "E1·1", parent="e1")
-    _item(conn, "w2", "vivy", "E1·2", parent="e1")
-    _item(conn, "e2", "vivy", "E2", type_="epic", parent="e1")
-    _item(conn, "w3", "vivy", "E2·1", parent="e2")
-    _item(conn, "c1", "vivy", "CQ·1", parent="cq_vivy")
-    # constance already has an E1 and a CQ·1, so keeping keys would collide.
-    _item(conn, "ce1", "constance", "E1", type_="epic")
-    _item(conn, "cc1", "constance", "CQ·1", parent="cq_constance")
+        [("cq_fennick", "fennick", T0), ("cq_marlow", "marlow", T0)])
+    # fennick: E1 with two sub-items and a sub-epic E2 holding one of its own.
+    _item(conn, "e1", "fennick", "E1", type_="epic")
+    _item(conn, "w1", "fennick", "E1·1", parent="e1")
+    _item(conn, "w2", "fennick", "E1·2", parent="e1")
+    _item(conn, "e2", "fennick", "E2", type_="epic", parent="e1")
+    _item(conn, "w3", "fennick", "E2·1", parent="e2")
+    _item(conn, "c1", "fennick", "CQ·1", parent="cq_fennick")
+    # marlow already has an E1 and a CQ·1, so keeping keys would collide.
+    _item(conn, "ce1", "marlow", "E1", type_="epic")
+    _item(conn, "cc1", "marlow", "CQ·1", parent="cq_marlow")
     conn.executemany(
         "INSERT INTO issue_item_key_counters (scope_kind, scope_id, next_value) "
         "VALUES (?,?,?)",
-        [("epic", "vivy", 3), ("item", "e1", 3), ("item", "e2", 2),
-         ("correction", "vivy", 2), ("epic", "constance", 2),
-         ("correction", "constance", 2)])
+        [("epic", "fennick", 3), ("item", "e1", 3), ("item", "e2", 2),
+         ("correction", "fennick", 2), ("epic", "marlow", 2),
+         ("correction", "marlow", 2)])
     conn.commit()
     conn.close()
     tokens = tmp_path / "api-tokens.json"
     tokens.write_text(json.dumps({
         WIDE: {"name": "wide-agent", "products": ["*"]},
-        VIVY: {"name": "vivy-agent", "products": ["vivy"]},
-        TWO: {"name": "two-agent", "products": ["vivy", "constance"]},
+        FENNICK: {"name": "fennick-agent", "products": ["fennick"]},
+        TWO: {"name": "two-agent", "products": ["fennick", "marlow"]},
     }))
     registry = tmp_path / "projects.json"
     registry.write_text(json.dumps(REGISTRY))
@@ -121,12 +121,12 @@ def _rows():
 
 
 def test_an_epic_moves_with_its_whole_subtree_and_new_keys(client):
-    r = _move(client, "e1", "constance")
+    r = _move(client, "e1", "marlow")
     assert r.status_code == 200, r.text
     rows = _rows()
     for mid in ("e1", "w1", "w2", "e2", "w3"):
-        assert rows[mid]["product"] == "constance"
-    # Epics take the next numbers in constance; sub-items keep their suffix
+        assert rows[mid]["product"] == "marlow"
+    # Epics take the next numbers in marlow; sub-items keep their suffix
     # under their epic's new key.
     assert {m: rows[m]["item_key"] for m in ("e1", "w1", "w2", "e2", "w3")} == {
         "e1": "E2", "w1": "E2·1", "w2": "E2·2", "e2": "E3", "w3": "E3·1"}
@@ -135,34 +135,34 @@ def test_an_epic_moves_with_its_whole_subtree_and_new_keys(client):
     assert {(m["id"], m["old_key"], m["new_key"]) for m in r.json()["moved"]} == {
         ("e1", "E1", "E2"), ("w1", "E1·1", "E2·1"), ("w2", "E1·2", "E2·2"),
         ("e2", "E2", "E3"), ("w3", "E2·1", "E3·1")}
-    # Untouched: the item left in vivy and constance's own items.
-    assert rows["c1"]["product"] == "vivy"
+    # Untouched: the item left in fennick and marlow's own items.
+    assert rows["c1"]["product"] == "fennick"
     assert rows["ce1"]["item_key"] == "E1"
 
 
 def test_every_moved_item_records_the_move_in_its_history(client):
-    assert _move(client, "e1", "constance").status_code == 200
+    assert _move(client, "e1", "marlow").status_code == 200
     conn = sqlite3.connect(store.DB_PATH)
     notes = dict(conn.execute("SELECT item_id, note FROM issue_events"))
     conn.close()
     assert set(notes) >= {"e1", "w1", "w2", "e2", "w3"}
-    assert "'vivy' to 'constance'" in notes["e1"]
+    assert "'fennick' to 'marlow'" in notes["e1"]
     assert "'E1' → 'E2'" in notes["e1"]
 
 
 def test_a_correction_lands_in_the_new_products_queue_with_a_new_key(client):
-    r = _move(client, "c1", "constance")
+    r = _move(client, "c1", "marlow")
     assert r.status_code == 200, r.text
     row = _rows()["c1"]
     assert (row["product"], row["parent_id"], row["item_key"]) == (
-        "constance", "cq_constance", "CQ·2")
+        "marlow", "cq_marlow", "CQ·2")
 
 
 def test_a_sub_item_moved_alone_leaves_its_epic_for_the_new_queue(client):
-    r = _move(client, "w1", "constance")
+    r = _move(client, "w1", "marlow")
     assert r.status_code == 200, r.text
     row = _rows()["w1"]
-    assert (row["parent_id"], row["item_key"]) == ("cq_constance", "CQ·2")
+    assert (row["parent_id"], row["item_key"]) == ("cq_marlow", "CQ·2")
 
 
 def test_the_new_product_resolves_through_the_registry(client):
@@ -172,11 +172,11 @@ def test_the_new_product_resolves_through_the_registry(client):
 
 
 def test_the_caller_must_hold_both_products(client):
-    # vivy-only: the destination is out of scope, answered as not found.
-    assert _move(client, "c1", "constance", token=VIVY).status_code == 404
+    # fennick-only: the destination is out of scope, answered as not found.
+    assert _move(client, "c1", "marlow", token=FENNICK).status_code == 404
     # ...and the source, for an item in a product the caller cannot see.
-    assert _move(client, "cc1", "vivy", token=VIVY).status_code == 404
-    assert _rows()["c1"]["product"] == "vivy"
+    assert _move(client, "cc1", "fennick", token=FENNICK).status_code == 404
+    assert _rows()["c1"]["product"] == "fennick"
 
 
 def test_another_holders_lease_inside_the_subtree_refuses_the_whole_move(client):
@@ -187,10 +187,10 @@ def test_another_holders_lease_inside_the_subtree_refuses_the_whole_move(client)
         (_now(), _now()))
     conn.commit()
     conn.close()
-    r = _move(client, "e1", "constance")
+    r = _move(client, "e1", "marlow")
     assert r.status_code == 409 and r.json()["reason"] == "held"
     assert "someone-else" in r.json()["error"]
-    assert all(row["product"] == "vivy" for k, row in _rows().items()
+    assert all(row["product"] == "fennick" for k, row in _rows().items()
                if k in ("e1", "w1", "w2", "e2", "w3"))
 
 
@@ -208,12 +208,12 @@ def test_a_lease_beneath_the_item_outside_the_callers_scope_withholds_its_holder
         (_now(), _now()))
     conn.commit()
     conn.close()
-    r = _move(client, "e1", "constance", token=TWO)
+    r = _move(client, "e1", "marlow", token=TWO)
     assert r.status_code == 409 and r.json()["reason"] == "held"
     assert "someone-else" not in r.text
     assert "lease" not in r.json()
     # A caller who can see that product is told who holds it.
-    r = _move(client, "e1", "constance")
+    r = _move(client, "e1", "marlow")
     assert r.status_code == 409 and "someone-else" in r.json()["error"]
 
 
@@ -222,10 +222,10 @@ def test_found_during_that_would_cross_products_refuses_by_name(client):
     conn.execute("UPDATE issue_items SET found_during = 'e1' WHERE id = 'c1'")
     conn.commit()
     conn.close()
-    r = _move(client, "e1", "constance")
+    r = _move(client, "e1", "marlow")
     assert r.status_code == 409
     assert r.json()["left_behind_naming_a_moved_epic"] == ["c1"]
-    r = _move(client, "c1", "constance")
+    r = _move(client, "c1", "marlow")
     assert r.status_code == 409
     assert r.json()["moving_away_from_their_epic"] == ["c1"]
 
@@ -235,11 +235,11 @@ def test_an_approved_epic_leaves_the_old_products_course(client):
     conn.execute("UPDATE issue_items SET maturity = 'approved' WHERE id = 'e1'")
     conn.execute(
         "INSERT INTO courses (id, product, title, entries, status, version, "
-        "created_by, created_at) VALUES ('course_v', 'vivy', 'Route', ?, "
+        "created_by, created_at) VALUES ('course_v', 'fennick', 'Route', ?, "
         "'live', 1, 't', ?)", (json.dumps(["e1"]), T0))
     conn.commit()
     conn.close()
-    r = _move(client, "e1", "constance")
+    r = _move(client, "e1", "marlow")
     assert r.status_code == 200, r.text
     assert r.json()["left_courses"] == [
         {"item_id": "e1", "course_id": "course_v", "position": 1}]
@@ -254,12 +254,12 @@ def test_a_terminal_item_does_not_move(client):
     conn.execute("UPDATE issue_items SET state = 'fixed' WHERE id = 'c1'")
     conn.commit()
     conn.close()
-    assert _move(client, "c1", "constance").status_code == 409
+    assert _move(client, "c1", "marlow").status_code == 409
 
 
 def test_the_epic_retype_count_stays_same_product_after_a_move(client):
     """The invariant the move exists to keep: no parent edge crosses products."""
-    assert _move(client, "e1", "constance").status_code == 200
+    assert _move(client, "e1", "marlow").status_code == 200
     rows = _rows()
     for row in rows.values():
         parent = rows.get(row["parent_id"])
@@ -302,14 +302,14 @@ def test_a_move_over_another_crews_lease_is_refused_with_its_name(
     crew took it, and the whole subtree moved out from under it."""
     _crewed_tokens(tmp_path, monkeypatch)
     _plant_lease("e2", "mover", "crew-alpha")
-    r = _move(client, "e1", "constance", owner="mover", token="crew-b-token")
+    r = _move(client, "e1", "marlow", owner="mover", token="crew-b-token")
     assert r.status_code == 409
     assert r.json()["reason"] == "held"
-    assert _rows()["e1"]["product"] == "vivy"
+    assert _rows()["e1"]["product"] == "fennick"
 
 
 def test_a_move_over_its_own_crews_lease_proceeds(client, tmp_path, monkeypatch):
     _crewed_tokens(tmp_path, monkeypatch)
     _plant_lease("e2", "mover", "crew-alpha")
-    r = _move(client, "e1", "constance", owner="mover", token="crew-a-token")
+    r = _move(client, "e1", "marlow", owner="mover", token="crew-a-token")
     assert r.status_code == 200, r.text

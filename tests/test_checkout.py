@@ -30,13 +30,13 @@ import protocol
 import reference
 import store
 
-AGENT = "agent-token-vivy"
+AGENT = "agent-token-fennick"
 WIDE = "agent-token-wide"
 NOREF = "agent-token-noref"
 # Every token this file mints carries no `profile`, so this is what `_identify`
 # resolves AGENT and WIDE to for `_call_slip_grant`'s purposes: unbound,
 # `_persona_model`'s scope check a no-op (issue_01M35QG0VANA5P1XE3PH6A7PS4).
-UNBOUND = identity.Identity(actor="vivy-agent", kind="agent")
+UNBOUND = identity.Identity(actor="fennick-agent", kind="agent")
 
 
 def _ts(**delta):
@@ -78,7 +78,7 @@ def client(tmp_path, monkeypatch, vector_index, ledger_tables):
             blocking_root_id TEXT, blocking_holder TEXT, blocks_by TEXT, blocking_taken_for TEXT);
         CREATE TABLE call_slips (
             id TEXT PRIMARY KEY, item_id TEXT, product TEXT, claim_owner_label TEXT,
-            issued_at TEXT, expires_at TEXT, grant_json TEXT);
+            issued_at TEXT, expires_at TEXT, grant_json TEXT, crew TEXT);
         CREATE TABLE issue_comments (
             id INTEGER PRIMARY KEY AUTOINCREMENT, item_id TEXT, actor TEXT,
             kind TEXT, body TEXT, run_id TEXT, at TEXT);
@@ -91,32 +91,37 @@ def client(tmp_path, monkeypatch, vector_index, ledger_tables):
     conn.executemany(
         "INSERT INTO issue_items (id, product, title, type, state, needs, "
         "created_by_kind, parent_id, created_at, refs) VALUES (?,?,?,?,?,?,?,?,?,?)",
-        [("top_epic", "vivy", "Top epic", "epic", "open", "agent", "agent",
+        [("top_epic", "fennick", "Top epic", "epic", "open", "agent", "agent",
           None, _ts(days=3), "{}"),
-         ("sub_epic", "vivy", "Sub epic", "epic", "open", "agent", "agent",
+         ("sub_epic", "fennick", "Sub epic", "epic", "open", "agent", "agent",
           "top_epic", _ts(days=3), "{}"),
-         ("deep_task", "vivy", "Deep task", "task", "open", "agent", "agent",
+         ("deep_task", "fennick", "Deep task", "task", "open", "agent", "agent",
           "sub_epic", _ts(days=2), "{}"),
-         ("task_a", "vivy", "Task A", "task", "open", "agent", "agent",
+         ("task_a", "fennick", "Task A", "task", "open", "agent", "agent",
           "top_epic", _ts(days=2), "{}"),
-         ("task_b", "vivy", "Task B", "task", "open", "agent", "agent",
+         ("task_b", "fennick", "Task B", "task", "open", "agent", "agent",
           "top_epic", _ts(days=2), "{}"),
-         ("lone", "vivy", "Parentless", "task", "open", "agent", "agent",
+         ("lone", "fennick", "Parentless", "task", "open", "agent", "agent",
           None, _ts(days=1), "{}"),
-         ("op_task", "vivy", "Operator work", "task", "open", "operator",
+         ("op_task", "fennick", "Operator work", "task", "open", "operator",
           "agent", None, _ts(days=1), "{}"),
-         ("done_task", "vivy", "Already resolved", "task", "fixed", "agent",
+         ("done_task", "fennick", "Already resolved", "task", "fixed", "agent",
           "agent", None, _ts(days=1), "{}"),
-         ("other_task", "constance", "Other product", "task", "open", "agent",
+         ("other_task", "marlow", "Other product", "task", "open", "agent",
           "agent", None, _ts(days=1), "{}")])
+    conn.execute(
+        "INSERT INTO issue_items (id, product, title, type, state, needs, "
+        "created_by_kind, parent_id, created_at, refs, maturity) "
+        "VALUES ('declined_epic', 'fennick', 'Declined epic', 'epic', 'open', "
+        "'agent', 'agent', NULL, ?, '{}', 'declined')", (_ts(days=1),))
     conn.commit()
     conn.close()
 
     tokens = tmp_path / "api-tokens.json"
     tokens.write_text(json.dumps({
-        AGENT: {"name": "vivy-agent", "products": ["vivy"]},
+        AGENT: {"name": "fennick-agent", "products": ["fennick"]},
         WIDE: {"name": "wide-agent", "products": ["*"]},
-        NOREF: {"name": "noref-agent", "products": ["vivy"],
+        NOREF: {"name": "noref-agent", "products": ["fennick"],
                 "withholds": ["reference.read"]},
     }))
     # The vec0 index, because the write routes reach it: an item or signal
@@ -295,7 +300,7 @@ def test_a_fence_outside_the_callers_scope_is_reported_without_disclosing_it(
     directly. The re-parent surface is already reserved in the contract.
     """
     conn = _db()
-    conn.execute("UPDATE issue_items SET product='constance' WHERE id='top_epic'")
+    conn.execute("UPDATE issue_items SET product='marlow' WHERE id='top_epic'")
     conn.commit()
     conn.close()
     # A wildcard caller takes the fence on the now-foreign epic.
@@ -397,7 +402,7 @@ def test_skipping_its_own_lease_does_not_hide_another_holders(client):
     conn.execute(
         "INSERT INTO issue_items (id, product, title, type, state, needs, "
         "created_by_kind, parent_id, created_at, refs) VALUES "
-        "('sub_epic_2','vivy','Second sub epic','epic','open','agent','agent',"
+        "('sub_epic_2','fennick','Second sub epic','epic','open','agent','agent',"
         "'top_epic',?,'{}')", (_ts(days=3),))
     conn.commit()
     conn.close()
@@ -439,7 +444,7 @@ def test_force_breaks_every_conflict_and_not_just_the_first(client):
     conn.execute(
         "INSERT INTO issue_items (id, product, title, type, state, needs, "
         "created_by_kind, parent_id, created_at, refs) "
-        "VALUES ('sub_two','vivy','Second sub','epic','open','agent','agent',"
+        "VALUES ('sub_two','fennick','Second sub','epic','open','agent','agent',"
         "'top_epic',?, '{}')", (_ts(days=2),))
     conn.commit()
     two = conn.execute("SELECT * FROM issue_items WHERE id='sub_two'").fetchone()
@@ -491,10 +496,19 @@ def test_an_out_of_scope_item_is_404(client):
     assert _co(client, "other_task").status_code == 404
 
 
+def test_a_declined_epic_is_not_checked_out(client):
+    """library/decisions/0005: the operator has already said this work will
+    not happen, so there is nothing here for a worker to take."""
+    r = _co(client, "declined_epic")
+    assert r.status_code == 409
+    assert "declined epic" in r.json()["error"]
+    assert "repropose" in r.json()["hint"]
+
+
 def test_an_unclaimable_item_takes_no_lease(client):
     """Every gate above must refuse before the fence is touched, or a refused
     checkout would leave a lease behind."""
-    for item in ("op_task", "done_task"):
+    for item in ("op_task", "done_task", "declined_epic"):
         _co(client, item)
     assert _leases() == []
 
@@ -611,7 +625,7 @@ def test_the_slip_id_names_a_real_persisted_row(client):
     conn.close()
     assert row is not None
     assert row["item_id"] == "task_a"
-    assert row["product"] == "vivy"
+    assert row["product"] == "fennick"
     assert row["claim_owner_label"] == "session-1"
 
 
@@ -810,8 +824,8 @@ def test_an_ambiguous_persona_stays_on_the_placeholder(
     the whole checkout over an unresolved model would be worse than the
     placeholder a client already knows to treat as unresolved."""
     _agent_index(tmp_path, monkeypatch,
-                [("svc-coder/agents/reviewer", "svc-coder", {"model": "opus"}),
-                 ("svc-planner/agents/reviewer", "svc-planner",
+                [("loom-coder/agents/reviewer", "loom-coder", {"model": "opus"}),
+                 ("loom-planner/agents/reviewer", "loom-planner",
                   {"model": "sonnet"})])
     model = _co(client, "task_a", persona="reviewer").json()["model"]
     assert model == libapp._MODEL_NOT_RESOLVED
@@ -832,7 +846,7 @@ def test_an_ambiguity_the_agent_platform_tiebreak_cannot_resolve_stays_on_the_pl
     only input in this file where that mutant answers differently from the
     real check."""
     _agent_index(tmp_path, monkeypatch,
-                [("svc-coder/agents/reviewer", "svc-coder", {"model": "opus"}),
+                [("loom-coder/agents/reviewer", "loom-coder", {"model": "opus"}),
                  ("agent-platform/agents/reviewer", "agent-platform",
                   {"model": "sonnet"}),
                  ("agent-platform/legacy/agents/reviewer", "agent-platform",
@@ -849,10 +863,10 @@ def test_an_ambiguous_persona_resolves_to_the_agent_platform_copy(
     tiebreak — mirrored from `agentctl`'s `_library_agent` — resolves to that
     one's pin rather than leaving the name ambiguous."""
     _agent_index(tmp_path, monkeypatch,
-                [("svc-coder/agents/reviewer", "svc-coder", {"model": "opus"}),
+                [("loom-coder/agents/reviewer", "loom-coder", {"model": "opus"}),
                  ("agent-platform/agents/reviewer", "agent-platform",
                   {"model": "sonnet"}),
-                 ("svc-planner/agents/reviewer", "svc-planner",
+                 ("loom-planner/agents/reviewer", "loom-planner",
                   {"model": "opus"})])
     model = _co(client, "task_a", persona="reviewer").json()["model"]
     assert model == "sonnet"
@@ -1005,7 +1019,7 @@ def test_budget_bounds_this_run_and_carries_no_project_total(client):
 
 
 def test_budget_cap_usd_is_null_for_a_project_with_no_per_run_cap(client):
-    """The ordinary case: no human has ever set a ledger for `vivy`, so
+    """The ordinary case: no human has ever set a ledger for `fennick`, so
     `store.live_ledger` answers None and the call slip carries no number."""
     assert _co(client, "task_a").json()["budget"]["cap_usd"] is None
 
@@ -1015,7 +1029,7 @@ def test_budget_cap_usd_carries_the_projects_per_run_cap(client):
     read from the checked-out item's own project ledger row, and served in
     dollars as every other cap field is."""
     store.upsert_ledger({
-        "scope_kind": "project", "scope_id": "vivy", "granted_by": "operator",
+        "scope_kind": "project", "scope_id": "fennick", "granted_by": "operator",
         "warn_usd_micro": None, "soft_cap_usd_micro": None,
         "hard_cap_usd_micro": None, "per_run_cap_usd_micro": 2_500_000})
     assert _co(client, "task_a").json()["budget"]["cap_usd"] == 2.5
@@ -1383,7 +1397,7 @@ def test_the_ambiguity_tiebreak_picks_the_body_and_the_model_from_one_document(
     its own model pin rather than another copy's."""
     index = tmp_path / "agent-index.db"
     _agent_index(tmp_path, monkeypatch,
-                 [("svc-coder/agents/reviewer", "svc-coder", {"model": "opus"}),
+                 [("loom-coder/agents/reviewer", "loom-coder", {"model": "opus"}),
                   ("agent-platform/agents/reviewer", "agent-platform",
                    {"model": "sonnet"})])
     conn = sqlite3.connect(index)
@@ -1399,8 +1413,8 @@ def test_the_ambiguity_tiebreak_picks_the_body_and_the_model_from_one_document(
     (None, [], "no_persona"),
     ("no-such-agent", [("agent-platform/agents/coder", "agent-platform", {})],
      "unresolved"),
-    ("reviewer", [("svc-coder/agents/reviewer", "svc-coder", {}),
-                  ("svc-planner/agents/reviewer", "svc-planner", {})],
+    ("reviewer", [("loom-coder/agents/reviewer", "loom-coder", {}),
+                  ("loom-planner/agents/reviewer", "loom-planner", {})],
      "unresolved"),
 ])
 def test_an_unresolved_persona_keeps_the_placeholder_and_says_why(

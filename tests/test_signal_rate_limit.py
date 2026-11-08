@@ -25,12 +25,12 @@ import projects
 import protocol
 import store
 
-AGENT = "agent-token-vivy"
+AGENT = "agent-token-fennick"
 OTHER = "agent-token-other"
 
 REGISTRY = {
     "_meta": {},
-    "vivy": {"repos": []},
+    "fennick": {"repos": []},
 }
 
 
@@ -57,8 +57,8 @@ def client(tmp_path, monkeypatch, vector_index):
 
     tokens = tmp_path / "api-tokens.json"
     tokens.write_text(json.dumps({
-        AGENT: {"name": "vivy-agent", "products": ["vivy"]},
-        OTHER: {"name": "vivy-agent-two", "products": ["vivy"]},
+        AGENT: {"name": "fennick-agent", "products": ["fennick"]},
+        OTHER: {"name": "fennick-agent-two", "products": ["fennick"]},
     }))
     vector_index(db)
     monkeypatch.setattr(store, "DB_PATH", db)
@@ -80,7 +80,7 @@ def _h(token=AGENT):
 
 def _body(**over):
     out = {"source": "github", "kind": "note", "actor": "someone",
-           "product": "vivy", "body": "a thing happened"}
+           "product": "fennick", "body": "a thing happened"}
     out.update(over)
     return out
 

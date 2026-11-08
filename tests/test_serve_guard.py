@@ -27,6 +27,7 @@ real venv would have started a real service against real data for as long as the
 test let it run.
 """
 
+import atexit
 import os
 import plistlib
 import shutil
@@ -39,6 +40,32 @@ from pathlib import Path
 import pytest
 
 SERVE = Path(__file__).resolve().parent.parent / "serve.sh"
+
+# `conftest.py` sets LIBRARY_DB, LIBRARY_BLOB_DIR and LIBRARY_VECTORS_DB at
+# collection — real values a *Python* import of `store`/`blobs`/`vectors`
+# needs to not refuse at module load, nothing to do with this file. The
+# store/credential ownership guard below reads those same names out of
+# `serve.sh`'s own subprocess environment, and LIBRARY_BLOB_DIR's collection-
+# time placeholder is `tempfile.mkdtemp()` with no directory argument — a
+# real directory under `/tmp`, which the guard's own ancestor walk already
+# refuses as sticky world-writable (see `refuse_component`'s comment on
+# `/private/tmp`). Every subprocess below that drives `serve.sh` starts from
+# this cleaned copy of `os.environ` instead of the raw one, so a case here
+# sees only what it sets itself, never collection's unrelated placeholders.
+_STORE_GUARD_VARS = (
+    "LIBRARY_DB", "LIBRARY_VECTORS_DB", "LIBRARY_BLOB_DIR", "LIBRARY_COLD_DB",
+    "LIBRARY_CLIENT_TOKENS", "LIBRARY_API_TOKENS", "LIBRARY_CHECK_PLIST",
+)
+BASE_ENV = {k: v for k, v in os.environ.items() if k not in _STORE_GUARD_VARS}
+
+# `serve.sh` defaults both credential files to `$HOME/.library/...` when their
+# variables are unset, so a case that inherited this machine's HOME would stat
+# the real token files and pass or fail on their modes. An empty HOME makes
+# those defaults absent, and the guard skips them; a case about the defaults
+# passes its own HOME through `extra_env`.
+_EMPTY_HOME = tempfile.mkdtemp(prefix="serve-guard-home-")
+atexit.register(shutil.rmtree, _EMPTY_HOME, ignore_errors=True)
+BASE_ENV["HOME"] = _EMPTY_HOME
 
 DARWIN_ONLY = pytest.mark.skipif(
     sys.platform != "darwin",
@@ -107,7 +134,7 @@ def _guard_refuses_this_checkout() -> str | None:
     try:
         result = subprocess.run(
             [str(SERVE), "--check"],
-            env=dict(os.environ, PY=HARMLESS, SERVE_ALLOW_BRANCH="1"),
+            env=dict(BASE_ENV, PY=HARMLESS, SERVE_ALLOW_BRANCH="1"),
             capture_output=True, text=True, timeout=60)
     except (OSError, subprocess.SubprocessError):
         return None
@@ -176,11 +203,16 @@ pytestmark = [
 ]
 
 
-def run_guard(py, script=SERVE, allow_branch=True):
+def run_guard(py, script=SERVE, allow_branch=True, extra_env=None):
     """Run `serve.sh --check` with PY pointed at `py`.
 
     `--check` is what keeps this safe: the guard and the preflight run, the exec
     does not, so no case here can start a service no matter what `py` names.
+
+    `extra_env` layers additional variables on top of `BASE_ENV` — used by the
+    store/credential ownership guard's own cases below to set LIBRARY_DB and
+    friends without reaching for the unrelated placeholders `conftest.py`
+    leaves in `os.environ` (see `BASE_ENV`'s own comment).
 
     `allow_branch` defaults to bypassing the branch guard (SERVE_ALLOW_BRANCH=1).
     `script` defaults to this checkout's own serve.sh, and a checkout doing this
@@ -191,9 +223,11 @@ def run_guard(py, script=SERVE, allow_branch=True):
     exercise the real check rather than a worktree that would fail it by
     definition.
     """
-    env = dict(os.environ, PY=str(py))
+    env = dict(BASE_ENV, PY=str(py))
     if allow_branch:
         env["SERVE_ALLOW_BRANCH"] = "1"
+    if extra_env:
+        env.update(extra_env)
     return subprocess.run(
         [str(script), "--check"],
         env=env,
@@ -578,7 +612,7 @@ def _run_with_prepended_path(py, prepend_dir):
     Used to put a stub tool ahead of the real one without losing everything
     else the guard's own walk needs to run at all.
     """
-    env = dict(os.environ, PY=str(py), SERVE_ALLOW_BRANCH="1")
+    env = dict(BASE_ENV, PY=str(py), SERVE_ALLOW_BRANCH="1")
     env["PATH"] = f"{prepend_dir}{os.pathsep}{env.get('PATH', '')}"
     return subprocess.run(
         [str(SERVE), "--check"], env=env, capture_output=True, text=True, timeout=180,
@@ -632,7 +666,7 @@ def test_getfacl_missing_from_path_is_refused(tmp_path):
             pytest.skip(f"{name} not found on this machine to build a minimal PATH")
         (minimal / name).symlink_to(real)
 
-    env = dict(os.environ, PY=HARMLESS, SERVE_ALLOW_BRANCH="1", PATH=str(minimal))
+    env = dict(BASE_ENV, PY=HARMLESS, SERVE_ALLOW_BRANCH="1", PATH=str(minimal))
     result = subprocess.run(
         [str(SERVE), "--check"], env=env, capture_output=True, text=True, timeout=180,
     )
@@ -744,7 +778,7 @@ def test_the_real_interpreter_passes_the_guard():
     # SERVE_ALLOW_BRANCH: this repository's own checkout is a feature-branch
     # worktree while this test runs, same reasoning as run_guard() above — this
     # test is about the interpreter chain, not the branch guard.
-    env = dict(os.environ, SERVE_ALLOW_BRANCH="1")
+    env = dict(BASE_ENV, SERVE_ALLOW_BRANCH="1")
     result = subprocess.run(
         [str(SERVE), "--check"],
         env=env,
@@ -1475,9 +1509,20 @@ def _write_check_plist(tmp_path: Path, *, omit: tuple[str, ...] = ()) -> Path:
     """A plist naming every variable `app.py`'s import chain requires at
     import, each pointed at a temp file or directory under `tmp_path` — never
     `~/.library`. `omit` drops named keys entirely, the same shape a plist
-    missing a variable has (not merely an empty value)."""
+    missing a variable has (not merely an empty value).
+
+    `blob_dir` IS CHMOD'D 0o700, not left at `mkdir`'s default: these cases
+    exercise the app-import refusal, and since the store/credential
+    ownership guard now runs against this same plist before app import is
+    ever attempted, a world- or group-readable blob directory would be
+    refused by that guard instead of reaching the case each of these is
+    actually about. `tmp_path` itself is already private — this module's own
+    `tmp_path` fixture builds it with `tempfile.mkdtemp`, mode 0o700 — so
+    nothing else under it needs the same fix.
+    """
     blob_dir = tmp_path / "blobs"
     blob_dir.mkdir(exist_ok=True)
+    blob_dir.chmod(0o700)
     env = {
         "PATH": os.environ.get("PATH", ""),
         "HOME": str(tmp_path),
@@ -1506,7 +1551,7 @@ def test_check_fails_naming_the_missing_cold_db_variable(tmp_path):
 
     result = subprocess.run(
         [str(SERVE), "--check"],
-        env=dict(os.environ, SERVE_ALLOW_BRANCH="1",
+        env=dict(BASE_ENV, SERVE_ALLOW_BRANCH="1",
                   LIBRARY_CHECK_PLIST=str(plist_path)),
         capture_output=True, text=True, timeout=180,
     )
@@ -1523,7 +1568,7 @@ def test_check_passes_when_the_staged_plist_sets_every_variable(tmp_path):
 
     result = subprocess.run(
         [str(SERVE), "--check"],
-        env=dict(os.environ, SERVE_ALLOW_BRANCH="1",
+        env=dict(BASE_ENV, SERVE_ALLOW_BRANCH="1",
                   LIBRARY_CHECK_PLIST=str(plist_path)),
         capture_output=True, text=True, timeout=180,
     )
@@ -1549,7 +1594,7 @@ def test_check_passes_from_a_cwd_that_is_not_the_build_directory(tmp_path):
     result = subprocess.run(
         [str(SERVE), "--check"],
         cwd=str(tmp_path),
-        env=dict(os.environ, SERVE_ALLOW_BRANCH="1",
+        env=dict(BASE_ENV, SERVE_ALLOW_BRANCH="1",
                   LIBRARY_CHECK_PLIST=str(plist_path)),
         capture_output=True, text=True, timeout=180,
     )
@@ -1567,7 +1612,7 @@ def test_check_without_library_check_plist_does_not_import_the_app(tmp_path):
     _real_py_or_skip()
     result = subprocess.run(
         [str(SERVE), "--check"],
-        env=dict(os.environ, SERVE_ALLOW_BRANCH="1"),
+        env=dict(BASE_ENV, SERVE_ALLOW_BRANCH="1"),
         capture_output=True, text=True, timeout=180,
     )
     assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
@@ -1581,7 +1626,7 @@ def test_check_plist_naming_a_missing_file_is_refused(tmp_path):
     missing = tmp_path / "does-not-exist.plist"
     result = subprocess.run(
         [str(SERVE), "--check"],
-        env=dict(os.environ, SERVE_ALLOW_BRANCH="1",
+        env=dict(BASE_ENV, SERVE_ALLOW_BRANCH="1",
                   LIBRARY_CHECK_PLIST=str(missing)),
         capture_output=True, text=True, timeout=60,
     )
@@ -1609,7 +1654,7 @@ def test_check_plist_without_environment_variables_dict_is_refused(tmp_path):
 
     result = subprocess.run(
         [str(SERVE), "--check"],
-        env=dict(os.environ, SERVE_ALLOW_BRANCH="1",
+        env=dict(BASE_ENV, SERVE_ALLOW_BRANCH="1",
                   LIBRARY_CHECK_PLIST=str(plist_path)),
         capture_output=True, text=True, timeout=60,
     )
@@ -1631,7 +1676,7 @@ def test_check_plist_that_is_binary_format_is_refused(tmp_path):
 
     result = subprocess.run(
         [str(SERVE), "--check"],
-        env=dict(os.environ, SERVE_ALLOW_BRANCH="1",
+        env=dict(BASE_ENV, SERVE_ALLOW_BRANCH="1",
                   LIBRARY_CHECK_PLIST=str(plist_path)),
         capture_output=True, text=True, timeout=60,
     )
@@ -1671,7 +1716,7 @@ def test_check_plist_with_an_empty_environment_variables_dict_is_refused(tmp_pat
 
     result = subprocess.run(
         [str(SERVE), "--check"],
-        env=dict(os.environ, SERVE_ALLOW_BRANCH="1",
+        env=dict(BASE_ENV, SERVE_ALLOW_BRANCH="1",
                   LIBRARY_CHECK_PLIST=str(plist_path)),
         capture_output=True, text=True, timeout=60,
     )
@@ -1694,7 +1739,7 @@ def test_check_names_missing_app_py_when_app_itself_is_unreachable(tmp_path, git
 
     result = subprocess.run(
         [str(git_repo / "serve.sh"), "--check"],
-        env=dict(os.environ, SERVE_ALLOW_BRANCH="1", PY=str(real),
+        env=dict(BASE_ENV, SERVE_ALLOW_BRANCH="1", PY=str(real),
                   LIBRARY_CHECK_PLIST=str(plist_path)),
         capture_output=True, text=True, timeout=180,
     )
@@ -1702,3 +1747,386 @@ def test_check_names_missing_app_py_when_app_itself_is_unreachable(tmp_path, git
         f"stdout: {result.stdout}\nstderr: {result.stderr}"
     )
     assert "cannot find app.py to import" in result.stderr, result.stderr
+
+
+# --- the store and credential ownership guard (CQ·224) ---------------------
+#
+# Company/decisions/0025 point 5: in the two- and three-account installs the
+# Library runs as its own no-login service account, which owns its store, so
+# anything else that can reach LIBRARY_DB, the vectors database, the blob
+# store, the cold tier, or either credential file is the hazard this guard
+# closes — aimed at the Library's data rather than at its code, which is what
+# the interpreter-chain cases above already cover.
+#
+# EVERY CASE DRIVES `--check` WITH `extra_env`, never a real `.venv`: the new
+# checks are pure shell, so HARMLESS keeps the interpreter leg trivial exactly
+# as it does above, and `extra_env` sets only the variable each case is about
+# — never through `os.environ` directly, which is why `run_guard`'s
+# `extra_env` layers on `BASE_ENV` rather than the raw one (see `BASE_ENV`'s
+# own comment on `conftest.py`'s unrelated placeholders).
+#
+# A GROUP- OR WORLD-READABLE STORE PATH IS REFUSED, NOT ONLY A WRITABLE ONE:
+# this is the one respect in which the new guard is stricter than the
+# interpreter-chain walk above, which tolerates a merely-readable ancestor
+# (Homebrew's own prefix is 755). There is no such reason for the Library's
+# own database, blob store or token file to be readable by anyone else at
+# all, so `refuse_component`'s "private" mode refuses on ANY group or other
+# bit.
+
+
+def test_library_db_world_readable_is_refused(tree):
+    """A store file at mode 644, the mode the live install's databases
+    carried when this guard was written, is refused."""
+    store = tree / "store"
+    store.mkdir()
+    store.chmod(0o700)
+    db = store / "library.db"
+    db.write_text("x")
+    db.chmod(0o644)
+
+    result = run_guard(HARMLESS, extra_env={"LIBRARY_DB": str(db)})
+    assert_refused(result, db)
+    assert "accessible by other" in result.stderr, result.stderr
+
+
+def test_library_db_group_readable_is_refused(tree):
+    """Group-readable alone, with no world bit, must still refuse — the
+    same shape as `test_world_writable_without_group_write_is_refused`
+    above, which exists because the other cases all set both bits at once
+    and would stay green with the group check blinded."""
+    store = tree / "store"
+    store.mkdir()
+    store.chmod(0o700)
+    db = store / "library.db"
+    db.write_text("x")
+    db.chmod(0o640)
+
+    result = run_guard(HARMLESS, extra_env={"LIBRARY_DB": str(db)})
+    assert_refused(result, db)
+    assert "accessible by its group" in result.stderr, result.stderr
+
+
+def test_directory_holding_library_db_group_readable_is_refused(tree):
+    """The directory is named explicitly in the spec, not merely walked as
+    LIBRARY_DB's ancestor — a group-readable holder refuses even though the
+    file inside it is private."""
+    store = tree / "store"
+    store.mkdir()
+    store.chmod(0o750)
+    db = store / "library.db"
+    db.write_text("x")
+    db.chmod(0o600)
+
+    result = run_guard(HARMLESS, extra_env={"LIBRARY_DB": str(db)})
+    assert_refused(result, store)
+    assert "the directory holding LIBRARY_DB" in result.stderr, result.stderr
+
+
+def test_private_library_db_is_allowed(tree):
+    """The positive control: owner-only bits throughout, nothing refuses."""
+    store = tree / "store"
+    store.mkdir()
+    store.chmod(0o700)
+    db = store / "library.db"
+    db.write_text("x")
+    db.chmod(0o600)
+
+    result = run_guard(HARMLESS, extra_env={"LIBRARY_DB": str(db)})
+    assert_allowed(result)
+    assert result.returncode == 0, result.stderr
+
+
+def test_library_db_wal_file_is_checked_when_present(tree):
+    """`-wal` is named explicitly in the spec: present and exposed, it
+    refuses even though `library.db` itself is private."""
+    store = tree / "store"
+    store.mkdir()
+    store.chmod(0o700)
+    db = store / "library.db"
+    db.write_text("x")
+    db.chmod(0o600)
+    wal = store / "library.db-wal"
+    wal.write_text("x")
+    wal.chmod(0o644)
+
+    result = run_guard(HARMLESS, extra_env={"LIBRARY_DB": str(db)})
+    assert_refused(result, wal)
+    assert "LIBRARY_DB's -wal file" in result.stderr, result.stderr
+
+
+def test_library_db_shm_file_is_checked_when_present(tree):
+    """The `-shm` sibling, checked the same way as `-wal` above."""
+    store = tree / "store"
+    store.mkdir()
+    store.chmod(0o700)
+    db = store / "library.db"
+    db.write_text("x")
+    db.chmod(0o600)
+    shm = store / "library.db-shm"
+    shm.write_text("x")
+    shm.chmod(0o644)
+
+    result = run_guard(HARMLESS, extra_env={"LIBRARY_DB": str(db)})
+    assert_refused(result, shm)
+    assert "LIBRARY_DB's -shm file" in result.stderr, result.stderr
+
+
+def test_library_db_sidecar_files_skipped_when_absent(tree):
+    """'When present' means exactly that: no -wal or -shm on disk yet is not
+    this guard's business, and must not refuse a private, sidecar-free
+    database."""
+    store = tree / "store"
+    store.mkdir()
+    store.chmod(0o700)
+    db = store / "library.db"
+    db.write_text("x")
+    db.chmod(0o600)
+    assert not (store / "library.db-wal").exists()
+    assert not (store / "library.db-shm").exists()
+
+    result = run_guard(HARMLESS, extra_env={"LIBRARY_DB": str(db)})
+    assert_allowed(result)
+    assert result.returncode == 0, result.stderr
+
+
+def test_unset_library_db_skips_the_whole_check():
+    """LIBRARY_DB has no default (store.resolve_db's own docstring), so a
+    process this guard runs against that never names one has nothing here
+    for the guard to refuse — matching today's behaviour for every test
+    above this section that never sets it."""
+    result = run_guard(HARMLESS)
+    assert_allowed(result)
+    assert result.returncode == 0, result.stderr
+
+
+def test_ancestor_directory_two_hops_above_library_db_is_still_refused(tree):
+    """`require_private_path` walks every ancestor the same way the
+    interpreter chain does (round 4's bug, applied to the store): a
+    world-writable directory upstream of a perfectly private library.db can
+    still be used to replace it, so the walk — not only the leaf check —
+    must still run."""
+    near = tree / "near"
+    far = tree / "far"
+    near.mkdir()
+    far.mkdir()
+    far.chmod(0o777)
+    store = far / "store"
+    store.mkdir()
+    store.chmod(0o700)
+    db = store / "library.db"
+    db.write_text("x")
+    db.chmod(0o600)
+    near.chmod(0o755)
+
+    result = run_guard(HARMLESS, extra_env={"LIBRARY_DB": str(db)})
+    assert_refused(result, far)
+
+
+def test_vectors_db_world_readable_is_refused(tree):
+    """The vectors database, named explicitly in the spec."""
+    store = tree / "store"
+    store.mkdir()
+    store.chmod(0o700)
+    db = store / "vectors.db"
+    db.write_text("x")
+    db.chmod(0o644)
+
+    result = run_guard(HARMLESS, extra_env={"LIBRARY_VECTORS_DB": str(db)})
+    assert_refused(result, db)
+    assert "LIBRARY_VECTORS_DB" in result.stderr, result.stderr
+
+
+def test_blob_dir_world_readable_is_refused(tree):
+    """The blob store, named explicitly in the spec — a directory, not a
+    file, and refused on the same terms."""
+    blobs = tree / "blobs"
+    blobs.mkdir()
+    blobs.chmod(0o755)
+
+    result = run_guard(HARMLESS, extra_env={"LIBRARY_BLOB_DIR": str(blobs)})
+    assert_refused(result, blobs)
+    assert "LIBRARY_BLOB_DIR" in result.stderr, result.stderr
+
+
+def test_cold_db_world_readable_is_refused(tree):
+    """The cold-tier database, named explicitly in the spec."""
+    store = tree / "store"
+    store.mkdir()
+    store.chmod(0o700)
+    db = store / "cold.db"
+    db.write_text("x")
+    db.chmod(0o644)
+
+    result = run_guard(HARMLESS, extra_env={"LIBRARY_COLD_DB": str(db)})
+    assert_refused(result, db)
+    assert "LIBRARY_COLD_DB" in result.stderr, result.stderr
+
+
+def test_client_tokens_default_path_is_checked(tree):
+    """`identity.CLIENT_TOKENS` has a default — `$HOME/.library/
+    client-tokens.json` — unlike LIBRARY_DB and friends, so it is checked
+    even with `LIBRARY_CLIENT_TOKENS` unset, against that default under
+    whatever HOME the guard runs under."""
+    fake_home = tree / "home"
+    lib_dir = fake_home / ".library"
+    lib_dir.mkdir(parents=True)
+    lib_dir.chmod(0o700)
+    tokens = lib_dir / "client-tokens.json"
+    tokens.write_text("{}")
+    tokens.chmod(0o644)
+
+    result = run_guard(HARMLESS, extra_env={"HOME": str(fake_home)})
+    assert_refused(result, tokens)
+    assert "identity.CLIENT_TOKENS" in result.stderr, result.stderr
+
+
+def test_api_tokens_default_path_is_checked(tree):
+    """The API token file's own default — `$HOME/.library/api-tokens.json`
+    (`identity.resolve_tokens`) — checked the same way as CLIENT_TOKENS."""
+    fake_home = tree / "home"
+    lib_dir = fake_home / ".library"
+    lib_dir.mkdir(parents=True)
+    lib_dir.chmod(0o700)
+    tokens = lib_dir / "api-tokens.json"
+    tokens.write_text("{}")
+    tokens.chmod(0o644)
+
+    result = run_guard(HARMLESS, extra_env={"HOME": str(fake_home)})
+    assert_refused(result, tokens)
+    assert "the API token file" in result.stderr, result.stderr
+
+
+def test_client_tokens_explicit_override_is_checked(tree):
+    """`LIBRARY_CLIENT_TOKENS` overrides the default, same as identity.py's
+    own `os.environ.get`."""
+    tokens = tree / "elsewhere" / "client-tokens.json"
+    tokens.parent.mkdir()
+    tokens.parent.chmod(0o700)
+    tokens.write_text("{}")
+    tokens.chmod(0o644)
+
+    result = run_guard(HARMLESS, extra_env={"LIBRARY_CLIENT_TOKENS": str(tokens)})
+    assert_refused(result, tokens)
+    assert "identity.CLIENT_TOKENS" in result.stderr, result.stderr
+
+
+def test_api_tokens_explicit_override_is_checked(tree):
+    """`LIBRARY_API_TOKENS` overrides the default the same way — on
+    macstudio today this names the file Orient's own process also reads
+    (identity.py's own docstring), so this is the live shape, not a
+    hypothetical."""
+    tokens = tree / "elsewhere" / "api-tokens.json"
+    tokens.parent.mkdir()
+    tokens.parent.chmod(0o700)
+    tokens.write_text("{}")
+    tokens.chmod(0o644)
+
+    result = run_guard(HARMLESS, extra_env={"LIBRARY_API_TOKENS": str(tokens)})
+    assert_refused(result, tokens)
+    assert "the API token file" in result.stderr, result.stderr
+
+
+def test_credential_files_skipped_when_absent(tree):
+    """Neither credential file exists yet under this HOME — a fresh
+    checkout or an unbootstrapped install — and that must pass, not refuse,
+    matching the "when present" rule the sidecar files already get."""
+    fake_home = tree / "home"
+    fake_home.mkdir()
+    fake_home.chmod(0o755)
+    assert not (fake_home / ".library").exists()
+
+    result = run_guard(HARMLESS, extra_env={"HOME": str(fake_home)})
+    assert_allowed(result)
+    assert result.returncode == 0, result.stderr
+
+
+@DARWIN_ONLY
+def test_library_db_acl_allowing_access_is_refused(tree):
+    """Round 5's hazard, aimed at the store: an ACL can grant access the
+    mode bits never show, on a file that reads 600 to every check built on
+    permission bits alone."""
+    store = tree / "store"
+    store.mkdir()
+    store.chmod(0o700)
+    db = store / "library.db"
+    db.write_text("x")
+    db.chmod(0o600)
+    subprocess.run(
+        ["chmod", "+a", "everyone allow read", str(db)],
+        check=True,
+    )
+    assert oct(db.stat().st_mode)[-3:] == "600", "the mode must still look private"
+
+    result = run_guard(HARMLESS, extra_env={"LIBRARY_DB": str(db)})
+    assert_refused(result, db)
+
+
+@LINUX_ONLY
+def test_library_db_acl_named_user_entry_is_refused(tree):
+    """The Linux equivalent of the case above: a POSIX ACL grants access
+    the mode bits do not show, read with `getfacl`."""
+    store = tree / "store"
+    store.mkdir()
+    store.chmod(0o700)
+    db = store / "library.db"
+    db.write_text("x")
+    db.chmod(0o600)
+    setfacl = subprocess.run(["setfacl", "-m", "u:nobody:r", str(db)], capture_output=True)
+    if setfacl.returncode != 0:
+        pytest.skip("setfacl unavailable or failed on this machine")
+
+    result = run_guard(HARMLESS, extra_env={"LIBRARY_DB": str(db)})
+    assert_refused(result, db)
+
+
+def test_check_plist_refuses_a_world_readable_library_db(tmp_path):
+    """The install-time shape (bin/install-library's pre-swap --check names
+    LIBRARY_CHECK_PLIST at the plist about to go live): the store guard
+    reads LIBRARY_DB out of THAT plist, never out of this process's own
+    empty environment, so a candidate whose configured library.db is
+    group- or world-readable is refused before app import ever runs. That
+    is how a deploy over a store with loose modes stops before the swap,
+    leaving the running service as it was."""
+    _real_py_or_skip()
+    plist_path = _write_check_plist(tmp_path)
+    db = tmp_path / "library.db"
+    db.write_text("x")
+    db.chmod(0o644)
+
+    result = subprocess.run(
+        [str(SERVE), "--check"],
+        env=dict(BASE_ENV, SERVE_ALLOW_BRANCH="1", LIBRARY_CHECK_PLIST=str(plist_path)),
+        capture_output=True, text=True, timeout=180,
+    )
+    assert result.returncode == REFUSED, (
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert str(db) in result.stderr, result.stderr
+    assert "accessible by other" in result.stderr, result.stderr
+    assert "importing app" not in result.stdout, result.stdout
+
+
+def test_check_plist_store_guard_uses_the_plists_own_home(tmp_path):
+    """`_write_check_plist` sets HOME to `tmp_path`, never this process's
+    real one, and the credential defaults must follow that plist HOME —
+    reading the installer's own HOME instead would check the wrong
+    machine's credential file, or none at all."""
+    _real_py_or_skip()
+    plist_path = _write_check_plist(tmp_path)
+    lib_dir = tmp_path / ".library"
+    lib_dir.mkdir()
+    lib_dir.chmod(0o700)
+    tokens = lib_dir / "client-tokens.json"
+    tokens.write_text("{}")
+    tokens.chmod(0o644)
+
+    result = subprocess.run(
+        [str(SERVE), "--check"],
+        env=dict(BASE_ENV, SERVE_ALLOW_BRANCH="1", LIBRARY_CHECK_PLIST=str(plist_path)),
+        capture_output=True, text=True, timeout=180,
+    )
+    assert result.returncode == REFUSED, (
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert str(tokens) in result.stderr, result.stderr
+    assert "identity.CLIENT_TOKENS" in result.stderr, result.stderr

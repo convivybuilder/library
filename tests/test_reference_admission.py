@@ -18,18 +18,21 @@ import app as libapp
 import identity
 import projects
 import protocol
+import reference
 import reference_admission
 import black_box_tables
 import store
 
-AGENT = "agent-token-vivy"
+pytestmark = pytest.mark.usefixtures("kb_registry")
+
+AGENT = "agent-token-fennick"
 SYSTEM = "system-token"
 
 
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     tokens = tmp_path / "api-tokens.json"
-    tokens.write_text('{"%s": {"name": "vivy-agent", "products": ["vivy"]},'
+    tokens.write_text('{"%s": {"name": "fennick-agent", "products": ["fennick"]},'
                       ' "%s": {"name": "capture", "products": ["*"], '
                       '"kind": "system"}}' % (AGENT, SYSTEM))
     monkeypatch.setattr(identity, "TOKENS", tokens)
@@ -39,6 +42,9 @@ def client(tmp_path, monkeypatch):
 def _h(token):
     return {"Authorization": f"Bearer {token}",
             protocol.HEADER: str(protocol.CURRENT)}
+
+
+EXISTING_PATH = "projects/library/specs/example.md"
 
 
 def _fm(**over):
@@ -210,6 +216,15 @@ def test_a_group_in_binds_agents_refuses_the_person_wording():
         "binds_agents names a person or a group, not an agent: team"]
 
 
+def test_the_consultant_agent_in_binds_agents_admits():
+    """`consultant` is a dispatchable agent (`agent-platform/agents/
+    consultant`), so a block may bind it; it was once listed among the
+    groups, which refused it with the person wording."""
+    assert reference_admission.validate_frontmatter(
+        _fm(binds_agents=["consultant"]),
+        roster=frozenset({"architect", "consultant", "team"})) == []
+
+
 def test_the_operator_marker_in_binds_agents_refuses_the_person_wording():
     errs = reference_admission.validate_frontmatter(
         _fm(binds_agents=["the-operator"]),
@@ -294,24 +309,29 @@ def test_binds_agents_needs_operator_marker_false_on_a_non_dict():
         "not a dict") is False
 
 
-# --- the knowledge-tree-derived project catalogue (agent-platform#685) ---------
+# --- the knowledge-tree-derived project catalogue (agent-platform#685,
+# platform/decisions/0097 point 4) ---------------------------------------------
 #
-# `ALLOWED_PROJECTS`/`ID_PATTERN` are the baseline; `project_catalogue` widens
-# them with whatever `<root>/projects/` actually holds, so an adopter's own
-# project — one Convivy's static list has never heard of — validates.
+# `project_catalogue` widens the registry's admitted set (`projects.kb_slugs()`
+# union `projects.scopes()` union `projects.kb_legacy()`) with whatever
+# REGISTERED `<root>/projects/` directory the tree actually holds. A directory
+# the registry does not name is refused even when it is on disk — an adopter's
+# own project validates once it is in that install's registry, not on the
+# strength of its name alone (platform/decisions/0097, Consequences).
 
 
 @pytest.fixture
 def registry(tmp_path, monkeypatch):
-    """A synthetic `agent-platform/config/projects.json` `projects.private_repos()`
-    reads, so a private-crew refusal can be tested without the real registry.
+    """A synthetic `<root>/install/projects.json` `projects.kb_slugs()`,
+    `projects.scopes()`, `projects.kb_legacy()` and `projects.private_repos()`
+    all read, so admission can be tested without the real registry.
 
-    **NEVER PASS `{}`.** `projects.private_repos()` treats an empty dict the
+    **NEVER PASS `{}`.** Every one of those readers treats an empty dict the
     same as a missing file — `if not raw: return None` — so a genuinely empty
-    registry reads as unreadable and every non-baseline name gets refused for
-    the wrong reason. Pass a harmless filler entry (`{"filler": {}}`) for "no
-    private crews today"; a real unreadable-registry case points
-    `REGISTRY_PATH` at a file that does not exist instead of calling this."""
+    registry reads as unreadable and every name gets refused for the wrong
+    reason. Pass a harmless filler entry (`{"filler": {}}`) for "no registered
+    projects today"; a real unreadable-registry case points `REGISTRY_PATH` at
+    a file that does not exist instead of calling this."""
     def _set(entries):
         path = tmp_path / "projects.json"
         path.write_text(json.dumps(entries))
@@ -325,9 +345,10 @@ def registry(tmp_path, monkeypatch):
     projects.reload()
 
 
-def test_a_project_directory_not_in_the_baseline_is_admitted(tmp_path, registry):
-    registry({"filler": {}})
-    assert "adopter-app" not in reference_admission.ALLOWED_PROJECTS
+def test_a_registered_project_directory_is_admitted(tmp_path, registry):
+    """A name the registry's admitted set names is admitted once its
+    directory exists on disk."""
+    registry({"adopter-app": {"kb": "central"}})
     (tmp_path / "projects" / "adopter-app").mkdir(parents=True)
 
     cat = reference_admission.project_catalogue(tmp_path)
@@ -336,8 +357,54 @@ def test_a_project_directory_not_in_the_baseline_is_admitted(tmp_path, registry)
     fm = {"id": "adopter-app/reference/x", "kind": "reference",
           "project": "adopter-app", "title": "A doc", "status": "draft"}
     assert reference_admission.validate_frontmatter(fm, cat) == []
-    # and without a catalogue, the baseline alone still refuses it
+    # and without a catalogue, the baseline (computed from `kb_registry`'s
+    # registry, not this fixture's) still refuses it
     assert reference_admission.validate_frontmatter(fm) != []
+
+
+def test_a_registry_name_that_is_not_a_slug_is_dropped(registry):
+    """`id_pattern_for` joins these names into a regex unescaped, so a name
+    from the registry that fails `_PROJECT_SLUG` never reaches it: a
+    non-string `kb_project` would fail `sorted()` at import, and a
+    metacharacter would widen the pattern (both reviewers, PR #307 round 1)."""
+    registry({"good": {"kb": "central"},
+              "numbered": {"kb": "central", "kb_project": 123},
+              "flagged": {"kb": "split", "kb_project": True},
+              "dotted": {"kb": "central", "kb_project": "a.b"},
+              "_scopes": {"plat|form": {}, "scope": {}},
+              "_kb_legacy": [".*", "legacy"]})
+    names = reference_admission._registry_projects()
+    assert names == frozenset({"good", "scope", "legacy"})
+    pattern = reference_admission.id_pattern_for(names)
+    assert pattern.match("good/reference/x")
+    assert not pattern.match("anything/reference/x")
+
+
+def test_the_registry_set_is_read_off_one_snapshot(registry, monkeypatch):
+    """The three pieces come from one registry generation: each public
+    accessor re-checks the file and could see a newer one mid-call
+    (security-reviewer, PR #307 round 1)."""
+    registry({"good": {"kb": "central"}, "_scopes": {"scope": {}}})
+
+    def stale(*_a, **_k):
+        raise AssertionError("read through a public accessor, not one snapshot")
+
+    for name in ("kb_slugs", "scopes", "kb_legacy"):
+        monkeypatch.setattr(projects, name, stale)
+    assert reference_admission._registry_projects() == frozenset({"good", "scope"})
+
+
+def test_an_on_disk_directory_not_in_the_registry_is_refused(tmp_path, registry):
+    """An adopter's own project, on disk but absent from the registry, no
+    longer validates on the strength of its name alone
+    (platform/decisions/0097 point 4) — it must be IN the registry."""
+    registry({"filler": {}})
+    (tmp_path / "projects" / "adopter-app").mkdir(parents=True)
+
+    cat = reference_admission.project_catalogue(tmp_path)
+    assert "adopter-app" not in cat.allowed
+    assert "not a registered project" in cat.refused["adopter-app"]
+    assert "0097" in cat.refused["adopter-app"]
 
 
 def test_a_missing_project_directory_is_refused(tmp_path, registry):
@@ -353,24 +420,27 @@ def test_a_missing_project_directory_is_refused(tmp_path, registry):
     assert any("invalid project: 'nowhere'" in e for e in errs), errs
 
 
-def test_root_unset_admits_only_the_baseline(registry):
+def test_root_unset_admits_only_the_registered_baseline(registry):
     """`KNOWLEDGE_ROOT` unset is today's behaviour — deploying this code ahead
     of the plist change that sets it must not widen anything, including
-    through `pending`."""
-    registry({"filler": {}})
+    through `pending`. The baseline is exactly the registry's admitted set,
+    read live rather than from an import-time snapshot."""
+    registry({"demoproj": {"kb": "central"}})
     cat = reference_admission.project_catalogue(None, pending="brand-new")
-    assert cat.allowed == reference_admission.ALLOWED_PROJECTS
-    assert cat.id_pattern.pattern == reference_admission.ID_PATTERN.pattern
+    assert cat.allowed == frozenset({"demoproj"})
+    assert cat.id_pattern.pattern == reference_admission.id_pattern_for(
+        frozenset({"demoproj"})).pattern
     assert "brand-new" not in cat.allowed
 
 
-def test_an_unreadable_projects_directory_admits_only_the_baseline(tmp_path, registry):
-    registry({"filler": {}})
+def test_an_unreadable_projects_directory_admits_only_the_registered_baseline(
+        tmp_path, registry):
+    registry({"demoproj": {"kb": "central"}})
     root = tmp_path / "tree"
     root.mkdir()
     # No `projects/` directory at all under a real root: `iterdir` raises OSError.
     cat = reference_admission.project_catalogue(root)
-    assert cat.allowed == reference_admission.ALLOWED_PROJECTS
+    assert cat.allowed == frozenset({"demoproj"})
 
 
 @pytest.mark.parametrize("scope", ["shared", "convivy", "utility", "engineering"])
@@ -434,8 +504,13 @@ def test_a_private_crews_home_dir_basename_is_refused(tmp_path, registry):
 
 def test_a_truthy_non_true_private_value_does_not_count(tmp_path, registry):
     """`private: "true"` (a string, not the boolean) does not mark a crew
-    private, matching agent-platform#685, which drew the same line."""
-    registry({"almostprivate": {"private": "true", "aliases": ["not-really-secret"]}})
+    private, matching agent-platform#685, which drew the same line.
+
+    `not-really-secret` is independently registered as its own unit, so the
+    only thing isolated here is the truthy-vs-`True` distinction, not the
+    registry-membership requirement this test is not about."""
+    registry({"almostprivate": {"private": "true", "aliases": ["not-really-secret"]},
+              "not-really-secret": {"kb": "central"}})
     (tmp_path / "projects").mkdir(parents=True)
     cat = reference_admission.project_catalogue(tmp_path, pending="not-really-secret")
     assert "not-really-secret" in cat.allowed
@@ -474,10 +549,11 @@ def test_an_escaping_symlink_is_refused(tmp_path, registry):
     assert "outside the knowledge tree" in cat.refused["escapee"]
 
 
-def test_a_pending_project_is_admitted_by_name(tmp_path, registry):
+def test_a_registered_pending_project_is_admitted_by_name(tmp_path, registry):
     """The project a write is about to create is admitted before its
-    directory exists — first-save-of-a-new-project has no directory yet."""
-    registry({"filler": {}})
+    directory exists — first-save-of-a-new-project has no directory yet —
+    when the registry names it (platform/decisions/0097 point 4)."""
+    registry({"brand-new": {"kb": "central"}})
     (tmp_path / "projects").mkdir(parents=True)
     assert not (tmp_path / "projects" / "brand-new").exists()
     cat = reference_admission.project_catalogue(tmp_path, pending="brand-new")
@@ -485,19 +561,33 @@ def test_a_pending_project_is_admitted_by_name(tmp_path, registry):
     assert cat.id_pattern.match("brand-new/reference/x")
 
 
-def test_an_unreadable_private_crew_source_refuses_non_baseline_names(tmp_path, monkeypatch, registry):
+def test_an_unregistered_pending_project_is_refused(tmp_path, registry):
+    """A pending name the registry does not know is refused rather than
+    created on the strength of its name alone (platform/decisions/0097
+    point 4) — this is the behaviour `test_a_registered_pending_project_
+    is_admitted_by_name` above used to lack."""
+    registry({"filler": {}})
+    (tmp_path / "projects").mkdir(parents=True)
+    cat = reference_admission.project_catalogue(tmp_path, pending="brand-new")
+    assert "brand-new" not in cat.allowed
+    assert "not a registered project" in cat.refused["brand-new"]
+
+
+def test_an_unreadable_registry_admits_on_disk_directories_and_refuses_pending(
+        tmp_path, monkeypatch, registry):
+    """platform/decisions/0097 point 4's unreadable-registry fallback: trust
+    what the knowledge tree already holds rather than refuse every document
+    under it, but refuse every `pending` name, since there is no on-disk
+    directory to trust instead for a project not yet created."""
     monkeypatch.setattr(projects, "REGISTRY_PATH", tmp_path / "no-such-file.json")
     projects.reload()
     assert projects.private_repos() is None
 
-    (tmp_path / "projects" / "newproj").mkdir(parents=True)
+    (tmp_path / "projects" / "library").mkdir(parents=True)
     cat = reference_admission.project_catalogue(tmp_path, pending="also-new")
-    assert "newproj" not in cat.allowed
-    assert "could not be read" in cat.refused["newproj"]
+    assert "library" in cat.allowed
     assert "also-new" not in cat.allowed
     assert "could not be read" in cat.refused["also-new"]
-    # a baseline project still validates, so an outage does not drop the corpus
-    assert "library" in cat.allowed
 
 
 # --- the route -----------------------------------------------------------------
@@ -603,6 +693,7 @@ def test_the_validation_constants_have_not_drifted():
         "binds_crews", "binds_agents", "binds_topics", "binds_sessions",
         "binds_roles")
     assert reference_admission.ISO_DATE.pattern == r"^\d{4}-\d{2}-\d{2}$"
+    assert reference_admission.NON_AGENT_GROUPS == {"team", "contractor"}
     assert "bead" in reference_admission.ALLOWED_KINDS
     assert "instruction-block" in reference_admission.ALLOWED_KINDS
     assert "build-plan" in reference_admission.ALLOWED_KINDS
@@ -624,7 +715,7 @@ def test_the_validation_constants_have_not_drifted():
     # seam, and a chain of bare asserts stops at the first mismatch — so it
     # reports one drifted site while others are equally drifted, and it
     # under-counts exactly when someone is relying on it to tell them how
-    # many sites to fix. That happened on 2026-09-06: `placard` was missing
+    # many sites to fix. That happened on 2026-09-06: `bannister` was missing
     # from both `ALLOWED_PROJECTS` and `ID_PATTERN`, the projects assertion
     # failed first, and the work item was written up as a one-line fix
     # because the pattern's drift was still hidden behind it.
@@ -655,19 +746,12 @@ def test_the_validation_constants_have_not_drifted():
             set(re.findall(r'"([a-z-]+)"', kinds.group(1))),
             set(reference_admission.ALLOWED_KINDS))
 
-    # **PROJECTS ARE THE MOST ACTIVELY-CHANGING CONSTANT IN THE SOURCE FILE**
-    # (reviewer, PR #42) — new projects are added regularly, so this is
-    # exactly the copy most likely to actually drift, and the one a
-    # presence-only check (`"library" in ...`) does not catch: removing an
-    # unrelated entry from the port's own copy left that assertion passing.
-    # Extracted the same way `ALLOWED_KINDS` is, since the block is a `{...}`
-    # set literal with no nested braces for a non-greedy match to stop at
-    # early — confirmed against the live source rather than assumed.
-    projects = re.search(r"ALLOWED_PROJECTS = \{(.*?)\}", text, re.S)
-    assert projects, "could not find ALLOWED_PROJECTS in validate.py"
-    compare("ALLOWED_PROJECTS",
-            set(re.findall(r'"([a-z-]+)"', projects.group(1))),
-            set(reference_admission.ALLOWED_PROJECTS))
+    # `ALLOWED_PROJECTS` is NOT compared here. `reference_admission.py` no
+    # longer carries that literal (platform/decisions/0097 point 4): its
+    # admitted project set is the registry's, not a copy of
+    # `validate.py`'s own list, so there is no second literal left to drift
+    # against it. `validate.py` keeps its own closed list until
+    # platform/decisions/0097 point 5 drops it.
 
     statuses = re.search(r"ALLOWED_STATUSES = \{([^}]+)\}", text)
     assert statuses, "could not find ALLOWED_STATUSES in validate.py"
@@ -687,20 +771,12 @@ def test_the_validation_constants_have_not_drifted():
             tuple(re.findall(r'"(\w+)"', required.group(1))),
             reference_admission.REQUIRED)
 
-    id_pattern = re.search(r"ID_PATTERN = re\.compile\(\s*(.*?)\)\n", text, re.S)
-    assert id_pattern, "could not find ID_PATTERN in validate.py"
-    # Compared by the SET OF PROJECT NAMES each pattern accepts, not by literal
-    # text. `reference_admission.ID_PATTERN` is now DERIVED from
-    # `ALLOWED_PROJECTS` (`id_pattern_for`, ported from agent-platform#685)
-    # rather than a second hand-maintained literal, so its text differs from
-    # validate.py's own (sorted order, `\Z` anchoring a trailing newline out
-    # where validate.py's `$` lets it through) even when the two agree on
-    # every project. What must still agree is which names each one admits.
-    found_text = "".join(re.findall(r'r"([^"]*)"', id_pattern.group(1)))
-    found_projects = set(re.match(r"\^\((.*?)\)/", found_text).group(1).split("|"))
-    ours_projects = set(re.match(
-        r"\^\((.*?)\)/", reference_admission.ID_PATTERN.pattern).group(1).split("|"))
-    compare("ID_PATTERN projects", found_projects, ours_projects)
+    # The ID pattern's project alternatives are NOT compared here either, for
+    # the same reason `ALLOWED_PROJECTS` is not: `reference_admission.
+    # ID_PATTERN` is now derived from the registry's admitted set
+    # (platform/decisions/0097 point 4), not from a copy of `validate.py`'s
+    # `ALLOWED_PROJECTS`, so the two patterns have no shared literal left to
+    # compare.
 
     list_fields = re.search(r"LIST_FIELDS = \(([^)]+)\)", text)
     assert list_fields, "could not find LIST_FIELDS in validate.py"
@@ -714,26 +790,11 @@ def test_the_validation_constants_have_not_drifted():
             iso_date.group(1),
             reference_admission.ISO_DATE.pattern)
 
-    # `NON_AGENT_GROUPS` is NOT compared for equality: `validate.py`'s
-    # `NON_AGENT_AUDIENCE` holds the operator's own marker as a literal,
-    # and this module holds it as data instead (`operator_marker.
-    # read_marker`), not as a literal (library#228). So the two sets must
-    # differ by EXACTLY ONE name — the marker — and every other name must
-    # agree; a fifth group added to `validate.py` without a matching add
-    # here widens that difference past one and fails this.
-    non_agent = re.search(r"NON_AGENT_AUDIENCE = \{([^}]+)\}", text)
-    assert non_agent, "could not find NON_AGENT_AUDIENCE in validate.py"
-    found_non_agent = set(re.findall(r'"(\w+)"', non_agent.group(1)))
-    missing_here = found_non_agent - reference_admission.NON_AGENT_GROUPS
-    extra_here = reference_admission.NON_AGENT_GROUPS - found_non_agent
-    if len(missing_here) != 1 or extra_here:
-        drifted.append(
-            f"  NON_AGENT_GROUPS: expected validate.py's NON_AGENT_AUDIENCE "
-            f"to be NON_AGENT_GROUPS plus exactly one more name (the "
-            f"operator marker); found {sorted(missing_here)} beyond "
-            f"NON_AGENT_GROUPS" +
-            (f", and {sorted(extra_here)} in NON_AGENT_GROUPS but not "
-             f"validate.py" if extra_here else ""))
+    # `NON_AGENT_GROUPS` has no cross-repo half. knowledge#968 (E7·19 step 4)
+    # deletes `validate.py`'s `NON_AGENT_AUDIENCE` along with its roster copy,
+    # because this module's admission check now owns the person/group refusal
+    # on `audience` and `binds_agents`. The literal pin in the first half of
+    # this test is what still fails when this copy changes.
 
     assert not drifted, (
         f"{len(drifted)} constant(s) have drifted from "
@@ -776,6 +837,18 @@ def held(tmp_path, monkeypatch):
     conn.commit()
     conn.close()
     monkeypatch.setattr(store, "DB_PATH", db)
+    # A knowledge index holding `_fm()`'s document, so the checkout clause
+    # these tests exercise runs on an EXISTING document rather than being
+    # waived as a create (see the create tests below).
+    index = tmp_path / "index.db"
+    iconn = sqlite3.connect(index)
+    iconn.execute("CREATE TABLE docs (id TEXT PRIMARY KEY, project TEXT, "
+                  "source_ref TEXT)")
+    iconn.execute("INSERT INTO docs (id, project, source_ref) VALUES (?, ?, ?)",
+                  ("library/spec/example", "library", EXISTING_PATH))
+    iconn.commit()
+    iconn.close()
+    monkeypatch.setattr(reference, "INDEX_DB", index)
 
     def take(doc_id, holder, *, when=None):
         # The service's own clock and format, rather than a literal: a fixed
@@ -991,15 +1064,282 @@ def test_omitting_owner_needs_no_reference_read(client, monkeypatch):
     assert body["clauses_checked"] == ["frontmatter", "checkout"]
 
 
+# --- a create: an id the index does not hold ------------------------------------
+#
+# `POST /reference/documents/{id}/checkout` 404s an id the index does not hold,
+# so before the waiver every new document was refused here once `kb apply`
+# began asking this route (agent-platform #966; the steward's kb_create of
+# platform/decisions/0098 on 2026-10-22).
+
+NEW_ID = "library/spec/not-yet-written"
+NEW_PATH = "projects/library/specs/not-yet-written.md"
+
+
+def test_a_create_waives_the_checkout_clause(client, held):
+    r = client.post("/reference/admission", headers=_h(AGENT),
+                    json={"frontmatter": _fm(id=NEW_ID), "owner": "operator",
+                          "path": NEW_PATH, "create": True})
+    body = r.json()
+    assert body["may_land"] is True, body
+    assert body["clauses_checked"] == ["frontmatter"]
+    assert body["clauses_refused"] == []
+    assert body["clauses_waived"] == ["checkout"]
+
+
+def test_an_indexed_document_is_not_waived(client, held):
+    """The refusing half of the pair: identical but for the id being indexed."""
+    r = client.post("/reference/admission", headers=_h(AGENT),
+                    json={"frontmatter": _fm(), "owner": "operator"})
+    body = r.json()
+    assert body["may_land"] is False
+    assert body["clauses_refused"] == ["checkout"]
+    assert body["clauses_waived"] == []
+
+
+def test_a_create_someone_else_holds_still_refuses_naming_them(client, held):
+    held(NEW_ID, "ann")
+    r = client.post("/reference/admission", headers=_h(AGENT),
+                    json={"frontmatter": _fm(id=NEW_ID), "owner": "operator",
+                          "path": NEW_PATH, "create": True})
+    body = r.json()
+    assert body["may_land"] is False
+    assert body["clauses_refused"] == ["checkout"]
+    assert "ann" in body["errors"][0]
+    assert body["clauses_waived"] == []
+
+
+def test_an_unreadable_index_waives_nothing(client, held, tmp_path, monkeypatch):
+    monkeypatch.setattr(reference, "INDEX_DB", tmp_path / "no-such-index.db")
+    r = client.post("/reference/admission", headers=_h(AGENT),
+                    json={"frontmatter": _fm(id=NEW_ID), "owner": "operator",
+                          "path": NEW_PATH, "create": True})
+    body = r.json()
+    assert body["may_land"] is False
+    assert body["clauses_refused"] == ["checkout"]
+    assert "could not be read to bind" in body["errors"][0]
+
+
+def test_a_busy_index_waives_nothing(client, held, tmp_path, monkeypatch):
+    """`reading()` re-raises SQLITE_BUSY unchanged, so `_index_rows_for` must
+    catch it itself and refuse the named path: a busy index answers the
+    binding refusal, neither a waiver nor the 503 `database_busy` gives."""
+    path = tmp_path / "busy-index.db"
+    holder = sqlite3.connect(path, isolation_level=None)
+    holder.execute("CREATE TABLE docs (id TEXT PRIMARY KEY, project TEXT, "
+                   "source_ref TEXT)")
+    holder.execute("BEGIN EXCLUSIVE")
+    real_connect = reference.connect
+
+    def busy_connect():
+        conn = real_connect()
+        conn.close()
+        # A genuine SQLITE_BUSY, raised by SQLite rather than constructed.
+        return sqlite3.connect(path, timeout=0.01)
+
+    monkeypatch.setattr(reference, "connect", busy_connect)
+    try:
+        r = client.post("/reference/admission", headers=_h(AGENT),
+                        json={"frontmatter": _fm(id=NEW_ID), "owner": "operator",
+                              "path": NEW_PATH, "create": True})
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["may_land"] is False
+    assert body["clauses_refused"] == ["checkout"]
+    assert body["clauses_waived"] == []
+    assert "could not be read to bind" in body["errors"][0]
+
+
+def test_a_document_outside_a_bound_scope_is_not_waived(client, held, tmp_path, monkeypatch):
+    """The index lookup is unscoped, so an existing document counts as existing
+    whatever the caller may read; and a bound identity gets no waiver at all.
+    An indexed id and an absent one get the same refusal text, so the answer
+    cannot tell it a document exists outside its scope."""
+    tokens = tmp_path / "bound-tokens.json"
+    tokens.write_text(json.dumps({AGENT: {"name": "fennick-agent", "products": ["fennick"],
+                                          "profile": "fennick/daytime"}}))
+    monkeypatch.setattr(identity, "TOKENS", tokens)
+    for doc_id in ("library/spec/example", NEW_ID):
+        r = client.post("/reference/admission", headers=_h(AGENT),
+                        json={"frontmatter": _fm(id=doc_id), "owner": "operator",
+                              "path": NEW_PATH, "create": True})
+        body = r.json()
+        assert body["may_land"] is False, (doc_id, body)
+        assert body["clauses_refused"] == ["checkout"], doc_id
+        assert body["errors"][0] == f"{NEW_PATH} is not indexed as {doc_id}"
+
+
+def _bind(tmp_path, monkeypatch):
+    tokens = tmp_path / "bound-tokens.json"
+    tokens.write_text(json.dumps({AGENT: {"name": "fennick-agent", "products": ["fennick"],
+                                          "profile": "fennick/daytime"}}))
+    monkeypatch.setattr(identity, "TOKENS", tokens)
+
+
+def test_a_bound_identity_cannot_write_another_documents_path(client, held, tmp_path, monkeypatch):
+    """Round 1's defect for a bound identity (security-reviewer, PR #306
+    round 2): hold a checkout on one id and write another document's file."""
+    _bind(tmp_path, monkeypatch)
+    held(NEW_ID, "operator")
+    r = client.post("/reference/admission", headers=_h(AGENT),
+                    json={"frontmatter": _fm(id=NEW_ID), "owner": "operator",
+                          "path": EXISTING_PATH})
+    body = r.json()
+    assert body["may_land"] is False
+    assert body["clauses_refused"] == ["checkout"]
+    assert body["errors"][0] == f"{EXISTING_PATH} is not indexed as {NEW_ID}"
+
+
+def test_a_bound_identity_writing_its_own_held_document_is_admitted(client, held, tmp_path, monkeypatch):
+    _bind(tmp_path, monkeypatch)
+    held("library/spec/example", "operator")
+    r = client.post("/reference/admission", headers=_h(AGENT),
+                    json={"frontmatter": _fm(), "owner": "operator",
+                          "path": EXISTING_PATH})
+    body = r.json()
+    assert body["may_land"] is True, body
+    assert body["clauses_checked"] == ["frontmatter", "checkout"]
+
+
+def test_an_unreadable_index_refuses_a_held_update_naming_a_path(client, held, tmp_path, monkeypatch):
+    """Without the index the path cannot be bound to its document, so the
+    write is refused rather than checked on the frontmatter id alone, which
+    would let a held id carry a write to another document's file."""
+    held(NEW_ID, "operator")
+    monkeypatch.setattr(reference, "INDEX_DB", tmp_path / "no-such-index.db")
+    r = client.post("/reference/admission", headers=_h(AGENT),
+                    json={"frontmatter": _fm(id=NEW_ID), "owner": "operator",
+                          "path": EXISTING_PATH})
+    body = r.json()
+    assert body["may_land"] is False
+    assert body["clauses_refused"] == ["checkout"]
+    assert "could not be read to bind" in body["errors"][0]
+
+
+def test_a_create_naming_no_path_is_not_waived(client, held):
+    """Without the path the write commits, nothing ties the frontmatter id to
+    a file, so nothing is waived (security-reviewer, PR #306 round 1)."""
+    r = client.post("/reference/admission", headers=_h(AGENT),
+                    json={"frontmatter": _fm(id=NEW_ID), "owner": "operator"})
+    body = r.json()
+    assert body["may_land"] is False
+    assert body["clauses_refused"] == ["checkout"]
+    assert body["clauses_waived"] == []
+
+
+def test_an_existing_path_labelled_with_a_fresh_id_is_refused(client, held):
+    """The round-1 attack: overwrite an indexed document by labelling the new
+    content with an id the index does not hold. The path binds the clause to
+    the document indexed there, and the mismatch is refused."""
+    r = client.post("/reference/admission", headers=_h(AGENT),
+                    json={"frontmatter": _fm(id=NEW_ID), "owner": "operator",
+                          "path": EXISTING_PATH, "create": True})
+    body = r.json()
+    assert body["may_land"] is False
+    assert body["clauses_refused"] == ["checkout"]
+    assert body["clauses_waived"] == []
+    assert "library/spec/example" in body["errors"][0]
+
+
+def test_an_existing_path_labelled_with_an_id_the_caller_holds_is_refused(client, held):
+    """The same attack before the waiver existed: hold a checkout on one id
+    and write another document's file under it."""
+    held(NEW_ID, "operator")
+    r = client.post("/reference/admission", headers=_h(AGENT),
+                    json={"frontmatter": _fm(id=NEW_ID), "owner": "operator",
+                          "path": EXISTING_PATH, "create": True})
+    body = r.json()
+    assert body["may_land"] is False
+    assert body["clauses_refused"] == ["checkout"]
+
+
+def test_an_existing_path_with_its_own_id_and_a_held_checkout_is_admitted(client, held):
+    held("library/spec/example", "operator")
+    r = client.post("/reference/admission", headers=_h(AGENT),
+                    json={"frontmatter": _fm(), "owner": "operator",
+                          "path": EXISTING_PATH})
+    body = r.json()
+    assert body["may_land"] is True, body
+    assert body["clauses_checked"] == ["frontmatter", "checkout"]
+
+
+def test_a_new_path_whose_id_is_indexed_elsewhere_is_not_waived(client, held):
+    r = client.post("/reference/admission", headers=_h(AGENT),
+                    json={"frontmatter": _fm(), "owner": "operator",
+                          "path": NEW_PATH, "create": True})
+    body = r.json()
+    assert body["may_land"] is False
+    assert body["clauses_waived"] == []
+
+
+@pytest.mark.parametrize("path", [7, "", "   "])
+def test_a_non_string_or_empty_path_is_a_400(client, held, path):
+    r = client.post("/reference/admission", headers=_h(AGENT),
+                    json={"frontmatter": _fm(), "owner": "operator", "path": path})
+    assert r.status_code == 400
+
+
+def test_an_over_long_path_is_a_400(client, held):
+    r = client.post("/reference/admission", headers=_h(AGENT),
+                    json={"frontmatter": _fm(), "owner": "operator",
+                          "path": "projects/" + "x" * store.MAX_REF + ".md"})
+    assert r.status_code == 400
+
+
+@pytest.mark.parametrize("create", ["true", 1, None])
+def test_a_non_boolean_create_is_a_400(client, held, create):
+    r = client.post("/reference/admission", headers=_h(AGENT),
+                    json={"frontmatter": _fm(id=NEW_ID), "owner": "operator",
+                          "path": NEW_PATH, "create": create})
+    assert r.status_code == 400
+
+
+@pytest.mark.parametrize("extra", [{}, {"create": False}])
+def test_an_update_the_index_has_not_caught_up_with_is_not_waived(client, held, extra):
+    """The round-2 finding: a document that just merged but is not yet
+    indexed reads as absent at both its path and its id. A second write to it
+    is an update, so the committer does not send `create: true`, and the
+    clause runs and refuses it for want of a checkout."""
+    r = client.post("/reference/admission", headers=_h(AGENT),
+                    json={"frontmatter": _fm(id=NEW_ID), "owner": "operator",
+                          "path": NEW_PATH, **extra})
+    body = r.json()
+    assert body["may_land"] is False
+    assert body["clauses_refused"] == ["checkout"]
+    assert body["clauses_waived"] == []
+    assert "no live checkout" in body["errors"][0]
+
+
+def test_a_crew_scoped_agent_creating_in_its_own_project_is_admitted(client, held, tmp_path, monkeypatch):
+    """The shape of a crew session's `kb_create`: an agent credential that
+    names its crew and is limited to its own project, creating a document the
+    index does not hold yet."""
+    crew_token = "crew-token-library"
+    tokens = tmp_path / "crew-tokens.json"
+    tokens.write_text(json.dumps({crew_token: {"name": "co-library", "products": ["library"],
+                                               "crew": "library"}}))
+    monkeypatch.setattr(identity, "TOKENS", tokens)
+    r = client.post("/reference/admission", headers=_h(crew_token),
+                    json={"frontmatter": _fm(id=NEW_ID), "owner": "co-library",
+                          "path": NEW_PATH, "create": True})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["may_land"] is True, body
+    assert body["clauses_waived"] == ["checkout"]
+
+
 # --- end to end: the bug this issue exists to fix -------------------------------
 
 
 def test_an_orient_editor_save_for_an_adopters_own_project_is_admitted(
         client, held, monkeypatch, tmp_path, registry):
     """`issue_01M3NS89KVRXB368VA4TJ38MDG`: a project `kb_create` made on a
-    fresh install, saved through Orient's in-window editor, must not be
-    refused for want of a row in the static baseline."""
-    registry({"filler": {}})
+    fresh install, saved through Orient's in-window editor, is admitted once
+    that install's registry names it (platform/decisions/0097 point 4) —
+    not for want of a row in a static baseline, and not on its name alone."""
+    registry({"adopter-app": {"kb": "central"}})
     (tmp_path / "projects" / "adopter-app").mkdir(parents=True)
     monkeypatch.setattr(reference_admission, "KNOWLEDGE_ROOT", str(tmp_path))
     held("adopter-app/reference/example", "operator")
@@ -1010,6 +1350,30 @@ def test_an_orient_editor_save_for_an_adopters_own_project_is_admitted(
     assert r.status_code == 200
     body = r.json()
     assert body["may_land"] is True, body
+
+
+@pytest.mark.parametrize("legacy, admitted", [(["lantern-kit"], True), ([], False)])
+def test_a_legacy_slug_with_documents_is_admitted_only_while_kb_legacy_names_it(
+        client, held, monkeypatch, tmp_path, registry, legacy, admitted):
+    """A legacy slug that holds documents in the knowledge tree and names no
+    registry unit is admitted only through `_kb_legacy`
+    (platform/decisions/0097 point 1). This is why CQ·227 must not deploy
+    before the registry change that lists it: without the entry, the same save
+    is refused."""
+    registry({"filler": {}, "_kb_legacy": legacy})
+    (tmp_path / "projects" / "lantern-kit").mkdir(parents=True)
+    monkeypatch.setattr(reference_admission, "KNOWLEDGE_ROOT", str(tmp_path))
+    doc_id = "lantern-kit/reference/example"
+    held(doc_id, "operator")
+    r = client.post("/reference/admission", headers=_h(AGENT),
+                    json={"frontmatter": _fm(id=doc_id, project="lantern-kit"),
+                          "owner": "operator"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["may_land"] is admitted, body
+    if not admitted:
+        assert body["clauses_refused"] == ["frontmatter"]
+        assert any("lantern-kit" in e for e in body["errors"]), body
 
 
 # --- the live roster, read fresh through the route (issue_01M34SYVH2M48K2S0FQK3K6REY) --
@@ -1028,6 +1392,7 @@ def roster_db(tmp_path, monkeypatch):
         CREATE TABLE roster_agents (
             id INTEGER PRIMARY KEY,
             name TEXT NOT NULL UNIQUE,
+            source_doc TEXT,
             created_at TEXT NOT NULL,
             created_by TEXT NOT NULL,
             updated_at TEXT NOT NULL,
@@ -1052,12 +1417,18 @@ def test_a_name_added_by_put_is_admitted_and_removed_by_delete_is_refused(
     fail this the way it would fail a real caller."""
     tokens = tmp_path / "api-tokens-with-orchestrator.json"
     tokens.write_text(json.dumps({
-        AGENT: {"name": "vivy-agent", "products": ["vivy"]},
+        AGENT: {"name": "fennick-agent", "products": ["fennick"]},
         ORCHESTRATOR: {"name": "co-library", "products": ["*"],
                        "kind": "orchestrator"},
     }))
     monkeypatch.setattr(identity, "TOKENS", tokens)
-    black_box_tables.use_registry(tmp_path, monkeypatch)
+    # `ORDINARY_REGISTRY` alone registers no central/split kb project, and
+    # `_fm()`'s default `project: library` now needs the registry to name it
+    # (platform/decisions/0097 point 4) rather than a hardcoded literal.
+    black_box_tables.use_registry(tmp_path, monkeypatch, {
+        **black_box_tables.ORDINARY_REGISTRY,
+        "library": {"kb": "central"},
+    })
     fm = _fm(audience=["newcomer"])
 
     before = client.post("/reference/admission", headers=_h(AGENT),
@@ -1094,6 +1465,7 @@ def empty_roster_db(tmp_path, monkeypatch):
         CREATE TABLE roster_agents (
             id INTEGER PRIMARY KEY,
             name TEXT NOT NULL UNIQUE,
+            source_doc TEXT,
             created_at TEXT NOT NULL,
             created_by TEXT NOT NULL,
             updated_at TEXT NOT NULL,

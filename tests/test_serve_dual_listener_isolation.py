@@ -29,10 +29,10 @@ def test_run_tls_survivably_catches_and_logs_rather_than_raising(
         monkeypatch, capsys):
     monkeypatch.setattr(serve_dual, "_run", _boom)
 
-    asyncio.run(serve_dual._run_tls_survivably(object()))
+    asyncio.run(serve_dual._run_tls_survivably(object(), "127.0.0.1:8443"))
 
     err = capsys.readouterr().err
-    assert "mutual-TLS listener crashed" in err
+    assert "mutual-TLS listener on 127.0.0.1:8443 crashed" in err
     assert "RuntimeError" in err
     assert "accept() blew up" in err
 
@@ -50,7 +50,8 @@ def test_a_tls_crash_does_not_cancel_the_plain_listeners_task(monkeypatch):
 
     async def go():
         return await asyncio.gather(
-            _plain_completes(), serve_dual._run_tls_survivably(object()))
+            _plain_completes(),
+            serve_dual._run_tls_survivably(object(), "127.0.0.1:8443"))
 
     results = asyncio.run(go())
     assert results[0] == "plain-done"
@@ -82,7 +83,8 @@ def test_a_real_bind_conflict_is_survived_not_just_a_synthetic_exception():
 
         async def go():
             return await asyncio.gather(
-                _plain_completes(), serve_dual._run_tls_survivably(server))
+                _plain_completes(),
+                serve_dual._run_tls_survivably(server, f"127.0.0.1:{port}"))
 
         results = asyncio.run(go())
         assert results[0] == "plain-done"
@@ -106,7 +108,8 @@ def test_a_plain_listener_crash_still_propagates(monkeypatch):
 
     async def go():
         return await asyncio.gather(
-            _plain_boom(), serve_dual._run_tls_survivably(object()))
+            _plain_boom(),
+            serve_dual._run_tls_survivably(object(), "127.0.0.1:8443"))
 
     try:
         asyncio.run(go())

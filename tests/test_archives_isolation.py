@@ -39,13 +39,13 @@ import projects
 import protocol
 import store
 
-AGENT = "agent-token-vivy"       # scoped to product "vivy"
-OTHER = "agent-token-constance"  # scoped to product "constance"
+AGENT = "agent-token-fennick"       # scoped to product "fennick"
+OTHER = "agent-token-marlow"  # scoped to product "marlow"
 
 # Neither project is private — `projects.private_repos()` and
 # `projects.private_crew_names()` are ADR-0043's disclosure wall, orthogonal
 # to the scope property this file is about.
-REGISTRY = {"vivy": {}, "constance": {}}
+REGISTRY = {"fennick": {}, "marlow": {}}
 
 
 @pytest.fixture
@@ -71,8 +71,8 @@ def client(tmp_path, monkeypatch, vector_index):
 
     tokens = tmp_path / "api-tokens.json"
     tokens.write_text(json.dumps({
-        AGENT: {"name": "vivy-agent", "products": ["vivy"]},
-        OTHER: {"name": "constance-agent", "products": ["constance"]},
+        AGENT: {"name": "fennick-agent", "products": ["fennick"]},
+        OTHER: {"name": "marlow-agent", "products": ["marlow"]},
     }))
     registry = tmp_path / "projects.json"
     registry.write_text(json.dumps(REGISTRY))
@@ -99,7 +99,7 @@ def _h(token=AGENT):
 
 def _body(**over):
     out = {"source": "github", "kind": "note", "actor": "someone",
-           "product": "vivy", "body": "a thing happened"}
+           "product": "fennick", "body": "a thing happened"}
     out.update(over)
     return out
 
@@ -123,25 +123,25 @@ def test_ingested_by_ignores_a_payload_naming_another_submitter(client):
     name must not land in the audit column — it is taken from the token."""
     created = client.post(
         "/signals",
-        json=_body(ingested_by="constance-agent", actor="constance-agent"),
+        json=_body(ingested_by="marlow-agent", actor="marlow-agent"),
         headers=_h(AGENT)).json()
     stored = _row(created["id"])
-    assert stored["ingested_by"] == "vivy-agent"
+    assert stored["ingested_by"] == "fennick-agent"
     got = client.get(f"/signals/{created['id']}", headers=_h(AGENT))
     assert got.status_code == 200
-    assert got.json()["ingested_by"] == "vivy-agent"
+    assert got.json()["ingested_by"] == "fennick-agent"
 
 
 def test_two_submitters_rows_are_distinguishable_by_ingested_by(client):
     """Two different credentials, each writing in its own scope, each leave a
     row that names its own actor rather than a shared or borrowed one."""
-    mine = client.post("/signals", json=_body(product="vivy"),
+    mine = client.post("/signals", json=_body(product="fennick"),
                        headers=_h(AGENT)).json()
-    theirs = client.post("/signals", json=_body(product="constance"),
+    theirs = client.post("/signals", json=_body(product="marlow"),
                          headers=_h(OTHER)).json()
     mine_row, theirs_row = _row(mine["id"]), _row(theirs["id"])
-    assert mine_row["ingested_by"] == "vivy-agent"
-    assert theirs_row["ingested_by"] == "constance-agent"
+    assert mine_row["ingested_by"] == "fennick-agent"
+    assert theirs_row["ingested_by"] == "marlow-agent"
     assert mine_row["ingested_by"] != theirs_row["ingested_by"]
 
 
@@ -197,27 +197,27 @@ def test_a_resubmission_with_the_same_dedup_key_does_not_alter_the_row(client):
 
 @pytest.fixture
 def two_products(client):
-    """One signal in `vivy`, one in `constance`, each created (and embedded)
+    """One signal in `fennick`, one in `marlow`, each created (and embedded)
     by the credential scoped to that product — real writes through the route
     under test, not a schema fixture standing in for it."""
-    vivy = client.post(
+    fennick = client.post(
         "/signals",
-        json=_body(product="vivy", body="vivy team shipped the archives release"),
+        json=_body(product="fennick", body="fennick team shipped the archives release"),
         headers=_h(AGENT)).json()
-    constance = client.post(
+    marlow = client.post(
         "/signals",
-        json=_body(product="constance",
-                  body="constance team shipped the archives release"),
+        json=_body(product="marlow",
+                  body="marlow team shipped the archives release"),
         headers=_h(OTHER)).json()
-    return vivy, constance
+    return fennick, marlow
 
 
 def test_list_signals_excludes_the_other_products_row(client, two_products):
-    vivy, constance = two_products
+    fennick, marlow = two_products
     body = client.get("/signals", headers=_h(AGENT)).json()
     ids = {s["id"] for s in body["signals"]}
-    assert vivy["id"] in ids
-    assert constance["id"] not in ids
+    assert fennick["id"] in ids
+    assert marlow["id"] not in ids
     # THE COUNT ITSELF, not only the page — `_scope_clause` is applied in the
     # query, so `total` must not count a row the caller cannot list either.
     assert body["total"] == 1
@@ -226,10 +226,10 @@ def test_list_signals_excludes_the_other_products_row(client, two_products):
 def test_get_signal_for_the_other_products_row_is_404(client, two_products):
     """404 rather than 403, matching `_readable_signal`'s own reasoning: a 403
     would confirm the row exists to a caller out of scope for it."""
-    vivy, constance = two_products
-    assert client.get(f"/signals/{constance['id']}",
+    fennick, marlow = two_products
+    assert client.get(f"/signals/{marlow['id']}",
                       headers=_h(AGENT)).status_code == 404
-    assert client.get(f"/signals/{vivy['id']}",
+    assert client.get(f"/signals/{fennick['id']}",
                       headers=_h(AGENT)).status_code == 200
 
 
@@ -239,15 +239,15 @@ def test_search_signals_excludes_the_other_products_row(client, two_products):
     route's one security property. Both rows share the query phrase, so a
     scoped reader that saw the other product's row would have to have found
     it through similarity rather than through a filter that let it slip."""
-    vivy, constance = two_products
+    fennick, marlow = two_products
     r = client.get("/signals/search",
                    params={"q": "shipped the archives release"},
                    headers=_h(AGENT))
     assert r.status_code == 200
     body = r.json()
     ids = {s["id"] for s in body["signals"]}
-    assert vivy["id"] in ids
-    assert constance["id"] not in ids
+    assert fennick["id"] in ids
+    assert marlow["id"] not in ids
 
 
 def test_signal_facets_exclude_the_other_products_counts(client, two_products):
@@ -258,6 +258,6 @@ def test_signal_facets_exclude_the_other_products_counts(client, two_products):
     the fixture's side effect (two rows, one per product) is needed here."""
     body = client.get("/signals/facets", headers=_h(AGENT)).json()
     assert body["total"] == 1
-    assert body["products"] == ["vivy"]
+    assert body["products"] == ["fennick"]
     assert sum(n for _, n in body["by_source"]) == 1
     assert sum(n for _, n in body["by_kind"]) == 1

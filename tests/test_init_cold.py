@@ -95,7 +95,7 @@ def test_a_second_run_is_a_no_op(tmp_path, monkeypatch):
     conn.execute(
         "INSERT INTO signals (id, source, kind, actor, ingested_by, "
         "product, refs, body, meta, privacy_class, ingested_at) VALUES "
-        "('sig_x','t','note','a','a','vivy','{}','b','{}','internal',"
+        "('sig_x','t','note','a','a','fennick','{}','b','{}','internal',"
         "'2026-01-01 00:00:00')")
     conn.commit()
     conn.close()

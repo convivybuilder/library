@@ -27,13 +27,13 @@ import projects
 import protocol
 import store
 
-AGENT = "agent-token-vivy"
+AGENT = "agent-token-fennick"
 WIDE = "agent-token-wide"
 SYSTEM = "system-token"
 NOSCOPE = "agent-token-noscope"
 
 # A private project (ADR-0043) with one repo, alongside the ordinary products
-# the rest of this file writes to. Neither "vivy" nor "constance" is private,
+# the rest of this file writes to. Neither "fennick" nor "marlow" is private,
 # so the black-box guard is a no-op for every test that predates it.
 #
 # `privatecrew` is a second private project whose `display`, `crew` and
@@ -44,8 +44,8 @@ NOSCOPE = "agent-token-noscope"
 # project reachable by a spelling `private_repos()` does not carry.
 REGISTRY = {
     "_meta": {},
-    "vivy": {"repos": ["vivy"], "aliases": ["vivy-old"]},
-    "constance": {"repos": ["constance"]},
+    "fennick": {"repos": ["fennick"], "aliases": ["fennick-old"]},
+    "marlow": {"repos": ["marlow"]},
     "secretproject": {"private": True, "repos": ["secret-repo"]},
     "privatecrew": {
         "private": True,
@@ -78,18 +78,18 @@ def client(tmp_path, monkeypatch, vector_index):
         "ingested_at, dedup_key) VALUES (?,?,?,?,?,?,?)",
         # One row per collision case the no-leak rule has to answer differently:
         # in the caller's scope, in another product, and customer-class.
-        [("sig_mine", "vivy", "note", "already captured", "internal",
+        [("sig_mine", "fennick", "note", "already captured", "internal",
           "2026-08-01 07:30:00.000000", "key-mine"),
-         ("sig_other", "constance", "note", "another product's row", "internal",
+         ("sig_other", "marlow", "note", "another product's row", "internal",
           "2026-08-01 07:31:00.000000", "key-other"),
-         ("sig_cust", "vivy", "note", "a customer wrote this", "customer",
+         ("sig_cust", "fennick", "note", "a customer wrote this", "customer",
           "2026-08-01 07:32:00.000000", "key-customer")])
     conn.commit()
     conn.close()
 
     tokens = tmp_path / "api-tokens.json"
     tokens.write_text(json.dumps({
-        AGENT: {"name": "vivy-agent", "products": ["vivy"]},
+        AGENT: {"name": "fennick-agent", "products": ["fennick"]},
         WIDE: {"name": "wide-agent", "products": ["*"]},
         SYSTEM: {"name": "capture", "products": ["*"], "kind": "system"},
         NOSCOPE: {"name": "scopeless", "products": []},
@@ -119,7 +119,7 @@ def _h(token=AGENT):
 
 def _body(**over):
     out = {"source": "github", "kind": "note", "actor": "someone",
-           "product": "vivy", "body": "a thing happened"}
+           "product": "fennick", "body": "a thing happened"}
     out.update(over)
     return out
 
@@ -206,7 +206,7 @@ def test_an_unknown_token_cannot_write(client):
 def test_writing_outside_scope_is_404_not_403(client):
     """The same answer the read surface gives. A caller must not learn which
     products exist by being told it may not write to one."""
-    r = client.post("/signals", json=_body(product="constance"), headers=_h())
+    r = client.post("/signals", json=_body(product="marlow"), headers=_h())
     assert r.status_code == 404
 
 
@@ -287,10 +287,10 @@ def test_a_self_registered_black_box_is_refused_even_when_not_marked_private(
         client):
     """A crew that registered itself through `POST /black-box/registrations`
     is a black box whether or not the project registry's `private` flag
-    agrees — the project `vivy` is not private in this fixture's registry."""
-    _register_black_box("vivy")
+    agrees — the project `fennick` is not private in this fixture's registry."""
+    _register_black_box("fennick")
     before = _stored_signals()
-    r = client.post("/signals", json=_body(product="vivy"), headers=_h())
+    r = client.post("/signals", json=_body(product="fennick"), headers=_h())
     assert r.status_code == 404
     assert _stored_signals() == before
 
@@ -304,7 +304,7 @@ def test_an_unreadable_registry_refuses_rather_than_risking_a_black_box(
     monkeypatch.setattr(projects, "REGISTRY_PATH", tmp_path / "gone.json")
     projects.reload()
     before = _stored_signals()
-    r = client.post("/signals", json=_body(product="vivy"), headers=_h())
+    r = client.post("/signals", json=_body(product="fennick"), headers=_h())
     assert r.status_code == 503
     assert "registry" in r.json()["error"]
     assert _stored_signals() == before
@@ -313,7 +313,7 @@ def test_an_unreadable_registry_refuses_rather_than_risking_a_black_box(
 def test_an_ordinary_product_still_gets_captured(client):
     """The guard is a no-op for a product that is neither privately
     registered nor self-registered as a black box."""
-    r = client.post("/signals", json=_body(product="vivy"), headers=_h())
+    r = client.post("/signals", json=_body(product="fennick"), headers=_h())
     assert r.status_code == 201
     stored = _stored_signals()
     assert any(row["id"] == r.json()["id"] for row in stored)
@@ -368,7 +368,7 @@ def test_a_case_variant_cannot_smuggle_customer_content_past_the_wall(client):
                                      body="a customer wrote this"),
                           headers=_h(WIDE))
     assert created.status_code == 400
-    listed = client.get("/signals?product=vivy", headers=_h()).json()
+    listed = client.get("/signals?product=fennick", headers=_h()).json()
     assert not any("a customer wrote this" in s["body"]
                    for s in listed["signals"])
 
@@ -409,7 +409,7 @@ def test_a_non_string_product_is_refused_rather_than_crashing(client):
     """It reached `identity.in_scope`, where `product in ident.products` raised
     `TypeError: unhashable type` for any non-wildcard token — a caller-triggered
     500 inside the function that enforces product scoping."""
-    r = client.post("/signals", json=_body(product=["vivy"]), headers=_h())
+    r = client.post("/signals", json=_body(product=["fennick"]), headers=_h())
     assert r.status_code == 400
     assert "product" in r.json()["error"]
 
@@ -485,18 +485,18 @@ def test_a_collision_in_the_callers_own_scope_returns_the_row(client):
 
 
 def test_a_collision_in_another_product_carries_nothing(client):
-    """**The oracle this rule exists to close.** The key matched a `constance`
+    """**The oracle this rule exists to close.** The key matched a `marlow`
     row; answering with it would report content the read surface refuses to this
     caller, purely because they guessed a key."""
     r = client.post("/signals", json=_body(dedup_key="key-other"), headers=_h())
     assert r.status_code == 409
     assert r.json() == {"error": "dedup_key already in use"}
-    assert "constance" not in r.text and "another product" not in r.text
+    assert "marlow" not in r.text and "another product" not in r.text
 
 
 def test_a_collision_on_customer_content_carries_nothing(client):
     """Same rule, customer wall instead of product scope. The caller is in scope
-    for `vivy` and still must not receive this row."""
+    for `fennick` and still must not receive this row."""
     r = client.post("/signals", json=_body(dedup_key="key-customer"),
                     headers=_h())
     assert r.status_code == 409
@@ -536,20 +536,20 @@ def test_the_gate_asks_for_the_capability_as_well_as_the_scope():
     watched the wrong door.
     """
     scoped_but_incapable = identity.Identity(
-        actor="future-role", kind="reader", products=frozenset({"vivy"}))
+        actor="future-role", kind="reader", products=frozenset({"fennick"}))
     assert not identity.authorized(scoped_but_incapable, "signal.create")
-    assert identity.in_scope(scoped_but_incapable, "vivy")
+    assert identity.in_scope(scoped_but_incapable, "fennick")
     assert not libapp._can_return_existing(
-        scoped_but_incapable, {"product": "vivy", "privacy_class": "internal"})
+        scoped_but_incapable, {"product": "fennick", "privacy_class": "internal"})
 
 
 def test_the_gate_still_admits_a_caller_that_holds_both_halves():
     """The other direction, so the check above cannot be satisfied by a gate that
     refuses everyone."""
     capable = identity.Identity(actor="a", kind="agent",
-                                products=frozenset({"vivy"}))
+                                products=frozenset({"fennick"}))
     assert libapp._can_return_existing(
-        capable, {"product": "vivy", "privacy_class": "internal"})
+        capable, {"product": "fennick", "privacy_class": "internal"})
 
 
 def test_a_create_only_caller_is_refused_the_row_at_the_route(
@@ -577,11 +577,11 @@ def test_the_read_half_is_asked_as_well_as_the_create_half(monkeypatch):
         **identity.ROLE_CAPS,
         "create_only": frozenset({"signal.create"})})
     create_only = identity.Identity(actor="future-role", kind="create_only",
-                                    products=frozenset({"vivy"}))
+                                    products=frozenset({"fennick"}))
     assert identity.authorized(create_only, "signal.create")
     assert not identity.authorized(create_only, "signal.read")
     assert not libapp._can_return_existing(
-        create_only, {"product": "vivy", "privacy_class": "internal"})
+        create_only, {"product": "fennick", "privacy_class": "internal"})
 
 
 def test_the_customer_wall_asks_for_the_read_capability_as_well(monkeypatch):
@@ -596,11 +596,11 @@ def test_the_customer_wall_asks_for_the_read_capability_as_well(monkeypatch):
         "mint_no_customer_read": frozenset(
             {"signal.create", "signal.create_customer", "signal.read"})})
     ident = identity.Identity(actor="future-role", kind="mint_no_customer_read",
-                              products=frozenset({"vivy"}))
+                              products=frozenset({"fennick"}))
     assert identity.authorized(ident, "signal.create_customer")
     assert not identity.authorized(ident, "signal.customer")
     assert not libapp._can_return_existing(
-        ident, {"product": "vivy", "privacy_class": "customer"})
+        ident, {"product": "fennick", "privacy_class": "customer"})
 
 
 def test_a_system_identity_may_be_handed_the_customer_row(client):
@@ -639,7 +639,7 @@ def test_the_ingester_is_recorded_from_the_token_not_the_payload(client):
     stored = conn.execute("SELECT ingested_by FROM signals WHERE id = ?",
                           (created["id"],)).fetchone()[0]
     conn.close()
-    assert stored == "vivy-agent"
+    assert stored == "fennick-agent"
 
 
 @pytest.mark.parametrize("field,cap", [
@@ -853,7 +853,7 @@ def test_an_unparseable_produced_at_becomes_null_rather_than_failing(client):
 
 
 def test_a_missing_required_field_is_refused_and_named(client):
-    r = client.post("/signals", json={"product": "vivy", "kind": "note",
+    r = client.post("/signals", json={"product": "fennick", "kind": "note",
                                       "actor": "x"}, headers=_h())
     assert r.status_code == 400
     assert "source" in r.json()["error"]
@@ -945,11 +945,11 @@ def _signal_product(signal_id):
 def test_a_pr_states_product_is_derived_from_meta_repo_and_stored(client):
     r = client.post(
         "/signals",
-        json=_body(kind="pr_state", product="vivy",
-                   meta={"repo": "convivy/vivy"}),
+        json=_body(kind="pr_state", product="fennick",
+                   meta={"repo": "convivy/fennick"}),
         headers=_h(WIDE))
     assert r.status_code == 201
-    assert _signal_product(r.json()["id"]) == "vivy"
+    assert _signal_product(r.json()["id"]) == "fennick"
 
 
 def test_a_pr_state_product_disagreeing_with_an_in_scope_derivation_is_refused(
@@ -959,26 +959,26 @@ def test_a_pr_state_product_disagreeing_with_an_in_scope_derivation_is_refused(
     before = _stored_signals()
     r = client.post(
         "/signals",
-        json=_body(kind="pr_state", product="constance",
-                   meta={"repo": "convivy/vivy"},
+        json=_body(kind="pr_state", product="marlow",
+                   meta={"repo": "convivy/fennick"},
                    dedup_key="pr-state-mismatch"),
         headers=_h(WIDE))
     assert r.status_code == 400
-    assert r.json()["product"] == "vivy"
+    assert r.json()["product"] == "fennick"
     assert _stored_signals() == before
 
 
 def test_a_pr_state_under_an_alias_is_stored_under_the_derived_slug(client):
-    """`vivy-old` resolves to `vivy`, so it passes the comparison; storing it
+    """`fennick-old` resolves to `fennick`, so it passes the comparison; storing it
     as spelled would put this PR's rows under two literal products
     (reviewer, PR #262 round 1)."""
     r = client.post(
         "/signals",
-        json=_body(kind="pr_state", product="vivy-old",
-                   meta={"repo": "convivy/vivy"}),
+        json=_body(kind="pr_state", product="fennick-old",
+                   meta={"repo": "convivy/fennick"}),
         headers=_h(WIDE))
     assert r.status_code == 201
-    assert _signal_product(r.json()["id"]) == "vivy"
+    assert _signal_product(r.json()["id"]) == "fennick"
 
 
 @pytest.mark.parametrize("repo", ["secret-repo", "convivy/secret-repo"])
@@ -989,7 +989,7 @@ def test_a_mismatch_against_a_private_repo_is_a_plain_404(client, repo):
     before = _stored_signals()
     r = client.post(
         "/signals",
-        json=_body(kind="pr_state", product="vivy", meta={"repo": repo},
+        json=_body(kind="pr_state", product="fennick", meta={"repo": repo},
                    dedup_key=f"pr-state-private-{repo}"),
         headers=_h(WIDE))
     assert r.status_code == 404
@@ -999,20 +999,20 @@ def test_a_mismatch_against_a_private_repo_is_a_plain_404(client, repo):
 
 def test_a_pr_state_product_disagreeing_with_an_out_of_scope_derivation_is_404(
         client):
-    """`AGENT` is scoped only to `vivy`. Its `product: "vivy"` passes the
+    """`AGENT` is scoped only to `fennick`. Its `product: "fennick"` passes the
     scope check at the top of the route, but `meta.repo` here resolves to
-    `constance`, a product this caller cannot see — the same 404 the scope,
+    `marlow`, a product this caller cannot see — the same 404 the scope,
     black-box and handoff checks above answer with, so the route is not an
     oracle for which repositories map to which products."""
     before = _stored_signals()
     r = client.post(
         "/signals",
-        json=_body(kind="pr_state", product="vivy",
-                   meta={"repo": "convivy/constance"},
+        json=_body(kind="pr_state", product="fennick",
+                   meta={"repo": "convivy/marlow"},
                    dedup_key="pr-state-oracle"),
         headers=_h(AGENT))
     assert r.status_code == 404
-    assert "constance" not in r.text
+    assert "marlow" not in r.text
     assert _stored_signals() == before
 
 
@@ -1020,7 +1020,7 @@ def test_a_pr_state_with_no_meta_repo_is_refused(client):
     before = _stored_signals()
     r = client.post(
         "/signals",
-        json=_body(kind="pr_state", product="vivy", dedup_key="pr-state-no-repo"),
+        json=_body(kind="pr_state", product="fennick", dedup_key="pr-state-no-repo"),
         headers=_h(WIDE))
     assert r.status_code == 404
     assert _stored_signals() == before
@@ -1030,7 +1030,7 @@ def test_a_pr_state_whose_repo_the_registry_does_not_know_is_refused(client):
     before = _stored_signals()
     r = client.post(
         "/signals",
-        json=_body(kind="pr_state", product="vivy",
+        json=_body(kind="pr_state", product="fennick",
                    meta={"repo": "convivy/no-such-repo"},
                    dedup_key="pr-state-unresolvable"),
         headers=_h(WIDE))
@@ -1045,8 +1045,8 @@ def test_a_pr_state_write_503s_on_an_unreadable_registry(
     before = _stored_signals()
     r = client.post(
         "/signals",
-        json=_body(kind="pr_state", product="vivy",
-                   meta={"repo": "convivy/vivy"},
+        json=_body(kind="pr_state", product="fennick",
+                   meta={"repo": "convivy/fennick"},
                    dedup_key="pr-state-registry-down"),
         headers=_h(WIDE))
     assert r.status_code == 503
@@ -1058,11 +1058,11 @@ def test_a_model_resolutions_disagreeing_meta_repo_is_refused(client):
     before = _stored_signals()
     r = client.post(
         "/signals",
-        json=_body(kind="model_resolution", product="constance",
-                   meta={"repo": "vivy"}, dedup_key="model-resolution-mismatch"),
+        json=_body(kind="model_resolution", product="marlow",
+                   meta={"repo": "fennick"}, dedup_key="model-resolution-mismatch"),
         headers=_h(WIDE))
     assert r.status_code == 400
-    assert r.json()["product"] == "vivy"
+    assert r.json()["product"] == "fennick"
     assert _stored_signals() == before
 
 
@@ -1072,7 +1072,46 @@ def test_a_model_resolution_with_no_meta_repo_is_left_unchecked(client):
     refused for a field its writer never sent."""
     r = client.post(
         "/signals",
-        json=_body(kind="model_resolution", product="constance"),
+        json=_body(kind="model_resolution", product="marlow"),
         headers=_h(WIDE))
     assert r.status_code == 201
-    assert _signal_product(r.json()["id"]) == "constance"
+    assert _signal_product(r.json()["id"]) == "marlow"
+
+
+def test_a_code_coverages_disagreeing_meta_repo_is_refused(client):
+    """`GET /signals/coverage` ranks a repo's rows before it checks the
+    winner against scope and the wall, correct only while every
+    `code_coverage` row for one repo carries the same product — the same
+    dependency `pr_state`'s own check above exists to hold."""
+    before = _stored_signals()
+    r = client.post(
+        "/signals",
+        json=_body(kind="code_coverage", product="marlow",
+                   meta={"repo": "convivy/fennick"},
+                   dedup_key="code-coverage-mismatch"),
+        headers=_h(WIDE))
+    assert r.status_code == 400
+    assert r.json()["product"] == "fennick"
+    assert _stored_signals() == before
+
+
+def test_a_code_coverages_product_is_derived_from_meta_repo_and_stored(client):
+    r = client.post(
+        "/signals",
+        json=_body(kind="code_coverage", product="fennick",
+                   meta={"repo": "convivy/fennick"}),
+        headers=_h(WIDE))
+    assert r.status_code == 201
+    assert _signal_product(r.json()["id"]) == "fennick"
+
+
+def test_a_code_coverage_with_no_meta_repo_is_left_unchecked(client):
+    """`code_coverage` (agent-platform#1114) is new enough that every row
+    carries `meta.repo`, but the check still only runs when it is present,
+    the same leniency `model_resolution` gets above."""
+    r = client.post(
+        "/signals",
+        json=_body(kind="code_coverage", product="marlow"),
+        headers=_h(WIDE))
+    assert r.status_code == 201
+    assert _signal_product(r.json()["id"]) == "marlow"

@@ -46,11 +46,11 @@ import vectors
 
 REPO = Path(__file__).resolve().parent.parent
 
-AGENT = "agent-token-vivy"
+AGENT = "agent-token-fennick"
 
 REGISTRY = {
     "_meta": {},
-    "vivy": {"repos": []},
+    "fennick": {"repos": []},
 }
 
 
@@ -64,7 +64,7 @@ def _ts(**delta):
             - _dt.timedelta(**delta)).isoformat(" ")
 
 
-def _insert_signal(db_path, sig_id, kind, *, product="vivy", body="body",
+def _insert_signal(db_path, sig_id, kind, *, product="fennick", body="body",
                     refs=None, meta=None, ingested_at=None, embedded_at="x",
                     dedup_key=None, privacy_class="internal", stream=None):
     conn = sqlite3.connect(db_path)
@@ -97,7 +97,7 @@ def env(tmp_path, monkeypatch, vector_index):
 
     tokens = tmp_path / "api-tokens.json"
     tokens.write_text(json.dumps({
-        AGENT: {"name": "vivy-agent", "products": ["vivy"]},
+        AGENT: {"name": "fennick-agent", "products": ["fennick"]},
     }))
 
     vector_index(db)
@@ -384,6 +384,53 @@ def test_pr_state_lists_a_closed_pr_inside_90_days_that_is_cold(env):
     assert 2 in numbers
 
 
+# --- ci-workflow-runs (CQ·253) ----------------------------------------------
+
+
+def test_ci_workflow_runs_serves_a_run_whose_only_row_is_cold(env):
+    db, cold = env
+    _insert_signal(db, "sig_run", "ci_workflow_run",
+                   meta={"repo": "convivy/library", "run_id": 1,
+                        "branch": "main", "head_sha": "sha1", "event": "push",
+                        "status": "completed", "conclusion": "success",
+                        "created_at": "2026-10-01T00:00:00Z",
+                        "updated_at": "2026-10-01T00:05:00Z"},
+                   ingested_at=_ts(days=60))
+    _move(db, cold, "sig_run")
+
+    client = TestClient(libapp.app)
+    r = client.get("/signals/ci-workflow-runs", headers=_h())
+    assert r.status_code == 200
+    run_ids = [run["run_id"] for run in r.json()["runs"]]
+    assert 1 in run_ids
+
+
+# --- coverage (CQ·253) ------------------------------------------------------
+
+
+def test_coverage_serves_a_repo_whose_only_row_is_cold(env, monkeypatch):
+    db, cold = env
+    monkeypatch.setattr(
+        libapp.ci_tracked, "deck_tracked_repos",
+        lambda reg=None: [{"repo": "convivy/library", "product": "fennick"}])
+    _insert_signal(db, "sig_cov", "code_coverage",
+                   meta={"repo": "convivy/library", "percent": 85.0,
+                        "source": "totals.percent_covered",
+                        "artifact_id": "art-cold", "workflow_run_id": 9,
+                        "head_sha": "sha-cold", "branch": "main",
+                        "artifact_created_at": "2026-10-01T00:00:00Z"},
+                   ingested_at=_ts(days=60))
+    _move(db, cold, "sig_cov")
+
+    client = TestClient(libapp.app)
+    r = client.get("/signals/coverage", headers=_h())
+    assert r.status_code == 200
+    entry = [c for c in r.json()["coverage"]
+             if c["repo"] == "convivy/library"][0]
+    assert entry["percent"] == 85.0
+    assert entry["reason"] is None
+
+
 # --- acks --------------------------------------------------------------
 
 
@@ -396,7 +443,7 @@ def test_ack_a_cold_signal_succeeds(env, monkeypatch, tmp_path):
     # `identity.TOKENS` (`test_signal_acks.py`'s own fixture).
     client_tokens = tmp_path / "client-tokens.json"
     client_tokens.write_text(json.dumps({
-        "client-token": {"name": "orient", "products": ["vivy"]}}))
+        "client-token": {"name": "orient", "products": ["fennick"]}}))
     monkeypatch.setattr(identity, "CLIENT_TOKENS", client_tokens)
 
     client = TestClient(libapp.app)
@@ -419,7 +466,7 @@ def test_a_dedup_repost_of_a_moved_signal_returns_the_cold_row_unchanged(env):
     client = TestClient(libapp.app)
     r = client.post("/signals", json={
         "source": "test", "kind": "note", "actor": "someone",
-        "product": "vivy", "body": "a different body", "dedup_key": "dk1"},
+        "product": "fennick", "body": "a different body", "dedup_key": "dk1"},
         headers=_h())
 
     assert r.status_code == 200
@@ -446,7 +493,7 @@ def test_a_dedup_repost_of_a_moved_signal_answers_503_when_the_cold_file_is_gone
     client = TestClient(libapp.app)
     r = client.post("/signals", json={
         "source": "test", "kind": "note", "actor": "someone",
-        "product": "vivy", "body": "a different body", "dedup_key": "dk1"},
+        "product": "fennick", "body": "a different body", "dedup_key": "dk1"},
         headers=_h())
 
     assert r.status_code == 503
@@ -470,7 +517,7 @@ def test_a_dedup_repost_of_a_moved_signal_answers_503_when_LIBRARY_COLD_DB_is_un
     client = TestClient(libapp.app)
     r = client.post("/signals", json={
         "source": "test", "kind": "note", "actor": "someone",
-        "product": "vivy", "body": "a different body", "dedup_key": "dk1"},
+        "product": "fennick", "body": "a different body", "dedup_key": "dk1"},
         headers=_h())
 
     assert r.status_code == 503
@@ -686,7 +733,7 @@ def test_interrupted_restore_before_step_1_commits_leaves_it_cold_only(
     client = TestClient(libapp.app)
     r = client.post("/signals", json={
         "source": "test", "kind": "note", "actor": "someone",
-        "product": "vivy", "body": "x", "dedup_key": "dk1"}, headers=_h())
+        "product": "fennick", "body": "x", "dedup_key": "dk1"}, headers=_h())
     assert r.status_code == 200
     assert r.json()["id"] == "sig_a"
 

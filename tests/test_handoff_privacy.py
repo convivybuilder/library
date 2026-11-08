@@ -32,16 +32,16 @@ import store
 import vectors
 
 WIDE = "agent-token-wide"          # scoped "*", so scope alone admits everything
-CFO_SCOPED = "agent-token-cfo"     # scoped to "cfo" itself
+QUILL_SCOPED = "agent-token-quill"     # scoped to "quill" itself
 CLIENT_WIDE = "client-token-wide"  # approved_client, scoped "*" — signal.ack
 
-# `cfo`'s `aliases` entry exists so a row can be seeded under a non-canonical
+# `quill`'s `aliases` entry exists so a row can be seeded under a non-canonical
 # spelling that still resolves to the private slug — see
 # `test_handoff_wall_matches_a_stored_alias_spelling`, which is the one test
 # that needs it; every other test in this file seeds under the canonical
-# `"cfo"`.
-REGISTRY = {"vivy": {},
-           "cfo": {"private": True, "aliases": ["chief-financial"]}}
+# `"quill"`.
+REGISTRY = {"fennick": {},
+           "quill": {"private": True, "aliases": ["chief-financial"]}}
 
 
 @pytest.fixture
@@ -78,7 +78,7 @@ def client(tmp_path, monkeypatch, vector_index):
     tokens = tmp_path / "api-tokens.json"
     tokens.write_text(json.dumps({
         WIDE: {"name": "wide-agent", "products": ["*"]},
-        CFO_SCOPED: {"name": "cfo-agent", "products": ["cfo"]},
+        QUILL_SCOPED: {"name": "quill-agent", "products": ["quill"]},
     }))
     client_tokens = tmp_path / "client-tokens.json"
     client_tokens.write_text(json.dumps({
@@ -105,7 +105,7 @@ def _h(token=WIDE):
 
 def _body(**over):
     out = {"source": "co", "kind": "handoff", "actor": "someone",
-           "product": "vivy", "body": "a handoff worth remembering"}
+           "product": "fennick", "body": "a handoff worth remembering"}
     out.update(over)
     return out
 
@@ -141,14 +141,14 @@ def _seed(product: str, kind: str = "handoff", body: str = "a handoff worth reme
 
 
 def test_a_private_products_handoff_write_is_refused(client):
-    r = client.post("/signals", json=_body(product="cfo"), headers=_h())
+    r = client.post("/signals", json=_body(product="quill"), headers=_h())
     assert r.status_code == 404
 
 
 def test_a_private_products_handoff_write_is_refused_even_in_its_own_scope(client):
-    """Not merely the usual scope wall: a credential scoped to `cfo` itself
+    """Not merely the usual scope wall: a credential scoped to `quill` itself
     still cannot write a handoff under it."""
-    r = client.post("/signals", json=_body(product="cfo"), headers=_h(CFO_SCOPED))
+    r = client.post("/signals", json=_body(product="quill"), headers=_h(QUILL_SCOPED))
     assert r.status_code == 404
 
 
@@ -159,7 +159,7 @@ def test_a_non_private_products_handoff_lands_and_reads_back(client):
     handoff is never a semantic-search hit at all. `test_search_signals_...`
     below covers the search route's own wall by lifting that restriction for
     one test."""
-    created = client.post("/signals", json=_body(product="vivy"), headers=_h())
+    created = client.post("/signals", json=_body(product="fennick"), headers=_h())
     assert created.status_code == 201
     signal_id = created.json()["id"]
 
@@ -169,7 +169,7 @@ def test_a_non_private_products_handoff_lands_and_reads_back(client):
 
     listed = client.get(
         "/signals",
-        params={"kind": "handoff", "product": "vivy",
+        params={"kind": "handoff", "product": "fennick",
                 "order": "produced_at"},
         headers=_h())
     assert listed.status_code == 200
@@ -180,7 +180,7 @@ def test_a_non_private_products_handoff_lands_and_reads_back(client):
 def test_an_unreadable_registry_refuses_a_handoff_write(client, tmp_path, monkeypatch):
     monkeypatch.setattr(projects, "REGISTRY_PATH", tmp_path / "gone.json")
     projects.reload()
-    r = client.post("/signals", json=_body(product="vivy"), headers=_h())
+    r = client.post("/signals", json=_body(product="fennick"), headers=_h())
     assert r.status_code == 503
 
 
@@ -188,8 +188,8 @@ def test_an_unreadable_registry_refuses_a_handoff_write(client, tmp_path, monkey
 
 
 def test_list_signals_excludes_a_private_products_handoff(client):
-    private_id = _seed("cfo")["id"]
-    other_id = _seed("vivy")["id"]
+    private_id = _seed("quill")["id"]
+    other_id = _seed("fennick")["id"]
     body = client.get("/signals", params={"kind": "handoff"}, headers=_h()).json()
     ids = {s["id"] for s in body["signals"]}
     assert private_id not in ids
@@ -199,7 +199,7 @@ def test_list_signals_excludes_a_private_products_handoff(client):
 
 
 def test_get_signal_for_a_private_products_handoff_is_404(client):
-    private_id = _seed("cfo")["id"]
+    private_id = _seed("quill")["id"]
     r = client.get(f"/signals/{private_id}", headers=_h())
     assert r.status_code == 404
 
@@ -212,8 +212,8 @@ def test_search_signals_excludes_a_private_products_handoff(client, monkeypatch)
     exercises."""
     monkeypatch.setattr(vectors, "EMBEDDED_SIGNAL_KINDS",
                         vectors.EMBEDDED_SIGNAL_KINDS | {"handoff"})
-    private_id = _seed("cfo", body="the quarterly handoff notes")
-    other = _seed("vivy", body="the quarterly handoff notes")
+    private_id = _seed("quill", body="the quarterly handoff notes")
+    other = _seed("fennick", body="the quarterly handoff notes")
     r = client.get("/signals/search", params={"q": "the quarterly handoff notes"},
                    headers=_h())
     assert r.status_code == 200
@@ -228,7 +228,7 @@ def test_an_unreadable_registry_hides_a_handoff_rather_than_admitting_it(
     row's product against, `_handoff_wall`/`_private_handoff` hide every
     handoff rather than none — `projects.private_products()` returning
     `None` must not read as "nothing is private"."""
-    seeded = _seed("vivy")["id"]
+    seeded = _seed("fennick")["id"]
     monkeypatch.setattr(projects, "REGISTRY_PATH", tmp_path / "gone.json")
     projects.reload()
 
@@ -239,10 +239,10 @@ def test_an_unreadable_registry_hides_a_handoff_rather_than_admitting_it(
 
 def test_another_kind_for_the_same_private_product_is_unaffected(client):
     """The new wall is keyed on `kind`, not on the product alone: a `note`
-    row for the same private product `cfo` is unaffected by it — listable,
+    row for the same private product `quill` is unaffected by it — listable,
     fetchable by id, and findable by search, exactly like any other row a
     wildcard-scoped reader may see."""
-    note_id = _seed("cfo", kind="note", body="an ordinary note")["id"]
+    note_id = _seed("quill", kind="note", body="an ordinary note")["id"]
 
     listed = client.get("/signals", params={"kind": "note"}, headers=_h()).json()
     assert note_id in {s["id"] for s in listed["signals"]}
@@ -271,13 +271,13 @@ def test_dedup_collision_cannot_return_a_private_products_handoff(client):
     caller held every capability `_can_return_existing` checked (`signal.
     create`, scope, `signal.read`), so the collision answered `200` with the
     private handoff's own body."""
-    private = _seed("cfo", dedup_key="shared-dedup-key",
-                    body="the cfo's private handoff body")
+    private = _seed("quill", dedup_key="shared-dedup-key",
+                    body="the quill's private handoff body")
     r = client.post("/signals", json=_body(
-        kind="note", product="vivy", dedup_key="shared-dedup-key"),
+        kind="note", product="fennick", dedup_key="shared-dedup-key"),
         headers=_h())
     assert r.status_code == 409
-    assert "the cfo's private handoff body" not in r.text
+    assert "the quill's private handoff body" not in r.text
     assert private["id"] not in r.text
 
 
@@ -285,13 +285,13 @@ def test_facets_excludes_a_private_products_handoff(client):
     """`GET /signals/facets` applied the scope clause and the customer wall
     but no handoff wall, so a private handoff inflated `total`, appeared in
     `by_kind["handoff"]`, and its product surfaced in `products`."""
-    _seed("cfo")
-    _seed("vivy")
+    _seed("quill")
+    _seed("fennick")
     body = client.get("/signals/facets", headers=_h()).json()
     assert body["total"] == 1
     assert dict(body["by_kind"]).get("handoff") == 1
-    assert "cfo" not in body["products"]
-    assert "vivy" in body["products"]
+    assert "quill" not in body["products"]
+    assert "fennick" in body["products"]
 
 
 def _ack_row(signal_id: str, human: str = "operator"):
@@ -310,7 +310,7 @@ def test_get_signal_acks_excludes_a_private_products_handoff(client):
     """`_ack_visible` checked the customer wall and scope but not the
     handoff wall, so a private handoff's ack state was readable through
     `GET /signals/acks` by any identity in scope for its product."""
-    private_id = _seed("cfo")["id"]
+    private_id = _seed("quill")["id"]
     _ack_row(private_id, "operator")
     r = client.get("/signals/acks",
                    params={"signal_id": private_id, "acting_human": "operator"},
@@ -320,14 +320,14 @@ def test_get_signal_acks_excludes_a_private_products_handoff(client):
 
 
 def test_post_ack_refuses_a_private_products_handoff(client):
-    private_id = _seed("cfo")["id"]
+    private_id = _seed("quill")["id"]
     r = client.post(f"/signals/{private_id}/ack",
                     json={"acting_human": "operator"}, headers=_h(CLIENT_WIDE))
     assert r.status_code == 404
 
 
 def test_delete_ack_refuses_a_private_products_handoff(client):
-    private_id = _seed("cfo")["id"]
+    private_id = _seed("quill")["id"]
     _ack_row(private_id, "operator")
     r = client.request("DELETE", f"/signals/{private_id}/ack",
                        json={"acting_human": "operator"}, headers=_h(CLIENT_WIDE))
@@ -363,8 +363,8 @@ def test_read_gates_match_a_differently_cased_stored_kind(client):
     this route, could take) was listable and fetchable like any other row.
     No `kind` filter on the list call, since a stored `"Handoff"` would not
     match a lowercase `?kind=handoff` query param regardless of this wall."""
-    private_id = _seed("cfo", kind="Handoff")["id"]
-    other_id = _seed("vivy", kind="HANDOFF")["id"]
+    private_id = _seed("quill", kind="Handoff")["id"]
+    other_id = _seed("fennick", kind="HANDOFF")["id"]
     listed = client.get("/signals", headers=_h()).json()
     ids = {s["id"] for s in listed["signals"]}
     assert private_id not in ids
@@ -375,7 +375,7 @@ def test_read_gates_match_a_differently_cased_stored_kind(client):
 def test_handoff_wall_matches_a_stored_alias_spelling(client):
     """`_handoff_wall`'s SQL matched `product` against the canonical private
     slug alone, while `_private_handoff` calls `projects.resolve()` first —
-    so a row stored under `cfo`'s alias `chief-financial` was listed and
+    so a row stored under `quill`'s alias `chief-financial` was listed and
     searched (the SQL exact-match missed it) while 404ing on single-fetch
     (the per-row `resolve()` caught it). `_handoff_wall` now calls
     `_private_handoff` itself as a registered SQL function, so the SQL wall
@@ -396,8 +396,8 @@ def test_search_all_excludes_a_private_products_handoff(client, monkeypatch):
     Archives route excluded it."""
     monkeypatch.setattr(vectors, "EMBEDDED_SIGNAL_KINDS",
                         vectors.EMBEDDED_SIGNAL_KINDS | {"handoff"})
-    private = _seed("cfo", body="the quarterly handoff notes")
-    other = _seed("vivy", body="the quarterly handoff notes")
+    private = _seed("quill", body="the quarterly handoff notes")
+    other = _seed("fennick", body="the quarterly handoff notes")
     r = client.get("/search", params={"q": "the quarterly handoff notes",
                                       "vault": "archives"}, headers=_h())
     assert r.status_code == 200
@@ -414,8 +414,8 @@ def test_unreferenced_by_does_not_count_a_private_handoffs_reference(client):
     points at it. That is the exact leak the subquery's own comment already
     refuses for an unreadable decision; a private handoff is the same leak
     through the one `ref.kind` this test checks."""
-    proposal = _seed("vivy", kind="proposal", body="a proposal")
-    _seed("cfo", kind="handoff", body="references the proposal",
+    proposal = _seed("fennick", kind="proposal", body="a proposal")
+    _seed("quill", kind="handoff", body="references the proposal",
          refs=json.dumps([proposal["id"]]))
     listed = client.get(
         "/signals",
@@ -480,9 +480,9 @@ def _move(cold_path, signal_id: str):
 
 
 def test_list_signals_excludes_a_cold_private_products_handoff(client, cold):
-    private_id = _seed("cfo")["id"]
+    private_id = _seed("quill")["id"]
     _move(cold, private_id)
-    other_id = _seed("vivy")["id"]
+    other_id = _seed("fennick")["id"]
     body = client.get("/signals", params={"kind": "handoff"}, headers=_h()).json()
     ids = {s["id"] for s in body["signals"]}
     assert private_id not in ids
@@ -491,7 +491,7 @@ def test_list_signals_excludes_a_cold_private_products_handoff(client, cold):
 
 
 def test_get_signal_for_a_cold_private_products_handoff_is_404(client, cold):
-    private_id = _seed("cfo")["id"]
+    private_id = _seed("quill")["id"]
     _move(cold, private_id)
     r = client.get(f"/signals/{private_id}", headers=_h())
     assert r.status_code == 404
@@ -505,9 +505,9 @@ def test_search_signals_excludes_a_cold_private_products_handoff(
     that stamp across, the same as the real mover does."""
     monkeypatch.setattr(vectors, "EMBEDDED_SIGNAL_KINDS",
                         vectors.EMBEDDED_SIGNAL_KINDS | {"handoff"})
-    private = _seed("cfo", body="the quarterly handoff notes")
+    private = _seed("quill", body="the quarterly handoff notes")
     _move(cold, private["id"])
-    other = _seed("vivy", body="the quarterly handoff notes")
+    other = _seed("fennick", body="the quarterly handoff notes")
     r = client.get("/signals/search", params={"q": "the quarterly handoff notes"},
                    headers=_h())
     assert r.status_code == 200
@@ -517,18 +517,18 @@ def test_search_signals_excludes_a_cold_private_products_handoff(
 
 
 def test_facets_excludes_a_cold_private_products_handoff(client, cold):
-    private_id = _seed("cfo")["id"]
+    private_id = _seed("quill")["id"]
     _move(cold, private_id)
-    _seed("vivy")
+    _seed("fennick")
     body = client.get("/signals/facets", headers=_h()).json()
     assert body["total"] == 1
     assert dict(body["by_kind"]).get("handoff") == 1
-    assert "cfo" not in body["products"]
-    assert "vivy" in body["products"]
+    assert "quill" not in body["products"]
+    assert "fennick" in body["products"]
 
 
 def test_get_signal_acks_excludes_a_cold_private_products_handoff(client, cold):
-    private_id = _seed("cfo")["id"]
+    private_id = _seed("quill")["id"]
     _move(cold, private_id)
     _ack_row(private_id, "operator")
     r = client.get("/signals/acks",
@@ -539,7 +539,7 @@ def test_get_signal_acks_excludes_a_cold_private_products_handoff(client, cold):
 
 
 def test_post_ack_refuses_a_cold_private_products_handoff(client, cold):
-    private_id = _seed("cfo")["id"]
+    private_id = _seed("quill")["id"]
     _move(cold, private_id)
     r = client.post(f"/signals/{private_id}/ack",
                     json={"acting_human": "operator"}, headers=_h(CLIENT_WIDE))
@@ -548,8 +548,8 @@ def test_post_ack_refuses_a_cold_private_products_handoff(client, cold):
 
 def test_unreferenced_by_does_not_count_a_cold_private_handoffs_reference(
         client, cold):
-    proposal = _seed("vivy", kind="proposal", body="a proposal")
-    handoff = _seed("cfo", kind="handoff", body="references the proposal",
+    proposal = _seed("fennick", kind="proposal", body="a proposal")
+    handoff = _seed("quill", kind="handoff", body="references the proposal",
                     refs=json.dumps([proposal["id"]]))
     _move(cold, handoff["id"])
     listed = client.get(
@@ -581,17 +581,17 @@ TAB_NEWLINE_NBSP_PADDED_KIND = "\thandoff\n "
 # A plain space on both sides — `_handoff_wall`'s SQL folded `product`'s case
 # but never trimmed it, while `_private_handoff`'s `projects.resolve()` call
 # strips before comparing (security-reviewer, PR #185 round 3).
-WHITESPACE_PADDED_PRODUCT = " cfo "
+WHITESPACE_PADDED_PRODUCT = " quill "
 
-# `cfo`'s alias `chief-financial` (`REGISTRY`, above), padded and wrong-cased
+# `quill`'s alias `chief-financial` (`REGISTRY`, above), padded and wrong-cased
 # — the alias-resolution gap round 2 fixed and the whitespace gap round 3
 # fixes, both at once, on the one field they both touch.
 PADDED_MIXED_CASE_ALIAS_PRODUCT = "  Chief-Financial  "
 
 
 def test_list_signals_excludes_a_tab_padded_kind_handoff(client):
-    private_id = _seed("cfo", kind=TAB_NEWLINE_NBSP_PADDED_KIND)["id"]
-    other_id = _seed("vivy")["id"]
+    private_id = _seed("quill", kind=TAB_NEWLINE_NBSP_PADDED_KIND)["id"]
+    other_id = _seed("fennick")["id"]
     listed = client.get("/signals", headers=_h()).json()
     ids = {s["id"] for s in listed["signals"]}
     assert private_id not in ids
@@ -599,7 +599,7 @@ def test_list_signals_excludes_a_tab_padded_kind_handoff(client):
 
 
 def test_get_signal_for_a_tab_padded_kind_handoff_is_404(client):
-    private_id = _seed("cfo", kind=TAB_NEWLINE_NBSP_PADDED_KIND)["id"]
+    private_id = _seed("quill", kind=TAB_NEWLINE_NBSP_PADDED_KIND)["id"]
     r = client.get(f"/signals/{private_id}", headers=_h())
     assert r.status_code == 404
 
@@ -607,9 +607,9 @@ def test_get_signal_for_a_tab_padded_kind_handoff_is_404(client):
 def test_search_signals_excludes_a_tab_padded_kind_handoff(client, monkeypatch):
     monkeypatch.setattr(vectors, "EMBEDDED_SIGNAL_KINDS",
                         vectors.EMBEDDED_SIGNAL_KINDS | {"handoff"})
-    private_id = _seed("cfo", kind=TAB_NEWLINE_NBSP_PADDED_KIND,
+    private_id = _seed("quill", kind=TAB_NEWLINE_NBSP_PADDED_KIND,
                        body="the quarterly handoff notes")
-    other = _seed("vivy", body="the quarterly handoff notes")
+    other = _seed("fennick", body="the quarterly handoff notes")
     r = client.get("/signals/search", params={"q": "the quarterly handoff notes"},
                    headers=_h())
     assert r.status_code == 200
@@ -619,20 +619,20 @@ def test_search_signals_excludes_a_tab_padded_kind_handoff(client, monkeypatch):
 
 
 def test_facets_excludes_a_tab_padded_kind_handoff(client):
-    _seed("cfo", kind=TAB_NEWLINE_NBSP_PADDED_KIND)
-    _seed("vivy")
+    _seed("quill", kind=TAB_NEWLINE_NBSP_PADDED_KIND)
+    _seed("fennick")
     body = client.get("/signals/facets", headers=_h()).json()
     assert body["total"] == 1
-    assert "cfo" not in body["products"]
-    assert "vivy" in body["products"]
+    assert "quill" not in body["products"]
+    assert "fennick" in body["products"]
 
 
 def test_search_all_excludes_a_tab_padded_kind_handoff(client, monkeypatch):
     monkeypatch.setattr(vectors, "EMBEDDED_SIGNAL_KINDS",
                         vectors.EMBEDDED_SIGNAL_KINDS | {"handoff"})
-    private = _seed("cfo", kind=TAB_NEWLINE_NBSP_PADDED_KIND,
+    private = _seed("quill", kind=TAB_NEWLINE_NBSP_PADDED_KIND,
                     body="the quarterly handoff notes")
-    other = _seed("vivy", body="the quarterly handoff notes")
+    other = _seed("fennick", body="the quarterly handoff notes")
     r = client.get("/search", params={"q": "the quarterly handoff notes",
                                       "vault": "archives"}, headers=_h())
     assert r.status_code == 200
@@ -643,7 +643,7 @@ def test_search_all_excludes_a_tab_padded_kind_handoff(client, monkeypatch):
 
 def test_list_signals_excludes_a_whitespace_padded_product_handoff(client):
     private_id = _seed(WHITESPACE_PADDED_PRODUCT)["id"]
-    other_id = _seed("vivy")["id"]
+    other_id = _seed("fennick")["id"]
     listed = client.get("/signals", params={"kind": "handoff"}, headers=_h()).json()
     ids = {s["id"] for s in listed["signals"]}
     assert private_id not in ids
@@ -663,7 +663,7 @@ def test_search_signals_excludes_a_whitespace_padded_product_handoff(
                         vectors.EMBEDDED_SIGNAL_KINDS | {"handoff"})
     private_id = _seed(WHITESPACE_PADDED_PRODUCT,
                        body="the quarterly handoff notes")
-    other = _seed("vivy", body="the quarterly handoff notes")
+    other = _seed("fennick", body="the quarterly handoff notes")
     r = client.get("/signals/search", params={"q": "the quarterly handoff notes"},
                    headers=_h())
     assert r.status_code == 200
@@ -674,19 +674,19 @@ def test_search_signals_excludes_a_whitespace_padded_product_handoff(
 
 def test_facets_excludes_a_whitespace_padded_product_handoff(client):
     _seed(WHITESPACE_PADDED_PRODUCT)
-    _seed("vivy")
+    _seed("fennick")
     body = client.get("/signals/facets", headers=_h()).json()
     assert body["total"] == 1
     assert dict(body["by_kind"]).get("handoff") == 1
-    assert "cfo" not in body["products"]
-    assert "vivy" in body["products"]
+    assert "quill" not in body["products"]
+    assert "fennick" in body["products"]
 
 
 def test_search_all_excludes_a_whitespace_padded_product_handoff(client, monkeypatch):
     monkeypatch.setattr(vectors, "EMBEDDED_SIGNAL_KINDS",
                         vectors.EMBEDDED_SIGNAL_KINDS | {"handoff"})
     private = _seed(WHITESPACE_PADDED_PRODUCT, body="the quarterly handoff notes")
-    other = _seed("vivy", body="the quarterly handoff notes")
+    other = _seed("fennick", body="the quarterly handoff notes")
     r = client.get("/search", params={"q": "the quarterly handoff notes",
                                       "vault": "archives"}, headers=_h())
     assert r.status_code == 200
@@ -697,7 +697,7 @@ def test_search_all_excludes_a_whitespace_padded_product_handoff(client, monkeyp
 
 def test_handoff_wall_matches_a_padded_mixed_case_stored_alias(client):
     """The alias gap round 2 fixed and the whitespace gap round 3 fixes,
-    together: a row stored under a padded, wrong-cased spelling of `cfo`'s
+    together: a row stored under a padded, wrong-cased spelling of `quill`'s
     alias still has to resolve to the private slug."""
     private_id = _seed(PADDED_MIXED_CASE_ALIAS_PRODUCT)["id"]
     listed = client.get("/signals", params={"kind": "handoff"},
@@ -707,9 +707,9 @@ def test_handoff_wall_matches_a_padded_mixed_case_stored_alias(client):
 
 
 def test_list_signals_excludes_a_cold_tab_padded_kind_handoff(client, cold):
-    private_id = _seed("cfo", kind=TAB_NEWLINE_NBSP_PADDED_KIND)["id"]
+    private_id = _seed("quill", kind=TAB_NEWLINE_NBSP_PADDED_KIND)["id"]
     _move(cold, private_id)
-    other_id = _seed("vivy")["id"]
+    other_id = _seed("fennick")["id"]
     body = client.get("/signals", headers=_h()).json()
     ids = {s["id"] for s in body["signals"]}
     assert private_id not in ids
@@ -717,7 +717,7 @@ def test_list_signals_excludes_a_cold_tab_padded_kind_handoff(client, cold):
 
 
 def test_get_signal_for_a_cold_tab_padded_kind_handoff_is_404(client, cold):
-    private_id = _seed("cfo", kind=TAB_NEWLINE_NBSP_PADDED_KIND)["id"]
+    private_id = _seed("quill", kind=TAB_NEWLINE_NBSP_PADDED_KIND)["id"]
     _move(cold, private_id)
     r = client.get(f"/signals/{private_id}", headers=_h())
     assert r.status_code == 404
@@ -727,10 +727,10 @@ def test_search_signals_excludes_a_cold_tab_padded_kind_handoff(
         client, cold, monkeypatch):
     monkeypatch.setattr(vectors, "EMBEDDED_SIGNAL_KINDS",
                         vectors.EMBEDDED_SIGNAL_KINDS | {"handoff"})
-    private = _seed("cfo", kind=TAB_NEWLINE_NBSP_PADDED_KIND,
+    private = _seed("quill", kind=TAB_NEWLINE_NBSP_PADDED_KIND,
                     body="the quarterly handoff notes")
     _move(cold, private["id"])
-    other = _seed("vivy", body="the quarterly handoff notes")
+    other = _seed("fennick", body="the quarterly handoff notes")
     r = client.get("/signals/search", params={"q": "the quarterly handoff notes"},
                    headers=_h())
     assert r.status_code == 200
@@ -740,22 +740,22 @@ def test_search_signals_excludes_a_cold_tab_padded_kind_handoff(
 
 
 def test_facets_excludes_a_cold_tab_padded_kind_handoff(client, cold):
-    private_id = _seed("cfo", kind=TAB_NEWLINE_NBSP_PADDED_KIND)["id"]
+    private_id = _seed("quill", kind=TAB_NEWLINE_NBSP_PADDED_KIND)["id"]
     _move(cold, private_id)
-    _seed("vivy")
+    _seed("fennick")
     body = client.get("/signals/facets", headers=_h()).json()
     assert body["total"] == 1
-    assert "cfo" not in body["products"]
-    assert "vivy" in body["products"]
+    assert "quill" not in body["products"]
+    assert "fennick" in body["products"]
 
 
 def test_search_all_excludes_a_cold_tab_padded_kind_handoff(client, cold, monkeypatch):
     monkeypatch.setattr(vectors, "EMBEDDED_SIGNAL_KINDS",
                         vectors.EMBEDDED_SIGNAL_KINDS | {"handoff"})
-    private = _seed("cfo", kind=TAB_NEWLINE_NBSP_PADDED_KIND,
+    private = _seed("quill", kind=TAB_NEWLINE_NBSP_PADDED_KIND,
                     body="the quarterly handoff notes")
     _move(cold, private["id"])
-    other = _seed("vivy", body="the quarterly handoff notes")
+    other = _seed("fennick", body="the quarterly handoff notes")
     r = client.get("/search", params={"q": "the quarterly handoff notes",
                                       "vault": "archives"}, headers=_h())
     assert r.status_code == 200
@@ -767,7 +767,7 @@ def test_search_all_excludes_a_cold_tab_padded_kind_handoff(client, cold, monkey
 def test_list_signals_excludes_a_cold_whitespace_padded_product_handoff(client, cold):
     private_id = _seed(WHITESPACE_PADDED_PRODUCT)["id"]
     _move(cold, private_id)
-    other_id = _seed("vivy")["id"]
+    other_id = _seed("fennick")["id"]
     body = client.get("/signals", params={"kind": "handoff"}, headers=_h()).json()
     ids = {s["id"] for s in body["signals"]}
     assert private_id not in ids
@@ -788,7 +788,7 @@ def test_search_signals_excludes_a_cold_whitespace_padded_product_handoff(
                         vectors.EMBEDDED_SIGNAL_KINDS | {"handoff"})
     private = _seed(WHITESPACE_PADDED_PRODUCT, body="the quarterly handoff notes")
     _move(cold, private["id"])
-    other = _seed("vivy", body="the quarterly handoff notes")
+    other = _seed("fennick", body="the quarterly handoff notes")
     r = client.get("/signals/search", params={"q": "the quarterly handoff notes"},
                    headers=_h())
     assert r.status_code == 200
@@ -800,12 +800,12 @@ def test_search_signals_excludes_a_cold_whitespace_padded_product_handoff(
 def test_facets_excludes_a_cold_whitespace_padded_product_handoff(client, cold):
     private_id = _seed(WHITESPACE_PADDED_PRODUCT)["id"]
     _move(cold, private_id)
-    _seed("vivy")
+    _seed("fennick")
     body = client.get("/signals/facets", headers=_h()).json()
     assert body["total"] == 1
     assert dict(body["by_kind"]).get("handoff") == 1
-    assert "cfo" not in body["products"]
-    assert "vivy" in body["products"]
+    assert "quill" not in body["products"]
+    assert "fennick" in body["products"]
 
 
 def test_search_all_excludes_a_cold_whitespace_padded_product_handoff(
@@ -814,7 +814,7 @@ def test_search_all_excludes_a_cold_whitespace_padded_product_handoff(
                         vectors.EMBEDDED_SIGNAL_KINDS | {"handoff"})
     private = _seed(WHITESPACE_PADDED_PRODUCT, body="the quarterly handoff notes")
     _move(cold, private["id"])
-    other = _seed("vivy", body="the quarterly handoff notes")
+    other = _seed("fennick", body="the quarterly handoff notes")
     r = client.get("/search", params={"q": "the quarterly handoff notes",
                                       "vault": "archives"}, headers=_h())
     assert r.status_code == 200

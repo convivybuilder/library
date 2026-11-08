@@ -45,7 +45,7 @@ DDL = """
 
 # One harmless entry: `projects.private_repos()` reads an empty dict as an
 # unreadable registry.
-ORDINARY_REGISTRY = {"_meta": {}, "vivy": {"repos": []}}
+ORDINARY_REGISTRY = {"_meta": {}, "fennick": {"repos": []}}
 
 
 def use_registry(tmp_path, monkeypatch, entries=None):

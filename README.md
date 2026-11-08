@@ -37,8 +37,8 @@ install -d -m 700 ~/.library
 LIBRARY_DB=~/.library/library.db python -m alembic upgrade head
 LIBRARY_DB=~/.library/library.db .venv/bin/python init_vectors.py
 .venv/bin/python bootstrap_library.py "Ada Lovelace"
-.venv/bin/python mint_credential.py --file agents --name orient --out ~/.orient-control/library-token
-.venv/bin/python mint_credential.py --file clients --name orient --out ~/.orient-control/library-client-token
+.venv/bin/python mint_credential.py --file agents --name orient --tokens-file ~/.library/api-tokens.json --out ~/.orient-control/library-token
+.venv/bin/python mint_credential.py --file clients --name orient --tokens-file ~/.library/client-tokens.json --out ~/.orient-control/library-client-token
 ```
 
 `install -d -m 700 ~/.library` creates the directory `LIBRARY_DB` names, at 0700 — SQLite needs the
@@ -52,12 +52,16 @@ first approved-client credential, once; both it and the two steps before it need
 database — it writes straight to `identity.TOKENS` (`--file agents`,
 `~/.library/api-tokens.json`) or `identity.CLIENT_TOKENS` (`--file clients`,
 `~/.library/client-tokens.json`), the same two files `identity.resolve` reads, so a credential it
-mints authenticates with no restart. `--file agents` resolves as `agent` unless `--kind system` is
-given; `--file clients` always resolves as `approved_client`, and there alone `--holds-reserved` and
-`--withholds` narrow which human-reserved capabilities the credential carries. `--out PATH` writes
-the token straight to PATH at mode 0600 from creation, rather than printing it — redirecting stdout
-with `>` instead creates the file at the shell's umask (usually 0644, world-readable) until a later
-chmod runs.
+mints authenticates with no restart. It refuses, writing nothing, unless `LIBRARY_API_TOKENS`/
+`LIBRARY_CLIENT_TOKENS` is set or `--tokens-file PATH` names the target explicitly, as the worked
+example above does — on a machine where the running Library's own environment points either file
+somewhere other than its default, minting from a shell
+that lacks the variable would otherwise write a credential the Library never reads (CQ·244).
+`--file agents` resolves as `agent` unless `--kind system` is given; `--file clients` always
+resolves as `approved_client`, and there alone `--holds-reserved` and `--withholds` narrow which
+human-reserved capabilities the credential carries. `--out PATH` writes the token straight to PATH
+at mode 0600 from creation, rather than printing it — redirecting stdout with `>` instead creates
+the file at the shell's umask (usually 0644, world-readable) until a later chmod runs.
 
 Orient needs one credential from each file, the worked example above: `library-token` (`agent`) for
 `agentctl` and Orient's own tooling, and `library-client-token` (`approved_client`) for the

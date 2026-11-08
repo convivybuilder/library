@@ -180,6 +180,42 @@ def test_binds_when_the_trust_anchor_passes_the_ownership_walk(
     assert mtls.build_tls_ssl_context() is not None
 
 
+def test_trust_anchor_walk_returns_false_when_serve_sh_times_out(monkeypatch):
+    """`subprocess.TimeoutExpired` is a `SubprocessError`, not an `OSError`,
+    so it must be caught alongside `OSError` rather than propagating out of
+    `_trust_anchor_walk_ok()` — a walk past the 30-second timeout must fail
+    closed like any other subprocess error, not take the caller down."""
+    monkeypatch.setattr(mtls.sys, "platform", "darwin")
+
+    def fake_run(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=args[0], timeout=30)
+
+    monkeypatch.setattr(mtls.subprocess, "run", fake_run)
+
+    assert mtls._trust_anchor_walk_ok() is False
+
+
+def test_refuses_to_bind_when_the_trust_anchor_walk_times_out(
+        monkeypatch, tmp_path):
+    """The same timeout, through `build_tls_ssl_context()` with otherwise
+    valid material: a `None` here is what leaves the plain listener
+    serving, per `serve_dual.py`'s docstring, so a propagating
+    `TimeoutExpired` taking this function down instead is the defect."""
+    ca_cert, server_cert, server_key = _staged_material(tmp_path)
+    monkeypatch.setattr(mtls, "TLS_CERT", server_cert)
+    monkeypatch.setattr(mtls, "TLS_KEY", server_key)
+    monkeypatch.setattr(mtls, "TLS_CA", ca_cert)
+    monkeypatch.setattr(store, "REQUEST_DEADLINE_SECONDS", 60.0)
+    monkeypatch.setattr(mtls.sys, "platform", "darwin")
+
+    def fake_run(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=args[0], timeout=30)
+
+    monkeypatch.setattr(mtls.subprocess, "run", fake_run)
+
+    assert mtls.build_tls_ssl_context() is None
+
+
 def test_trust_anchor_walk_is_skipped_rather_than_refused_off_darwin(
         monkeypatch):
     """Off Darwin, `serve.sh --walk` cannot mean anything — it is built on

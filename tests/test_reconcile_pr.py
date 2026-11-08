@@ -13,9 +13,11 @@ agent-platform's `issue-pr-reconcile`) rather than by the item's own holder.
 `claimed_at` clear, so a reader does not see a stale holder's name on a row
 that reads as available. `refs` — `pr` and `url` — stays, as history.
 
-**`abandoned` moves nothing.** The PR is still open, indistinguishable from one
-still being worked, so freeing the item would race a second worker onto a live
-branch. It only raises `needs` to `"operator"`.
+**`abandoned` was retired on 2026-10-28 (CQ·251).** It used to set `needs` to
+`"operator"` with no record of the prior value and no comment, and its only
+caller, agent-platform's `bin/issue-pr-reconcile`, was removed in the same
+change (CQ·579). A caller that still sends it is refused by the same 400
+every other unrecognized outcome gets.
 
 **Hold discipline is `_hold_for_write`, not a `claimed_by` match** — the same
 gate `/link-pr`, `/correct` and `/resolve` share, covered end to end for those
@@ -41,7 +43,7 @@ import lease
 import protocol
 import store
 
-AGENT = "agent-token-vivy"
+AGENT = "agent-token-fennick"
 WIDE = "agent-token-wide"
 
 
@@ -86,27 +88,27 @@ def client(tmp_path, monkeypatch):
     conn.executemany(
         "INSERT INTO issue_items (id, product, title, type, state, claimed_by, "
         "claimed_at, parent_id, created_at, refs) VALUES (?,?,?,?,?,?,?,?,?,?)",
-        [("epic_v", "vivy", "A vivy epic", "epic", "open", None, None, None,
+        [("epic_v", "fennick", "A fennick epic", "epic", "open", None, None, None,
           _ts(days=3), "{}"),
          # In review, under the epic, carrying the PR `/link-pr` would have
          # recorded — the row `/reconcile-pr` exists to unstick.
-         ("task_a", "vivy", "A task in review", "task", "pr-open", "session-1",
+         ("task_a", "fennick", "A task in review", "task", "pr-open", "session-1",
           _ts(hours=2), "epic_v", _ts(days=2),
           json.dumps({"pr": 9, "url": "https://example/pull/9"})),
-         ("open_v", "vivy", "Not yet claimed", "task", "open", None, None,
+         ("open_v", "fennick", "Not yet claimed", "task", "open", None, None,
           None, _ts(days=1), "{}"),
-         ("claimed_v", "vivy", "Mid-work", "task", "claimed", "session-1",
+         ("claimed_v", "fennick", "Mid-work", "task", "claimed", "session-1",
           _ts(hours=1), None, _ts(days=1), "{}"),
-         ("done_v", "vivy", "Already resolved", "task", "fixed", None, None,
+         ("done_v", "fennick", "Already resolved", "task", "fixed", None, None,
           None, _ts(days=1), "{}"),
-         ("task_c", "constance", "Another product", "task", "pr-open",
+         ("task_c", "marlow", "Another product", "task", "pr-open",
           "session-1", _ts(hours=2), None, _ts(days=1), "{}")])
     conn.commit()
     conn.close()
 
     tokens = tmp_path / "api-tokens.json"
     tokens.write_text(json.dumps({
-        AGENT: {"name": "vivy-agent", "products": ["vivy"]},
+        AGENT: {"name": "fennick-agent", "products": ["fennick"]},
         WIDE: {"name": "wide-agent", "products": ["*"]},
     }))
     monkeypatch.setattr(store, "DB_PATH", db)
@@ -188,7 +190,7 @@ def test_reopening_writes_the_state_event(client, outcome):
     events = _events("task_a")
     assert len(events) == 1
     actor, from_state, to_state, note = events[0]
-    assert (actor, from_state, to_state) == ("vivy-agent", "pr-open", "open")
+    assert (actor, from_state, to_state) == ("fennick-agent", "pr-open", "open")
     assert note and outcome in note.lower()
 
 
@@ -196,7 +198,7 @@ def test_merged_and_closed_notes_are_distinguishable(client):
     conn = _db()
     conn.execute(
         "INSERT INTO issue_items (id, product, title, type, state, refs, "
-        "created_at) VALUES ('task_b','vivy','Also in review','task','pr-open', "
+        "created_at) VALUES ('task_b','fennick','Also in review','task','pr-open', "
         "'{}', ?)", (_ts(days=1),))
     conn.commit()
     conn.close()
@@ -211,40 +213,26 @@ def test_merged_and_closed_notes_are_distinguishable(client):
     assert "closed" in closed_note.lower()
 
 
-# --- abandoned: no state change, needs flips to operator ------------------------
+# --- abandoned: retired, refused like any other outcome this route does not
+# understand (CQ·251) ------------------------------------------------------------
 
 
-def test_abandoned_sets_needs_operator_without_moving_state(client):
+def test_abandoned_is_refused_and_changes_nothing(client):
     r = _reconcile(client, "task_a", "abandoned")
-    assert r.status_code == 200, r.json()
-    body = r.json()
+    assert r.status_code == 400, r.json()
+    body = _item("task_a")
     assert body["state"] == "pr-open"
-    assert body["needs"] == "operator"
-
-
-def test_abandoned_writes_no_state_event(client):
-    """The item did not move, so there is nothing for the audit trail to
-    explain — recording a `pr-open -> pr-open` event would be a transition
-    that never happened."""
-    _reconcile(client, "task_a", "abandoned")
+    assert body["needs"] is None
     assert _events("task_a") == []
-
-
-def test_abandoned_leaves_the_claim_and_refs_alone(client):
-    r = _reconcile(client, "task_a", "abandoned")
-    assert r.status_code == 200, r.json()
-    body = r.json()
-    assert body["claimed_by"] == "session-1"
-    assert body["refs"] == {"pr": 9, "url": "https://example/pull/9"}
 
 
 # --- refused from every state but pr-open ---------------------------------------
 
 
 @pytest.mark.parametrize("item_id,outcome", [
-    ("open_v", "merged"), ("open_v", "abandoned"),
-    ("claimed_v", "merged"), ("claimed_v", "abandoned"),
-    ("done_v", "merged"), ("done_v", "abandoned"),
+    ("open_v", "merged"), ("open_v", "closed"),
+    ("claimed_v", "merged"), ("claimed_v", "closed"),
+    ("done_v", "merged"), ("done_v", "closed"),
 ])
 def test_refused_from_every_state_but_pr_open(client, item_id, outcome):
     r = _reconcile(client, item_id, outcome, owner="session-1")
@@ -270,7 +258,8 @@ def test_an_active_but_not_pr_open_item_names_its_state(client):
 # --- outcome validation ----------------------------------------------------------
 
 
-@pytest.mark.parametrize("outcome", [None, "", "in-review", 1, True, ["merged"]])
+@pytest.mark.parametrize("outcome", [None, "", "in-review", 1, True, ["merged"],
+                                     "abandoned"])
 def test_a_malformed_outcome_is_refused(client, outcome):
     r = client.post("/items/task_a/reconcile-pr", json={"outcome": outcome},
                     headers=_h())
@@ -309,7 +298,7 @@ def _lease_epic(holder, *, alive=True):
     conn.close()
 
 
-@pytest.mark.parametrize("outcome", ["merged", "abandoned"])
+@pytest.mark.parametrize("outcome", ["merged", "closed"])
 def test_another_holders_live_lease_refuses_the_reconcile(client, outcome):
     _lease_epic("co-other-crew")
     r = _reconcile(client, "task_a", outcome)
@@ -320,14 +309,14 @@ def test_another_holders_live_lease_refuses_the_reconcile(client, outcome):
     assert _item("task_a")["needs"] is None
 
 
-@pytest.mark.parametrize("outcome", ["merged", "abandoned"])
+@pytest.mark.parametrize("outcome", ["merged", "closed"])
 def test_the_holders_own_lease_lets_the_reconcile_through(client, outcome):
     _lease_epic("co-library-1154")
     r = _reconcile(client, "task_a", outcome, owner="co-library-1154")
     assert r.status_code == 200, r.json()
 
 
-@pytest.mark.parametrize("outcome", ["merged", "abandoned"])
+@pytest.mark.parametrize("outcome", ["merged", "closed"])
 def test_a_dead_lease_does_not_refuse_the_reconcile(client, outcome):
     _lease_epic("co-gone", alive=False)
     r = _reconcile(client, "task_a", outcome)

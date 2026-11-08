@@ -74,7 +74,7 @@ def client(tmp_path, monkeypatch, vector_index):
     tokens = tmp_path / "api-tokens.json"
     tokens.write_text(json.dumps({
         AGENT: {"name": "an-agent", "products": ["*"]},
-        NARROW: {"name": "vivy-only", "products": ["vivy"]},
+        NARROW: {"name": "fennick-only", "products": ["fennick"]},
         REPO_ONLY: {"name": "knowledge-only", "products": ["knowledge"]},
         SUBSCRIBER: {"name": "bosun-reporter", "products": ["*"],
                      "grants": ["ledger.spend.subscription"]}}))
@@ -91,7 +91,7 @@ def client(tmp_path, monkeypatch, vector_index):
     # real one, so every product these tests report under is listed here.
     registry = tmp_path / "projects.json"
     registry.write_text(json.dumps({
-        "_meta": {}, "library": {"repos": ["knowledge"]}, "vivy": {"repos": []},
+        "_meta": {}, "library": {"repos": ["knowledge"]}, "fennick": {"repos": []},
         "keel": {"repos": []}}))
     monkeypatch.setattr(projects, "REGISTRY_PATH", registry)
     projects.reload()
@@ -272,7 +272,7 @@ def test_a_dedup_key_matching_another_products_ledger_is_refused_with_nothing_le
     a spend whose key collides with another project's entry and read that
     entry's id, day, amount or lane back under its own `ledger_id`. Both
     ledgers' totals are unchanged — nothing was recorded on either side."""
-    first = report(client, 9, product="vivy", dedup_key="shared-key")
+    first = report(client, 9, product="fennick", dedup_key="shared-key")
     assert first.status_code == 200, first.text
     r = report(client, 2, product="library", dedup_key="shared-key")
     assert r.status_code == 409, r.text
@@ -284,7 +284,7 @@ def test_a_dedup_key_matching_another_products_ledger_is_refused_with_nothing_le
     ledgers = {row["scope_id"]: row for row in
               client.get("/ledgers", headers=_agent()).json()["ledgers"]}
     assert ledgers["library"]["total_usd"] == 0
-    assert ledgers["vivy"]["total_usd"] == 9
+    assert ledgers["fennick"]["total_usd"] == 9
 
 
 def test_spend_for_an_uncapped_scope_is_recorded(client):
@@ -481,6 +481,57 @@ def test_entries_carry_their_lane_and_no_read_blends_the_two(client):
     assert row["total_usd"] != gateway["usd"] + subscription["usd"] + unset["usd"]
 
 
+# --- lane: "openai-subscription", a second non-enforceable lane, never
+# blended with the first (issue_01M58502RQC0XDAC1D704XQW5B) -------------------
+
+def test_an_ordinary_agent_cannot_claim_the_openai_subscription_lane(client):
+    """The same reservation as `subscription`: `ledger.spend` alone must not
+    let a caller keep real spend out of enforcement by tagging it
+    `openai-subscription`."""
+    set_caps(client, soft_cap_usd=160)
+    r = report(client, 5, lane="openai-subscription")
+    assert r.status_code == 403, r.text
+    assert "ledger.spend.subscription" in r.json()["error"]
+    assert client.get("/ledger-entries", headers=_agent()).json()["entries"] == []
+
+
+def test_a_credential_granted_the_subscription_capability_may_claim_the_openai_lane(client):
+    """`ledger.spend.subscription` gates both non-enforceable lanes — the
+    Bosun's subscription reporter needs no second grant for the second
+    subscription."""
+    set_caps(client, soft_cap_usd=160)
+    r = report(client, 5, lane="openai-subscription", token=SUBSCRIBER)
+    assert r.status_code == 200, r.text
+    assert r.json()["lane"] == "openai-subscription"
+
+
+def test_subscription_and_openai_subscription_report_under_their_own_keys(client):
+    """Claude's subscription estimate and Codex's are two separate lanes.
+    Summing them into one figure would hide which subscription a crossing
+    came from, which is why `openai-subscription` exists rather than
+    sharing `subscription` — `total_usd` and `lanes.gateway` must also stay
+    unmoved by either."""
+    set_caps(client, soft_cap_usd=160)
+    gateway = report(client, 10, lane="gateway").json()
+    claude = report(client, 7, lane="subscription", dedup_key="claude-1",
+                    token=SUBSCRIBER).json()
+    codex = report(client, 11, lane="openai-subscription", dedup_key="codex-1",
+                  token=SUBSCRIBER).json()
+    assert claude["lane"] == "subscription"
+    assert codex["lane"] == "openai-subscription"
+
+    row = client.get("/ledgers", headers=_agent()).json()["ledgers"][0]
+    assert row["total_usd"] == gateway["usd"] == 10
+    assert row["lanes"]["gateway"] == 10
+    assert row["lanes"]["subscription"] == 7
+    assert row["lanes"]["openai-subscription"] == 11
+    # NEVER SUMMED, in either direction: the two subscriptions stay apart
+    # from each other and from the enforceable total.
+    assert row["total_usd"] != claude["usd"] + codex["usd"]
+    assert row["lanes"]["subscription"] != row["lanes"]["openai-subscription"] + \
+        row["lanes"]["gateway"]
+
+
 def test_ledgers_refuses_an_unrecognised_parameter(client):
     r = client.get("/ledgers?product=library", headers=_agent())
     assert r.status_code == 400
@@ -524,6 +575,19 @@ def test_subscription_spend_never_crosses_a_threshold_or_refuses_checkout(client
     assert r2.status_code == 200, r2.text
     assert r2.json()["state"] == "soft_capped"
     assert checkout(client).status_code == 409
+
+
+def test_openai_subscription_spend_never_crosses_a_threshold_or_refuses_checkout(client):
+    """The same guarantee as `subscription`, for the second non-enforceable
+    lane: a report that would, by its dollar figure alone, blow well past a
+    soft cap must neither cross a threshold nor refuse the next checkout."""
+    set_caps(client, soft_cap_usd=10)
+    r = report(client, 50, lane="openai-subscription", token=SUBSCRIBER)
+    assert r.status_code == 200, r.text
+    assert r.json()["crossed"] is None
+    assert r.json()["total_usd"] == 0
+    assert r.json()["state"] == "ok"
+    assert checkout(client).status_code == 200
 
 
 # --- the closed set: no free-text attribution dimension ------------------------
@@ -719,15 +783,15 @@ def test_a_grant_naming_only_a_repository_does_not_see_its_projects_ledger(clien
     does not see the spend every other repository folded into it booked.
     """
     report(client, 5, product="knowledge")
-    report(client, 3, product="vivy")
+    report(client, 3, product="fennick")
     repo_only = {**H, "Authorization": f"Bearer {REPO_ONLY}"}
     assert client.get("/ledgers", headers=repo_only).json()["ledgers"] == []
     assert client.get("/ledger-entries", headers=repo_only).json()["entries"] == []
     narrow = {**H, "Authorization": f"Bearer {NARROW}"}
     [ledger] = client.get("/ledgers", headers=narrow).json()["ledgers"]
-    assert ledger["scope_id"] == "vivy"
+    assert ledger["scope_id"] == "fennick"
     [entry] = client.get("/ledger-entries", headers=narrow).json()["entries"]
-    assert entry["product"] == "vivy"
+    assert entry["product"] == "fennick"
 
 
 def test_get_ledger_entries_product_filter_resolves_a_repository(client):
@@ -777,16 +841,16 @@ def test_a_scoped_caller_neither_sees_nor_counts_another_products_ledger(client)
     the `count` a client pages by.
     """
     set_caps(client, scope_id="library", soft_cap_usd=160)
-    set_caps(client, scope_id="vivy", soft_cap_usd=80)
+    set_caps(client, scope_id="fennick", soft_cap_usd=80)
     wide = client.get("/ledgers", headers=_agent()).json()
     assert wide["total"] == 2
-    assert {r["scope_id"] for r in wide["ledgers"]} == {"library", "vivy"}
+    assert {r["scope_id"] for r in wide["ledgers"]} == {"library", "fennick"}
 
     narrow = client.get(
         "/ledgers", headers={**H, "Authorization": f"Bearer {NARROW}"}).json()
     assert narrow["total"] == 1
     assert narrow["count"] == 1
-    assert [r["scope_id"] for r in narrow["ledgers"]] == ["vivy"]
+    assert [r["scope_id"] for r in narrow["ledgers"]] == ["fennick"]
 
 
 # --- crossing a threshold is a reported signal, once per day -------------------
@@ -1112,9 +1176,9 @@ def entries(client, headers=None, **params):
 
 
 def test_the_happy_path_returns_entries_for_a_scoped_caller(client):
-    set_caps(client, scope_id="vivy", soft_cap_usd=160)
-    report(client, 1.5, product="vivy")
-    report(client, 2.5, product="vivy")
+    set_caps(client, scope_id="fennick", soft_cap_usd=160)
+    report(client, 1.5, product="fennick")
+    report(client, 2.5, product="fennick")
     r = entries(client, headers={**H, "Authorization": f"Bearer {NARROW}"})
     assert r.status_code == 200, r.text
     body = r.json()
@@ -1127,9 +1191,9 @@ def test_a_scoped_caller_neither_sees_nor_counts_another_products_entries(client
     """Scoped in SQL, so `total` cannot count rows the caller may not see, the
     same failure `_scope_clause`'s docstring names for every list in this file."""
     set_caps(client, scope_id="library", soft_cap_usd=160)
-    set_caps(client, scope_id="vivy", soft_cap_usd=80)
+    set_caps(client, scope_id="fennick", soft_cap_usd=80)
     report(client, 1)
-    report(client, 2, product="vivy")
+    report(client, 2, product="fennick")
     wide = entries(client).json()
     assert wide["total"] == 2
 
@@ -1137,17 +1201,17 @@ def test_a_scoped_caller_neither_sees_nor_counts_another_products_entries(client
         client, headers={**H, "Authorization": f"Bearer {NARROW}"}).json()
     assert narrow["total"] == 1
     assert narrow["count"] == 1
-    assert narrow["entries"][0]["product"] == "vivy"
+    assert narrow["entries"][0]["product"] == "fennick"
 
 
 def test_the_product_filter_narrows(client):
     set_caps(client, scope_id="library", soft_cap_usd=160)
-    set_caps(client, scope_id="vivy", soft_cap_usd=80)
+    set_caps(client, scope_id="fennick", soft_cap_usd=80)
     report(client, 1)
-    report(client, 2, product="vivy")
-    r = entries(client, product="vivy")
+    report(client, 2, product="fennick")
+    r = entries(client, product="fennick")
     assert r.json()["total"] == 1
-    assert r.json()["entries"][0]["product"] == "vivy"
+    assert r.json()["entries"][0]["product"] == "fennick"
 
 
 def test_the_day_filter_narrows(client):
@@ -1311,7 +1375,7 @@ def test_spend_against_an_epic_filed_under_a_repository_still_derives_its_epic(c
 # from another product exists, is an epic, or has a parent.
 
 def test_spend_against_a_cross_product_epic_has_no_epic(client):
-    insert_item("issue_other_epic", item_type="epic", product="vivy")
+    insert_item("issue_other_epic", item_type="epic", product="fennick")
     set_caps(client, soft_cap_usd=160)
     r = report(client, 1, item_id="issue_other_epic")
     assert r.status_code == 200, r.text
@@ -1320,9 +1384,9 @@ def test_spend_against_a_cross_product_epic_has_no_epic(client):
 
 
 def test_spend_against_a_cross_product_sub_item_has_no_epic(client):
-    insert_item("issue_other_epic", item_type="epic", product="vivy")
+    insert_item("issue_other_epic", item_type="epic", product="fennick")
     insert_item("issue_other_sub", item_type="task",
-                parent_id="issue_other_epic", product="vivy")
+                parent_id="issue_other_epic", product="fennick")
     set_caps(client, soft_cap_usd=160)
     r = report(client, 1, item_id="issue_other_sub")
     assert r.status_code == 200, r.text
@@ -1331,7 +1395,7 @@ def test_spend_against_a_cross_product_sub_item_has_no_epic(client):
 
 
 def test_spend_against_a_cross_product_parentless_item_has_no_epic(client):
-    insert_item("issue_other_bug", item_type="bug", product="vivy")
+    insert_item("issue_other_bug", item_type="bug", product="fennick")
     set_caps(client, soft_cap_usd=160)
     r = report(client, 1, item_id="issue_other_bug")
     assert r.status_code == 200, r.text
@@ -1466,13 +1530,18 @@ def test_a_column_added_to_ledger_entries_does_not_reach_a_client_by_itself(clie
 # --- the migration -----------------------------------------------------------
 
 def test_the_migrations_upgrade_moves_a_grant_into_the_soft_cap(tmp_path):
+    # The ledger-fold migration (1e5e5078a1c6) resolves a seeded ledger's
+    # scope through the project registry, and refuses when none is readable.
+    registry = tmp_path / "projects.json"
+    registry.write_text('{"library": {}}')
     import sqlite3
 
     db = tmp_path / "migration.db"
     up_to = subprocess.run(
         [sys.executable, "-m", "alembic", "upgrade", "f71949b78df4"],
         cwd=REPO, capture_output=True, text=True,
-        env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "LIBRARY_DB": str(db)})
+        env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "LIBRARY_DB": str(db),
+             "PROJECTS_JSON": str(registry)})
     assert up_to.returncode == 0, up_to.stderr
 
     conn = sqlite3.connect(db)
@@ -1487,7 +1556,8 @@ def test_the_migrations_upgrade_moves_a_grant_into_the_soft_cap(tmp_path):
     up = subprocess.run(
         [sys.executable, "-m", "alembic", "upgrade", "head"],
         cwd=REPO, capture_output=True, text=True,
-        env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "LIBRARY_DB": str(db)})
+        env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "LIBRARY_DB": str(db),
+             "PROJECTS_JSON": str(registry)})
     assert up.returncode == 0, up.stderr
 
     conn = sqlite3.connect(db)
@@ -1503,7 +1573,8 @@ def test_the_migrations_upgrade_moves_a_grant_into_the_soft_cap(tmp_path):
     down = subprocess.run(
         [sys.executable, "-m", "alembic", "downgrade", "f71949b78df4"],
         cwd=REPO, capture_output=True, text=True,
-        env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "LIBRARY_DB": str(db)})
+        env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "LIBRARY_DB": str(db),
+             "PROJECTS_JSON": str(registry)})
     assert down.returncode == 0, down.stderr
 
     conn = sqlite3.connect(db)
@@ -1593,7 +1664,7 @@ def test_the_epic_id_migration_backfills_every_branch_of_the_rule(tmp_path):
             # A different product's own epic, same id shape as any other —
             # the row an out-of-product `item_id` would otherwise resolve
             # against.
-            ("i_other_epic", "vivy", "epic", None),
+            ("i_other_epic", "fennick", "epic", None),
         ])
     conn.executemany(
         "INSERT INTO ledger_entries (id, ledger_id, day, usd_micro, at, "
@@ -1606,7 +1677,7 @@ def test_the_epic_id_migration_backfills_every_branch_of_the_rule(tmp_path):
             ("lde_sub", "i_sub"),
             ("lde_corr", "i_corr"),
             ("lde_dangling", "i_missing"),
-            # `library`'s own entry naming `vivy`'s epic: cross-product, and
+            # `library`'s own entry naming `fennick`'s epic: cross-product, and
             # required to backfill to NULL exactly as `lde_dangling` does.
             ("lde_cross_product", "i_other_epic"),
         ])
@@ -1655,13 +1726,18 @@ def test_the_per_run_cap_migration_is_additive_and_nullable(tmp_path):
     """One nullable column, matching `80ab55fe0dba`'s shape for the lane
     column: an existing row gets NULL on the way up, and the column is gone
     on the way back down."""
+    # The ledger-fold migration (1e5e5078a1c6) resolves a seeded ledger's
+    # scope through the project registry, and refuses when none is readable.
+    registry = tmp_path / "projects.json"
+    registry.write_text('{"library": {}}')
     import sqlite3
 
     db = tmp_path / "migration.db"
     up_to = subprocess.run(
         [sys.executable, "-m", "alembic", "upgrade", "80ab55fe0dba"],
         cwd=REPO, capture_output=True, text=True,
-        env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "LIBRARY_DB": str(db)})
+        env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "LIBRARY_DB": str(db),
+             "PROJECTS_JSON": str(registry)})
     assert up_to.returncode == 0, up_to.stderr
 
     conn = sqlite3.connect(db)
@@ -1677,7 +1753,8 @@ def test_the_per_run_cap_migration_is_additive_and_nullable(tmp_path):
     up = subprocess.run(
         [sys.executable, "-m", "alembic", "upgrade", "head"],
         cwd=REPO, capture_output=True, text=True,
-        env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "LIBRARY_DB": str(db)})
+        env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "LIBRARY_DB": str(db),
+             "PROJECTS_JSON": str(registry)})
     assert up.returncode == 0, up.stderr
 
     conn = sqlite3.connect(db)
@@ -1696,7 +1773,8 @@ def test_the_per_run_cap_migration_is_additive_and_nullable(tmp_path):
     down = subprocess.run(
         [sys.executable, "-m", "alembic", "downgrade", "80ab55fe0dba"],
         cwd=REPO, capture_output=True, text=True,
-        env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "LIBRARY_DB": str(db)})
+        env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "LIBRARY_DB": str(db),
+             "PROJECTS_JSON": str(registry)})
     assert down.returncode == 0, down.stderr
 
     conn = sqlite3.connect(db)

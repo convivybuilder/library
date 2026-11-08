@@ -105,15 +105,15 @@ def client(tmp_path, monkeypatch):
     """)
     # (id, product, type, state, maturity, specification, definition_of_done)
     rows = [
-        ("epic_a", "vivy", "epic", "open", "proposed", "scope a", "done a"),
-        ("epic_b", "vivy", "epic", "open", "proposed", "scope b", "done b"),
-        ("epic_c", "vivy", "epic", "open", "proposed", "scope c", "done c"),
-        ("epic_bare", "vivy", "epic", "open", "proposed", None, None),
-        ("epic_done", "vivy", "epic", "fixed", "proposed", "s", "d"),
-        ("a_bug", "vivy", "bug", "open", None, None, None),
+        ("epic_a", "fennick", "epic", "open", "proposed", "scope a", "done a"),
+        ("epic_b", "fennick", "epic", "open", "proposed", "scope b", "done b"),
+        ("epic_c", "fennick", "epic", "open", "proposed", "scope c", "done c"),
+        ("epic_bare", "fennick", "epic", "open", "proposed", None, None),
+        ("epic_done", "fennick", "epic", "fixed", "proposed", "s", "d"),
+        ("a_bug", "fennick", "bug", "open", None, None, None),
         ("epic_keel", "keel", "epic", "open", "proposed", "keel scope",
          "keel done"),
-        ("epic_other", "constance", "epic", "open", "proposed", "s", "d"),
+        ("epic_other", "marlow", "epic", "open", "proposed", "s", "d"),
     ]
     conn.executemany(
         "INSERT INTO issue_items (id, product, type, state, maturity, "
@@ -123,7 +123,7 @@ def client(tmp_path, monkeypatch):
         [(*r, _ts(days=2)) for r in rows])
     conn.execute(
         "INSERT INTO courses (id, product, title, entries, status, version, "
-        "created_by, created_at) VALUES ('course_vivy', 'vivy', 'The route', ?, "
+        "created_by, created_at) VALUES ('course_fennick', 'fennick', 'The route', ?, "
         "'live', 3, 'test', ?)", (json.dumps(["epic_c"]), _ts(days=3)))
     # keel has a Course, but a superseded one: the product has no LIVE Course.
     conn.execute(
@@ -178,7 +178,7 @@ def _row(item_id):
     return row
 
 
-def _course(course_id="course_vivy"):
+def _course(course_id="course_fennick"):
     conn = _db()
     row = conn.execute("SELECT * FROM courses WHERE id = ?",
                        (course_id,)).fetchone()
@@ -245,13 +245,13 @@ def test_the_record_names_the_client_the_human_the_course_and_the_position(clien
     r = _approve(client, "epic_a")
     assert r.json()["approval"] == {
         "approved_by": "deck", "acting_human": HUMAN,
-        "course_id": "course_vivy", "position": 2, "course_size": 2,
+        "course_id": "course_fennick", "position": 2, "course_size": 2,
         "newly_placed": True, "restored_position": False,
         "specification_sha256": spec_sha,
         "definition_of_done_sha256": dod_sha}
     note = _notes("epic_a")[0]
     assert "deck" in note and HUMAN in note
-    assert "course_vivy" in note and "position 2 of 2" in note
+    assert "course_fennick" in note and "position 2 of 2" in note
     assert f"specification_sha256: {spec_sha}" in note
     assert f"definition_of_done_sha256: {dod_sha}" in note
     event = _events()[0]
@@ -403,18 +403,28 @@ def test_the_revision_route_refuses_maturity_for_an_agent_credential(client):
     assert _row("epic_a")["maturity"] == "proposed"
 
 
-def test_only_one_statement_in_the_service_writes_the_approved_value():
+def test_only_three_statements_in_the_service_write_the_maturity_ladder():
     """A scan of the source, because a second writer of `approved` is exactly
     what this epic removed and a behavioural test only covers the routes it
-    thinks of. Every assignment to the `maturity` column is either the approval
-    route's own UPDATE or the demotion to `proposed`."""
+    thinks of.
+
+    **THREE, NOT ONE, SINCE library/decisions/0005** (this PR): the approval
+    route's own UPDATE, `/decline`'s own UPDATE to `declined`, and
+    `/repropose`'s own UPDATE back to `proposed` — each the sole writer of
+    its own value, the same invariant the single approval UPDATE used to
+    state alone. Every OTHER assignment to the `maturity` column is either
+    the demotion to `proposed` (`_do_correct`/`_do_revision`, an approved
+    item's edit revoking its approval) or, new in this PR, the null a retype
+    out of epic writes (`_do_correct` only — `/revision` cannot retype,
+    `type` being refused there by name)."""
     src = (Path(libapp.__file__)).read_text()
-    assert len(re.findall(r"SET maturity\s*=", src)) == 1
+    assert len(re.findall(r"SET maturity\s*=", src)) == 3
     assert 'columns["maturity"] = store.ITEM_MATURITY_PROPOSED' in src
+    assert 'columns["maturity"] = None' in src
     assignments = re.findall(r'columns\["maturity"\]\s*=\s*(.+)', src)
     assert assignments and all(
-        a.strip() == "store.ITEM_MATURITY_PROPOSED" for a in assignments), (
-        assignments)
+        a.strip() in ("store.ITEM_MATURITY_PROPOSED", "None")
+        for a in assignments), assignments
     for name in ("store.py", "lease.py", "reference.py", "call_slips.py"):
         text = (Path(libapp.__file__).parent / name).read_text()
         assert not re.search(r"SET[^\"']*\bmaturity\b", text), name
@@ -446,7 +456,7 @@ def test_an_epic_outside_the_callers_scope_reads_as_absent(client, tmp_path,
                                                           monkeypatch):
     scoped = tmp_path / "scoped.json"
     scoped.write_text(json.dumps({"scoped-token": {"name": "scoped-deck",
-                                                   "products": ["vivy"]}}))
+                                                   "products": ["fennick"]}}))
     monkeypatch.setattr(identity, "CLIENT_TOKENS", scoped)
     assert _approve(client, "epic_other", token="scoped-token").status_code == 404
     assert _approve(client, "no_such", token="scoped-token").status_code == 404
@@ -567,7 +577,7 @@ def test_an_approved_epic_that_was_never_placed_is_placed_at_the_end(client):
 def test_a_full_course_refuses_the_approval(client, monkeypatch):
     monkeypatch.setattr(store, "MAX_COURSE_ENTRIES", 1)
     r = _approve(client, "epic_a")
-    assert r.status_code == 409 and r.json()["course_id"] == "course_vivy"
+    assert r.status_code == 409 and r.json()["course_id"] == "course_fennick"
     _nothing_changed()
 
 
@@ -632,12 +642,48 @@ def test_a_specification_edit_returns_the_epic_to_proposed_and_off_the_course(
     assert _events()[-1]["action"] == store.COURSE_ACTION_DEMOTED
 
 
-def test_a_retype_returns_the_epic_to_proposed_and_off_the_course(client):
+def test_a_retype_out_of_epic_clears_maturity_and_leaves_the_course(client):
+    """library/decisions/0005: a retype out of epic sets `maturity` null
+    rather than demoting to `proposed` — a plain work item carries no
+    maturity at all. An AGENT credential may still retype an APPROVED epic
+    out, unassisted; the gate is only on a not-yet-approved one (below)."""
     assert _approve(client, "epic_a").status_code == 200
     r = client.post("/items/epic_a/correct", json={"type": None},
                     headers=_h(AGENT))
-    assert r.status_code == 200 and r.json()["maturity"] == "proposed"
+    assert r.status_code == 200 and r.json()["maturity"] is None
     assert "epic_a" not in _course()["entries"]
+
+
+def test_retyping_a_proposed_epic_out_needs_epic_approve_and_a_human(client):
+    r = client.post("/items/epic_b/correct", json={"type": None},
+                    headers=_h(AGENT))
+    assert r.status_code == 403
+    assert _row("epic_b")["maturity"] == "proposed"
+    assert _row("epic_b")["type"] == "epic"
+
+
+def test_retyping_a_proposed_epic_out_is_refused_with_no_acting_human(client):
+    r = client.post("/items/epic_b/correct", json={"type": None},
+                    headers=_h(OPERATOR))
+    assert r.status_code == 403
+    assert _row("epic_b")["maturity"] == "proposed"
+
+
+def test_an_operator_credential_with_a_human_retypes_a_proposed_epic_out(client):
+    r = client.post("/items/epic_b/correct",
+                    json={"type": None, "acting_human": HUMAN},
+                    headers=_h(OPERATOR))
+    assert r.status_code == 200 and r.json()["maturity"] is None
+    assert r.json()["type"] is None
+
+
+def test_retyping_into_epic_stores_proposed(client):
+    r = client.post("/items/a_bug/correct",
+                    json={"type": "epic", "specification": "s",
+                          "definition_of_done": "d"},
+                    headers=_h(AGENT))
+    assert r.status_code == 200
+    assert r.json()["type"] == "epic" and r.json()["maturity"] == "proposed"
 
 
 def test_the_edit_with_the_assertion_keeps_the_approval_and_the_place(client):
@@ -684,9 +730,9 @@ def _set_order(entries):
     event carrying it."""
     conn = _db()
     conn.execute("UPDATE courses SET entries = ?, version = version + 1 "
-                 "WHERE id = 'course_vivy'", (json.dumps(entries),))
+                 "WHERE id = 'course_fennick'", (json.dumps(entries),))
     conn.execute("INSERT INTO course_events (course_id, actor, action, entries, "
-                 "note, at) VALUES ('course_vivy', 'test', 'reordered', ?, '', ?)",
+                 "note, at) VALUES ('course_fennick', 'test', 'reordered', ?, '', ?)",
                  (json.dumps(entries), _ts()))
     conn.commit()
     conn.close()
@@ -723,7 +769,7 @@ def _orderless_event(action):
     order did not move."""
     conn = _db()
     conn.execute("INSERT INTO course_events (course_id, actor, action, entries, "
-                 "note, at) VALUES ('course_vivy', 'test', ?, NULL, '', ?)",
+                 "note, at) VALUES ('course_fennick', 'test', ?, NULL, '', ?)",
                  (action, _ts()))
     conn.commit()
     conn.close()
@@ -815,16 +861,16 @@ def test_a_demotion_from_a_superseded_course_does_not_place_it_on_the_new_one(
     _demote(client, "epic_a")
     conn = _db()
     conn.execute("UPDATE courses SET status = 'superseded' "
-                 "WHERE id = 'course_vivy'")
+                 "WHERE id = 'course_fennick'")
     conn.execute(
         "INSERT INTO courses (id, product, title, entries, status, version, "
-        "created_by, created_at) VALUES ('course_vivy_2', 'vivy', 'Next', ?, "
+        "created_by, created_at) VALUES ('course_fennick_2', 'fennick', 'Next', ?, "
         "'live', 1, 'test', ?)", (json.dumps(["epic_b", "epic_c"]), _ts()))
     conn.commit()
     conn.close()
     r = _approve(client, "epic_a")
     assert r.json()["approval"]["restored_position"] is False
-    assert _course("course_vivy_2")["entries"] == ["epic_b", "epic_c", "epic_a"]
+    assert _course("course_fennick_2")["entries"] == ["epic_b", "epic_c", "epic_a"]
 
 
 def test_a_second_demotion_returns_it_to_where_it_stood_most_recently(client):

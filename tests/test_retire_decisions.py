@@ -38,7 +38,7 @@ def db(tmp_path, monkeypatch):
         "INSERT INTO decision_items (id, product, kind, title, body, refs, "
         "state, decided_by, decided_at, directive, snooze_until, once_key, "
         "created_by, created_at, run_id, outcome_note, blocked) VALUES "
-        "('dec_a', 'vivy', 'needs-decision', 'Ship it?', 'the body', '{}', "
+        "('dec_a', 'fennick', 'needs-decision', 'Ship it?', 'the body', '{}', "
         "'approved', 'operator@example.com', '2026-08-01 10:00:00.000000', "
         "'go ahead', NULL, NULL, 'ops-mcp', '2026-07-30 09:00:00.000000', "
         "NULL, NULL, 0)")
@@ -75,7 +75,7 @@ def test_a_decision_migrates_to_a_signal_preserving_its_id(db):
     assert row["kind"] == rd.KIND
     assert row["actor"] == "ops-mcp"
     assert row["ingested_by"] == rd.MIGRATED_BY
-    assert row["product"] == "vivy"
+    assert row["product"] == "fennick"
     assert row["privacy_class"] == "internal"
     assert "Ship it?" in row["body"] and "the body" in row["body"]
 
@@ -105,7 +105,7 @@ def test_a_decision_with_no_comments_or_events_migrates_with_empty_lists(
         "INSERT INTO decision_items (id, product, kind, title, body, refs, "
         "state, decided_by, decided_at, directive, snooze_until, once_key, "
         "created_by, created_at, run_id, outcome_note, blocked) VALUES "
-        "('dec_bare', 'vivy', 'proposal', 'A bare one', '', '{}', "
+        "('dec_bare', 'fennick', 'proposal', 'A bare one', '', '{}', "
         "'pending', NULL, NULL, NULL, NULL, NULL, "
         "'ops-mcp', '2026-07-30 09:00:00.000000', NULL, NULL, 0)")
     conn.commit()

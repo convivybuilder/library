@@ -43,6 +43,7 @@ def db(tmp_path, monkeypatch):
         CREATE TABLE roster_agents (
             id INTEGER PRIMARY KEY,
             name TEXT NOT NULL UNIQUE,
+            source_doc TEXT,
             created_at TEXT NOT NULL,
             created_by TEXT NOT NULL,
             updated_at TEXT NOT NULL,
@@ -207,39 +208,39 @@ def _write_profile(root, project, variant, body):
 
 
 def test_profiles_from_knowledge_repo_reads_every_yaml_file(tmp_path):
-    _write_profile(tmp_path, "hollis", "daytime", """\
-        profile: hollis/daytime
+    _write_profile(tmp_path, "bramwell", "daytime", """\
+        profile: bramwell/daytime
         include:
           - kind: agent
-            audience_contains: [hollis-coder]
+            audience_contains: [bramwell-coder]
         claude_md_extras:
-          - "You are the hollis crew."
+          - "You are the bramwell crew."
         """)
-    _write_profile(tmp_path, "hollis", "overnight", """\
-        profile: hollis/overnight
+    _write_profile(tmp_path, "bramwell", "overnight", """\
+        profile: bramwell/overnight
         include:
           - kind: agent
-            audience_contains: [hollis-overnight-orchestrator]
+            audience_contains: [bramwell-overnight-orchestrator]
         """)
     rows = load_crew_registry._profiles_from_knowledge_repo(str(tmp_path))
     by_variant = {r["variant"]: r for r in rows}
     assert set(by_variant) == {"daytime", "overnight"}
-    assert by_variant["daytime"]["project"] == "hollis"
+    assert by_variant["daytime"]["project"] == "bramwell"
     assert by_variant["daytime"]["include"] == [
-        {"kind": "agent", "audience_contains": ["hollis-coder"]}]
+        {"kind": "agent", "audience_contains": ["bramwell-coder"]}]
     assert by_variant["daytime"]["claude_md_extras"] == \
-        ["You are the hollis crew."]
+        ["You are the bramwell crew."]
     assert by_variant["overnight"]["claude_md_extras"] == []
 
 
 def test_profiles_from_knowledge_repo_refuses_a_profile_key_mismatch(
         tmp_path):
-    """The path (`projects/hollis/profiles/daytime.yaml`) says
-    `hollis/daytime`; a YAML `profile:` key claiming something else is a
+    """The path (`projects/bramwell/profiles/daytime.yaml`) says
+    `bramwell/daytime`; a YAML `profile:` key claiming something else is a
     fact about the file worth stopping over, not something to silently
     resolve one way or the other."""
-    _write_profile(tmp_path, "hollis", "daytime", """\
-        profile: hollis/overnight
+    _write_profile(tmp_path, "bramwell", "daytime", """\
+        profile: bramwell/overnight
         include: []
         """)
     with pytest.raises(SystemExit, match="does not match"):
@@ -247,14 +248,14 @@ def test_profiles_from_knowledge_repo_refuses_a_profile_key_mismatch(
 
 
 def test_profiles_subcommand_loads_every_file(db, tmp_path):
-    _write_profile(tmp_path, "hollis", "daytime", """\
-        profile: hollis/daytime
+    _write_profile(tmp_path, "bramwell", "daytime", """\
+        profile: bramwell/daytime
         include:
           - kind: agent
-            audience_contains: [hollis-coder]
+            audience_contains: [bramwell-coder]
         """)
-    _write_profile(tmp_path, "vivy", "daytime", """\
-        profile: vivy/daytime
+    _write_profile(tmp_path, "fennick", "daytime", """\
+        profile: fennick/daytime
         include:
           - kind: agent
             audience_contains: [reviewer]
@@ -263,12 +264,12 @@ def test_profiles_subcommand_loads_every_file(db, tmp_path):
         ["profiles", str(tmp_path), "--actor", ACTOR])
     assert rc == 0
     projects = {r["project"] for r in _rows(db, "profiles")}
-    assert projects == {"hollis", "vivy"}
+    assert projects == {"bramwell", "fennick"}
 
 
 def test_profiles_subcommand_is_idempotent(db, tmp_path):
-    _write_profile(tmp_path, "hollis", "daytime", """\
-        profile: hollis/daytime
+    _write_profile(tmp_path, "bramwell", "daytime", """\
+        profile: bramwell/daytime
         include: []
         """)
     load_crew_registry.main(["profiles", str(tmp_path), "--actor", ACTOR])
@@ -281,20 +282,20 @@ def test_profiles_subcommand_is_idempotent(db, tmp_path):
 
 def test_profiles_subcommand_removes_a_row_whose_file_is_gone(
         db, tmp_path, capsys):
-    daytime = tmp_path / "projects" / "hollis" / "profiles" / "daytime.yaml"
+    daytime = tmp_path / "projects" / "bramwell" / "profiles" / "daytime.yaml"
     overnight = \
-        tmp_path / "projects" / "hollis" / "profiles" / "overnight.yaml"
-    _write_profile(tmp_path, "hollis", "daytime", """\
-        profile: hollis/daytime
+        tmp_path / "projects" / "bramwell" / "profiles" / "overnight.yaml"
+    _write_profile(tmp_path, "bramwell", "daytime", """\
+        profile: bramwell/daytime
         include: []
         """)
-    _write_profile(tmp_path, "hollis", "overnight", """\
-        profile: hollis/overnight
+    _write_profile(tmp_path, "bramwell", "overnight", """\
+        profile: bramwell/overnight
         include: []
         """)
     load_crew_registry.main(["profiles", str(tmp_path), "--actor", ACTOR])
     assert {(r["project"], r["variant"]) for r in _rows(db, "profiles")} == \
-        {("hollis", "daytime"), ("hollis", "overnight")}
+        {("bramwell", "daytime"), ("bramwell", "overnight")}
 
     overnight.unlink()
     assert daytime.exists()
@@ -308,30 +309,30 @@ def test_profiles_subcommand_removes_a_row_whose_file_is_gone(
     # confirm that the command SAYS it removed a row while the row is still
     # being served.
     assert {(r["project"], r["variant"]) for r in _rows(db, "profiles")} == \
-        {("hollis", "daytime")}
+        {("bramwell", "daytime")}
 
     out = capsys.readouterr().out
-    assert "removed profile: hollis/overnight" in out
+    assert "removed profile: bramwell/overnight" in out
     assert "removed 1 profile(s)" in out
 
 
 def test_profiles_subcommand_keeps_a_row_whose_file_still_exists(
         db, tmp_path):
-    _write_profile(tmp_path, "hollis", "daytime", """\
-        profile: hollis/daytime
+    _write_profile(tmp_path, "bramwell", "daytime", """\
+        profile: bramwell/daytime
         include: []
         """)
     load_crew_registry.main(["profiles", str(tmp_path), "--actor", ACTOR])
     load_crew_registry.main(["profiles", str(tmp_path), "--actor", ACTOR])
     assert {(r["project"], r["variant"]) for r in _rows(db, "profiles")} == \
-        {("hollis", "daytime")}
+        {("bramwell", "daytime")}
 
 
 def test_profiles_subcommand_dry_run_writes_nothing(db, tmp_path, capsys):
     overnight = \
-        tmp_path / "projects" / "hollis" / "profiles" / "overnight.yaml"
-    _write_profile(tmp_path, "hollis", "overnight", """\
-        profile: hollis/overnight
+        tmp_path / "projects" / "bramwell" / "profiles" / "overnight.yaml"
+    _write_profile(tmp_path, "bramwell", "overnight", """\
+        profile: bramwell/overnight
         include: []
         """)
     load_crew_registry.main(["profiles", str(tmp_path), "--actor", ACTOR])
@@ -339,25 +340,25 @@ def test_profiles_subcommand_dry_run_writes_nothing(db, tmp_path, capsys):
     # A second file, so the dry run has something to LOAD as well as something
     # to remove. Without it the "would load" half of the flag goes unexercised,
     # and that half is where the flag was writing.
-    _write_profile(tmp_path, "hollis", "daytime", """\
-        profile: hollis/daytime
+    _write_profile(tmp_path, "bramwell", "daytime", """\
+        profile: bramwell/daytime
         include: []
         """)
 
     # The whole table, captured before the dry run, values included. Asserting
     # only on the (project, variant) SET would pass while the dry run rewrote
     # every row's `updated_at`, and it would count a row the dry run itself
-    # INSERTED as evidence that nothing changed — `hollis/daytime` has no row
+    # INSERTED as evidence that nothing changed — `bramwell/daytime` has no row
     # at this point, so a dry run that upserts leaves the set looking correct.
     before = sorted(tuple(sorted(r.items())) for r in _rows(db, "profiles"))
     assert {(r["project"], r["variant"]) for r in _rows(db, "profiles")} == \
-        {("hollis", "overnight")}
+        {("bramwell", "overnight")}
 
     rc = load_crew_registry.main(
         ["profiles", str(tmp_path), "--actor", ACTOR, "--dry-run"])
     assert rc == 0
     out = capsys.readouterr().out
-    assert "would remove profile: hollis/overnight" in out
+    assert "would remove profile: bramwell/overnight" in out
     assert "would remove 1 profile(s)" in out
     assert "would load 1 profile(s)" in out
 
@@ -367,8 +368,8 @@ def test_profiles_subcommand_dry_run_writes_nothing(db, tmp_path, capsys):
 
 def test_profiles_subcommand_announces_a_no_op_reconcile(
         db, tmp_path, capsys):
-    _write_profile(tmp_path, "hollis", "daytime", """\
-        profile: hollis/daytime
+    _write_profile(tmp_path, "bramwell", "daytime", """\
+        profile: bramwell/daytime
         include: []
         """)
     rc = load_crew_registry.main(
@@ -408,16 +409,16 @@ def test_profiles_subcommand_refuses_a_root_that_globs_no_profiles(
     `profiles/*.yaml` under any of it. A worktree checked out before those
     files existed looks exactly like this, and without the refusal every row
     in the table is stale by construction and gets deleted."""
-    _write_profile(tmp_path, "hollis", "daytime", """\
-        profile: hollis/daytime
+    _write_profile(tmp_path, "bramwell", "daytime", """\
+        profile: bramwell/daytime
         include: []
         """)
     load_crew_registry.main(["profiles", str(tmp_path), "--actor", ACTOR])
     assert len(_rows(db, "profiles")) == 1
 
-    # Remove the profile but leave `projects/hollis/profiles/` standing, so
+    # Remove the profile but leave `projects/bramwell/profiles/` standing, so
     # the structural check still passes and only the glob comes back empty.
-    (tmp_path / "projects" / "hollis" / "profiles" / "daytime.yaml").unlink()
+    (tmp_path / "projects" / "bramwell" / "profiles" / "daytime.yaml").unlink()
 
     with pytest.raises(SystemExit, match="refusing to reconcile"):
         load_crew_registry.main(["profiles", str(tmp_path), "--actor", ACTOR])
@@ -429,8 +430,8 @@ def test_profiles_dry_run_validates_profile_shape_the_real_run_would_reject(
     """A dry run skips `profile_put`, which is where shape validation lived, so
     without validating on both paths a clean dry run would report "would load"
     for a profile the real run raises on before it writes anything."""
-    _write_profile(tmp_path, "hollis", "daytime", """\
-        profile: hollis/daytime
+    _write_profile(tmp_path, "bramwell", "daytime", """\
+        profile: bramwell/daytime
         include:
           - kind: agent
             gateway: nope
@@ -465,13 +466,13 @@ def test_roster_skips_a_withheld_name_and_loads_the_rest(
     black_box_tables.use_registry(
         tmp_path, monkeypatch,
         {**black_box_tables.ORDINARY_REGISTRY,
-         "cfo": {"repos": [], "private": True}})
-    path = _write_knowledge_py(tmp_path, ["coder", "cfo-scribe", "reviewer"])
+         "quill": {"repos": [], "private": True}})
+    path = _write_knowledge_py(tmp_path, ["coder", "quill-scribe", "reviewer"])
     rc = load_crew_registry.main(["roster", str(path), "--actor", ACTOR])
     assert rc == 0
     assert {r["name"] for r in _rows(db, "roster_agents")} == \
         {"coder", "reviewer", MARKER}
-    assert "cfo-scribe withheld" in capsys.readouterr().out
+    assert "quill-scribe withheld" in capsys.readouterr().out
 
 
 def test_roster_writes_nothing_when_the_registry_cannot_be_read(

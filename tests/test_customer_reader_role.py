@@ -55,17 +55,17 @@ def client(tmp_path, monkeypatch):
         "INSERT INTO signals (id, product, kind, source, actor, ingested_by, "
         "body, refs, meta, privacy_class, ingested_at, dedup_key) "
         "VALUES (?,?,'note','gmail','a','capture',?,'{}','{}',?,?,?)",
-        [("sig_internal", "vivy", "an internal note", "internal",
+        [("sig_internal", "fennick", "an internal note", "internal",
           "2026-08-01 07:30:00.000000", "k-int"),
-         ("sig_customer", "vivy", "a captured customer email", "customer",
+         ("sig_customer", "fennick", "a captured customer email", "customer",
           "2026-08-01 08:30:00.000000", "k-cust")])
     conn.commit()
     conn.close()
 
     tokens = tmp_path / "api-tokens.json"
     tokens.write_text(json.dumps({
-        AGENT: {"name": "an-agent", "products": ["vivy"]},
-        READER: {"name": "commercial", "products": ["vivy"],
+        AGENT: {"name": "an-agent", "products": ["fennick"]},
+        READER: {"name": "commercial", "products": ["fennick"],
                  "kind": "customer_reader"},
         SYSTEM: {"name": "capture", "products": ["*"], "kind": "system"},
     }))
@@ -91,7 +91,7 @@ def _ids(r):
 
 
 def _list(client, token):
-    return client.get("/signals", params={"product": "vivy"}, headers=_h(token))
+    return client.get("/signals", params={"product": "fennick"}, headers=_h(token))
 
 
 # --- the capability delta, asserted directly ----------------------------------
@@ -144,7 +144,7 @@ def test_the_readers_total_counts_what_it_may_see(client):
 def _capture(client, token, privacy_class):
     return client.post("/signals", json={
         "source": "gmail", "kind": "note", "actor": "alice@example.org",
-        "product": "vivy", "body": "b", "privacy_class": privacy_class,
+        "product": "fennick", "body": "b", "privacy_class": privacy_class,
     }, headers=_h(token))
 
 
@@ -164,7 +164,7 @@ def test_the_reader_cannot_attest_a_human(client):
     """`acting_human` stays approved-client-only. Reading customer content and
     vouching for a person are different claims."""
     r = client.post("/signals", json={
-        "source": "gmail", "kind": "note", "actor": "a", "product": "vivy",
+        "source": "gmail", "kind": "note", "actor": "a", "product": "fennick",
         "body": "b", "acting_human": "operator@example.com"}, headers=_h(READER))
     assert r.status_code == 403 and "approved-client" in r.json()["error"]
 
@@ -178,7 +178,7 @@ def test_a_token_file_cannot_mint_an_approved_client(tmp_path, monkeypatch):
     capabilities ADR-0038 puts behind a separate file the Library alone reads."""
     tokens = tmp_path / "t.json"
     tokens.write_text(json.dumps({
-        "sneaky": {"name": "x", "products": ["vivy"], "kind": "approved_client"}}))
+        "sneaky": {"name": "x", "products": ["fennick"], "kind": "approved_client"}}))
     monkeypatch.setattr(identity, "TOKENS", tokens)
     monkeypatch.setattr(identity, "CLIENT_TOKENS", tmp_path / "absent.json")
     ident = identity.resolve("Bearer sneaky")
@@ -198,7 +198,7 @@ def test_a_token_file_cannot_mint_an_approved_client(tmp_path, monkeypatch):
 def test_an_unrecognised_kind_falls_back_to_agent(tmp_path, monkeypatch, claimed):
     """Fail-closed: a typo in the token file must not mint a role with more
     capability than the one intended, and `agent` is the least of them."""
-    entry = {"name": "x", "products": ["vivy"]}
+    entry = {"name": "x", "products": ["fennick"]}
     if claimed is not None:
         entry["kind"] = claimed
     tokens = tmp_path / "t.json"
@@ -232,7 +232,7 @@ def _resolve_with(tmp_path, monkeypatch, entry, *, client=False):
     return identity.resolve("Bearer tok")
 
 
-NON_LIST = [5, 0, None, True, False, 3.14, "vivy", {"a": "vivy"}, {}]
+NON_LIST = [5, 0, None, True, False, 3.14, "fennick", {"a": "fennick"}, {}]
 
 
 @pytest.mark.parametrize("products", NON_LIST)
@@ -248,7 +248,7 @@ def test_a_malformed_products_scopes_to_nothing_rather_than_crashing(
     assert ident is not None
     assert ident.products == frozenset()
     # ...and scoped to nothing means seeing nothing, not seeing everything.
-    assert identity.in_scope(ident, "vivy") is False
+    assert identity.in_scope(ident, "fennick") is False
 
 
 @pytest.mark.parametrize("client", [False, True])
@@ -269,8 +269,8 @@ def test_a_list_with_one_bad_entry_keeps_the_readable_ones(tmp_path, monkeypatch
     """Dropping the whole list would turn a typo in one product name into a
     total outage for that token."""
     ident = _resolve_with(tmp_path, monkeypatch,
-                          {"name": "x", "products": ["vivy", 5, None, "keel"]})
-    assert ident.products == {"vivy", "keel"}
+                          {"name": "x", "products": ["fennick", 5, None, "keel"]})
+    assert ident.products == {"fennick", "keel"}
 
 
 @pytest.mark.parametrize("name", [5, None, True, {"a": 1}, ["x"], 3.14])
@@ -285,7 +285,7 @@ def test_a_malformed_name_becomes_unknown_rather_than_a_write_time_500(
     `"unknown"` rather than `str(name)`: stringifying would mint an actor named
     `{'a': 1}` and write it into an audit column."""
     ident = _resolve_with(tmp_path, monkeypatch,
-                          {"name": name, "products": ["vivy"]}, client=client)
+                          {"name": name, "products": ["fennick"]}, client=client)
     assert ident.actor == "unknown"
     assert isinstance(ident.actor, str)
 
@@ -345,7 +345,7 @@ def test_a_wrong_shaped_client_file_does_not_disturb_agent_auth(
     has to survive the new shape guard."""
     (tmp_path / "c.json").write_text("[1, 2, 3]")
     (tmp_path / "t.json").write_text(json.dumps({
-        "tok": {"name": "an-agent", "products": ["vivy"]}}))
+        "tok": {"name": "an-agent", "products": ["fennick"]}}))
     monkeypatch.setattr(identity, "CLIENT_TOKENS", tmp_path / "c.json")
     monkeypatch.setattr(identity, "TOKENS", tmp_path / "t.json")
     ident = identity.resolve("Bearer tok")

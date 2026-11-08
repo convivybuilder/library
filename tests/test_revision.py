@@ -39,8 +39,8 @@ import lease
 import protocol
 import store
 
-AGENT = "agent-token-vivy"
-HOLDER = "co-vivy-0912"
+AGENT = "agent-token-fennick"
+HOLDER = "co-fennick-0912"
 
 
 def _ts(**delta):
@@ -95,18 +95,18 @@ def client(tmp_path, monkeypatch, vector_index):
     """)
     # (id, product, title, body, type, state, maturity, parent_id, spec, dod)
     rows = [
-        ("held", "vivy", "A held item", "the original body", "bug", "claimed",
+        ("held", "fennick", "A held item", "the original body", "bug", "claimed",
          None, None, None, None),
-        ("unheld", "vivy", "Nobody holds this", "body", "bug", "open", None,
+        ("unheld", "fennick", "Nobody holds this", "body", "bug", "open", None,
          None, None, None),
-        ("epic", "vivy", "An approved epic", "body", "epic", "open", "approved",
+        ("epic", "fennick", "An approved epic", "body", "epic", "open", "approved",
          None, "the long form", "the finish line"),
-        ("under_epic", "vivy", "Inside the epic", "body", "bug", "open", None,
+        ("under_epic", "fennick", "Inside the epic", "body", "bug", "open", None,
          "epic", None, None),
-        ("impr_ok", "vivy", "An approved improvement", "body", "improvement",
+        ("impr_ok", "fennick", "An approved improvement", "body", "improvement",
          "open", "approved", None, "a scope", None),
-        ("done", "vivy", "Done", "body", "bug", "fixed", None, None, None, None),
-        ("other", "constance", "Other product", "body", "bug", "open", None,
+        ("done", "fennick", "Done", "body", "bug", "fixed", None, None, None, None),
+        ("other", "marlow", "Other product", "body", "bug", "open", None,
          None, None, None),
     ]
     conn.executemany(
@@ -118,14 +118,14 @@ def client(tmp_path, monkeypatch, vector_index):
     # The live Course the approved epic stands on; a demotion has to take it off.
     conn.execute(
         "INSERT INTO courses (id, product, title, entries, status, version, "
-        "created_by, created_at) VALUES ('course_vivy', 'vivy', 'The route', ?, "
+        "created_by, created_at) VALUES ('course_fennick', 'fennick', 'The route', ?, "
         "'live', 1, 'test', ?)", (json.dumps(["epic"]), _ts(days=3)))
     conn.commit()
     conn.close()
 
     tokens = tmp_path / "api-tokens.json"
     tokens.write_text(json.dumps({
-        AGENT: {"name": "vivy-agent", "products": ["vivy"]},
+        AGENT: {"name": "fennick-agent", "products": ["fennick"]},
     }))
     # The vec0 index, because the write routes reach it: an item or signal
     # created here is embedded after its commit, and a revision drops its
@@ -292,7 +292,7 @@ def test_an_idempotent_resubmission_is_still_a_sighting(client):
 
 
 @pytest.mark.parametrize("field,value", [
-    ("product", "constance"), ("parent_id", "epic"), ("type", "epic"),
+    ("product", "marlow"), ("parent_id", "epic"), ("type", "epic"),
     ("state", "fixed"), ("needs", "operator"), ("severity", "high"),
     ("refs", {"decision_id": "dec_1"}),
 ])
@@ -352,6 +352,35 @@ def test_revising_an_approved_epics_text_returns_it_to_proposed(client):
     r = _revise(client, "epic", {"specification": "a different scope"})
     assert r.status_code == 200 and r.json()["item"]["maturity"] == "proposed"
     assert "Returned to `proposed`" in _notes("epic")[0]
+
+
+def test_a_declined_epics_specification_is_not_edited_here(client):
+    """library/decisions/0005: the same refusal `/correct` gives, repeated
+    here because a revision is the other door onto these two fields."""
+    _set_maturity("epic", "declined")
+    _take_lease("epic")
+    r = _revise(client, "epic", {"specification": "a different scope"})
+    assert r.status_code == 409
+    assert "declined epic" in r.json()["error"]
+    assert "repropose" in r.json()["hint"]
+    assert _row("epic")["specification"] == "the long form"
+
+
+def test_a_declined_epics_definition_of_done_is_not_edited_here(client):
+    _set_maturity("epic", "declined")
+    _take_lease("epic")
+    r = _revise(client, "epic", {"definition_of_done": "a new finish line"})
+    assert r.status_code == 409
+    assert _row("epic")["definition_of_done"] == "the finish line"
+
+
+def test_a_declined_epics_title_may_still_be_revised(client):
+    """The refusal is on the two approval fields, not on the item."""
+    _set_maturity("epic", "declined")
+    _take_lease("epic")
+    r = _revise(client, "epic", {"title": "renamed while declined"})
+    assert r.status_code == 200
+    assert r.json()["item"]["title"] == "renamed while declined"
 
 
 @pytest.mark.parametrize("value", [None, "approved", "proposed", "shipped"])
@@ -494,7 +523,7 @@ def test_the_note_names_the_actor_and_the_holder(client):
     _take_lease("held")
     assert _revise(client, "held", {"title": "renamed"}).status_code == 200
     note = _notes("held")[0]
-    assert "vivy-agent" in note and HOLDER in note
+    assert "fennick-agent" in note and HOLDER in note
     assert "**title:**" in note and "'A held item' → 'renamed'" in note
 
 
@@ -656,15 +685,15 @@ def test_a_holder_outside_the_callers_scope_is_not_named(client):
     sits on. Guarded upstream today, since no route can build a cross-product
     edge — which is the argument this check exists so as not to depend on."""
     conn = _db()
-    conn.execute("UPDATE issue_items SET product='constance' WHERE id='epic'")
+    conn.execute("UPDATE issue_items SET product='marlow' WHERE id='epic'")
     conn.commit()
     conn.close()
-    _take_lease("epic", holder="a-constance-session")
+    _take_lease("epic", holder="a-marlow-session")
     r = _revise(client, "under_epic", {"title": "renamed"})
     assert r.status_code == 409
     assert "outside this identity's scope" in r.json()["error"]
     assert "lease" not in r.json()
-    assert "a-constance-session" not in json.dumps(r.json())
+    assert "a-marlow-session" not in json.dumps(r.json())
 
 
 # --- a losing concurrent writer is refused, not silently overwritten -----------

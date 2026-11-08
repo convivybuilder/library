@@ -30,7 +30,7 @@ import reference
 import reference_admission
 import store
 
-AGENT = "agent-token-vivy"
+AGENT = "agent-token-fennick"
 DOC_ID = "platform/decisions/0022-library-repo"
 
 # Ids, kinds, projects, statuses and audiences chosen so every filter has both a
@@ -48,7 +48,7 @@ DOCS = [
     # document carrying one cannot be indexed and a test asserting it is
     # reachable asserts nothing about the real corpus
     # (issue_01M1MWRXAZ5NRH10NP6Z9MBH0C).
-    ("vivy/runbooks/archived-thing", "runbook", "vivy", "archived", ["team"]),
+    ("fennick/runbooks/archived-thing", "runbook", "fennick", "archived", ["team"]),
 ]
 
 # **AUDIENCE VALUES THIS SERVICE DOES NOT CONTROL.** The knowledge index is
@@ -142,7 +142,7 @@ def client(tmp_path, monkeypatch):
 
     tokens = tmp_path / "api-tokens.json"
     tokens.write_text(json.dumps({
-        AGENT: {"name": "vivy-agent", "products": ["vivy"]},
+        AGENT: {"name": "fennick-agent", "products": ["fennick"]},
     }))
 
     monkeypatch.setattr(store, "DB_PATH", db)
@@ -253,7 +253,7 @@ def test_listing_returns_the_default_status_corpus(client):
     to agree about what exists."""
     r = _list(client)
     assert r.status_code == 200
-    assert "vivy/runbooks/archived-thing" not in _ids(r)
+    assert "fennick/runbooks/archived-thing" not in _ids(r)
     assert r.json()["total"] == 11
 
 
@@ -419,7 +419,7 @@ def test_kind_filters(client):
 
 def test_status_filters_and_can_reach_the_excluded_ones(client):
     assert _ids(_list(client, status="archived")) == [
-        "vivy/runbooks/archived-thing"]
+        "fennick/runbooks/archived-thing"]
 
 
 def test_audience_matches_membership_not_equality(client):
@@ -494,7 +494,7 @@ def test_a_free_document_reports_a_null_checkout(client):
 def test_a_held_document_names_its_holder(client):
     _checkout(client)
     body = _status(client).json()["checkout"]
-    assert body["holder"] == "vivy-agent" and body["released_at"] is None
+    assert body["holder"] == "fennick-agent" and body["released_at"] is None
 
 
 def test_the_status_read_takes_nothing(client):
@@ -519,7 +519,7 @@ def test_a_dead_checkout_is_reported_rather_than_hidden(client):
     _checkout(client)
     _age_checkout(DOC_ID, minutes=int(lease.max_lease().total_seconds() / 60) + 120)
     body = _status(client).json()["checkout"]
-    assert body is not None and body["holder"] == "vivy-agent"
+    assert body is not None and body["holder"] == "fennick-agent"
 
 
 def test_status_404s_on_a_document_that_is_not_indexed(client):
@@ -693,7 +693,7 @@ def test_status_all_returns_every_status(client):
 def test_status_all_reaches_what_the_default_excludes(client):
     """The sentinel is not merely the default under another name: the document
     the default hides is in it."""
-    assert "vivy/runbooks/archived-thing" in _ids(
+    assert "fennick/runbooks/archived-thing" in _ids(
         _list(client, status=reference.STATUS_ALL))
 
 

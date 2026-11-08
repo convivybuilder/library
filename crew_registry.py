@@ -266,10 +266,11 @@ def withheld(name: str) -> bool:
       keyed by agent and crew, so a registered crew has already named its
       agents.
     - **The crew's own name, or that name plus a hyphen and anything
-      after.** A private crew in the project registry (`cfo`, `ea`) need not
-      register, so it has declared no agents; `cfo-scribe` is caught by its
-      prefix. A crew whose agents use an abbreviation (`sel-` for
-      `selector`) escapes this rule, and only its registration covers it.
+      after.** A private crew in the project registry need not register, so
+      it has declared no agents; a sub-agent named with the crew's name as
+      a prefix is caught the same way. A crew whose agents use an
+      abbreviation instead escapes this rule, and only its registration
+      covers it.
 
     The crews are the union `POST /signals` uses: `projects.private_repos()`,
     `projects.private_crew_names()` and `store.black_box_registration_crews()`.
@@ -325,6 +326,58 @@ def roster_add(ident: identity.Identity, name: str, *, now=None) -> dict:
         stored = conn.execute(
             "SELECT * FROM roster_agents WHERE name = ?", (name,)).fetchone()
         return dict(stored)
+    finally:
+        conn.close()
+
+
+def roster_add_from_document(ident: identity.Identity, name: str,
+                             source_doc: str, *, now=None
+                             ) -> tuple[dict, bool]:
+    """Add `name` to the roster with `source_doc` recorded as the document
+    that supplied it, or leave an existing row untouched. Returns `(row,
+    inserted)`.
+
+    **An insert only, never an upsert** — `agent_sync.py`'s own reconcile is
+    `add <name> when it is absent`, not `revise it on every scan`, so a name
+    already on the roster keeps its row (and its `source_doc`, whatever that
+    was) exactly as it stood; this never moves `updated_at` on a row it did
+    not create. `roster_add` above stays the manual path's upsert, unchanged.
+
+    Runs the same two checks `roster_add` runs on `name` — the slug rule and
+    `withheld()` — so a name this reconcile could add is a name `PUT /roster/
+    {name}` could add by hand. `agent_sync.py` runs a third check of its own
+    first, on the CREW directory rather than the name, since a path gives it
+    information `roster_add`'s bare `name` argument never carries.
+    """
+    _require_write(ident)
+    _validate_ident_str(name, "name")
+    if not _ROSTER_NAME.match(name):
+        raise InvalidRosterRow(
+            "name must be ASCII letters, digits, '.', '_' or '-', starting "
+            "with a letter or digit")
+    # `MAX_DOC_ID`, not `MAX_IDENT`: `source_doc` is `<crew>/agents/<name>`,
+    # a document id rather than a plain identifier, so `name`'s own 64-char
+    # bound would refuse a real `crew`+`name` combination comfortably inside
+    # a document id's own width.
+    _validate_ident_str(source_doc, "source_doc", max_len=store.MAX_DOC_ID)
+    now_iso = _now_iso(now)
+    conn = store.connect_rw()
+    try:
+        # After `connect_rw`, so the shadow gate's `WritesDisabled` still
+        # answers first while nobody may write.
+        if withheld(name):
+            raise RosterNameWithheld(name)
+        cur = conn.execute(
+            "INSERT INTO roster_agents "
+            "(name, source_doc, created_at, created_by, updated_at, "
+            " updated_by) VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT (name) DO NOTHING",
+            (name, source_doc, now_iso, ident.actor, now_iso, ident.actor))
+        inserted = cur.rowcount > 0
+        conn.commit()
+        stored = conn.execute(
+            "SELECT * FROM roster_agents WHERE name = ?", (name,)).fetchone()
+        return dict(stored), inserted
     finally:
         conn.close()
 

@@ -12,6 +12,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 import store
 
 REPO = Path(__file__).resolve().parent.parent
@@ -150,7 +152,8 @@ def _write_review_row(**over):
         "pr": 1, "reviewed_ref": "a" * 40, "role": "reviewer",
         "run_id": "run-1", "verdict": "APPROVE", "findings": [],
         "prose": "fine", "paths": [], "doc_ids": [], "item_ids": [],
-        "auth": "unverified", "auth_reason": None, "source_comment_id": None,
+        "auth": "unverified", "auth_reason": None, "verdict_bound": False,
+        "source_comment_id": None,
     }
     row.update(over)
     return row
@@ -276,3 +279,41 @@ def test_write_review_record_only_if_after_allows_a_later_position(
     assert out["id"] == first["id"]
     assert out["version"] == 2
     assert out["verdict"] == "REQUEST_CHANGES"
+
+
+def test_write_review_record_refuses_to_flip_a_bound_verdict(tmp_path, monkeypatch):
+    """CQ·217: once a run-verified record's verdict is bound
+    (`verdict_bound=True`), a later write on the same key naming a
+    different verdict is refused outright — unlike
+    `test_write_review_record_still_supersedes_run_verified_when_called_like_the_route`
+    above, which pins that an UNBOUND `run-verified` record (the shape a
+    record verified under the pre-CQ·217 rule has) still supersedes freely.
+    Nothing is stored, and the existing row rides along on the exception.
+    """
+    db = make_db(tmp_path)
+    monkeypatch.setattr(store, "DB_PATH", db)
+    monkeypatch.setattr(store, "WRITES_ENABLED", True)
+
+    _status, outcome, first = store.write_review_record(
+        _write_review_row(auth="run-verified", verdict_bound=True))
+    assert outcome == store.REVIEW_OUTCOME_CREATED
+    assert first["verdict_bound"] is True
+
+    with pytest.raises(store.ReviewRecordVerdictBound) as exc_info:
+        store.write_review_record(
+            _write_review_row(auth="run-verified", verdict_bound=True,
+                              verdict="REQUEST_CHANGES"))
+    assert exc_info.value.existing["id"] == first["id"]
+    assert exc_info.value.existing["verdict"] == "APPROVE"
+
+    conn = sqlite3.connect(db)
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            f"SELECT {', '.join(store.REVIEW_RECORD_COLUMNS)} "
+            f"FROM review_records WHERE id = ?", (first["id"],)).fetchone()
+    finally:
+        conn.close()
+    out = store.review_record_dict(row)
+    assert out["verdict"] == "APPROVE"
+    assert out["version"] == 1
